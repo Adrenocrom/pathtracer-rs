@@ -1,4 +1,5 @@
 use crossterm::{
+    cursor,
     event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, ClearType, Clear},
@@ -85,7 +86,7 @@ impl std::ops::Div<f32> for Vec3 {
 const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES: usize = 64; 
+const SAMPLES_PREVIEW: usize = 4; 
 const SAMPLES_FHD: usize = 256;
 const MAX_DEPTH: i32 = 10;
 
@@ -193,7 +194,6 @@ impl Cam {
         let aspect = width as f32 / height as f32;
         let scale = (self.fov * 0.5).tan();
 
-        // Calculate camera coordinate system
         let forward = (self.lookat - self.origin).normalize();
         let world_up = Vec3::new(0.0, 1.0, 0.0);
         let right = world_up.cross(forward).normalize();
@@ -209,7 +209,6 @@ impl Cam {
                     let px = (u * 2.0 - 1.0) * aspect * scale;
                     let py = -(v * 2.0 - 1.0) * scale;
                     
-                    // Map the 2D plane to 3D camera space
                     let dir = (right * px + up * py + forward).normalize();
                     let ray = Ray { origin: self.origin, direction: dir };
                     color = color + trace(&ray, scene, MAX_DEPTH);
@@ -223,6 +222,37 @@ impl Cam {
             height,
             pixels,
         }
+    }
+
+    fn move_forward(&mut self, dist: f32) {
+        let forward = (self.lookat - self.origin).normalize();
+        self.origin = self.origin + forward * dist;
+        self.lookat = self.lookat + forward * dist;
+    }
+
+    fn move_right(&mut self, dist: f32) {
+        let forward = (self.lookat - self.origin).normalize();
+        let right = Vec3::new(0.0, 1.0, 0.0).cross(forward).normalize();
+        self.origin = self.origin + right * dist;
+        self.lookat = self.lookat + right * dist;
+    }
+
+    fn rotate(&mut self, angle_rad: f32) {
+        // Rotate around world Y axis for simplicity (yaw)
+        let cos_a = angle_rad.cos();
+        let sin_a = angle_rad.sin();
+        
+        let rotate_vec = |v: Vec3| -> Vec3 {
+            Vec3::new(
+                v.x * cos_a - v.z * sin_a,
+                v.y,
+                v.x * sin_a + v.z * cos_a,
+            )
+        };
+
+        let rel_lookat = self.lookat - self.origin;
+        let rotated_lookat = rotate_vec(rel_lookat);
+        self.lookat = self.origin + rotated_lookat;
     }
 }
 
@@ -369,32 +399,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
     ];
 
-    let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 90.0);
+    let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 90.0);
     
-    // Initial terminal render
-    let buffer = cam.render(&scene, width, height, SAMPLES);
-    let frame_string = buffer_to_string(&buffer);
-    execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
-    writeln!(stdout, "{}", frame_string).unwrap();
-    stdout.flush()?;
-
     loop {
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Render Preview
+        let buffer = cam.render(&scene, width, height, SAMPLES_PREVIEW);
+        let frame_string = buffer_to_string(&buffer);
+        execute!(stdout, cursor::MoveTo(0, 0))?;
+        writeln!(stdout, "{}", frame_string).unwrap();
+        stdout.flush()?;
+
+        if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                    break;
-                } else if key.code == KeyCode::Char('p') {
-                    // Render FHD (1920x1080)
-                    write!(stdout, "Rendering FHD screenshot... ").unwrap();
-                    stdout.flush()?;
-                    
-                    let fhd_buffer = cam.render(&scene, 1920, 1080, SAMPLES_FHD);
-                    if let Err(e) = fhd_buffer.save_as_png("screenshot.png") {
-                        write!(stdout, "Failed to save screenshot: {}", e).unwrap();
-                    } else {
-                        write!(stdout, "FHD screenshot saved to screenshot.png!").unwrap();
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('p') => {
+                        write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
+                        stdout.flush()?;
+                        let fhd_buffer = cam.render(&scene, 1920, 1080, SAMPLES_FHD);
+                        if let Err(e) = fhd_buffer.save_as_png("screenshot.png") {
+                            write!(stdout, "Failed to save: {}", e).unwrap();
+                        } else {
+                            write!(stdout, "Saved to screenshot.png!").unwrap();
+                        }
+                        stdout.flush()?;
+                        std::thread::sleep(std::time::Duration::from_secs(2));
                     }
-                    stdout.flush()?;
+                    KeyCode::Char('w') => cam.move_forward(0.1),
+                    KeyCode::Char('s') => cam.move_forward(-0.1),
+                    KeyCode::Char('a') => cam.rotate(0.05),
+                    KeyCode::Char('d') => cam.rotate(-0.05),
+                    _ => {}
                 }
             }
         }
