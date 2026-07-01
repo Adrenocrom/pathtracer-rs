@@ -1,6 +1,11 @@
 use rand::Rng;
 use rayon::prelude::*;
 use std::io::{self, Write};
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, ClearType, Clear},
+};
 
 // --- VEC3 UTILS ---
 #[derive(Clone, Copy, Debug)]
@@ -217,7 +222,11 @@ fn render_rgb(color: Vec3) -> String {
     format!("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀\x1b[0m", r, g, b, r, g, b)
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
+
     let (width, height) = {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 40));
         (w as usize, h as usize)
@@ -255,11 +264,27 @@ fn main() {
             color = color / SAMPLES as f32;
             row.push_str(&render_rgb(color));
         }
+        row.push_str("\r");
         row
     }).collect();
 
-    let mut stdout = io::stdout();
-    for row in results {
+    for row in &results {
         writeln!(stdout, "{}", row).unwrap();
     }
+    stdout.flush()?;
+
+    // Wait for 'q' or ESC to quit
+    loop {
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+                    break;
+                }
+            }
+        }
+    }
+
+    execute!(stdout, LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+    Ok(())
 }
