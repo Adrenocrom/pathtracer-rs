@@ -325,29 +325,45 @@ impl PixelBuffer {
         let height = self.height;
         let original_pixels = self.pixels.clone();
 
-        // 1. Spatial Denoising (3x3 Box Blur)
-        let mut blurred = vec![VEC_ZERO; width * height];
+        // Bilateral Filter Parameters
+        let sigma_spatial = 1.0; 
+        let sigma_range = 0.15;  
+
+        let mut filtered = vec![VEC_ZERO; width * height];
+
         for y in 0..height {
             for x in 0..width {
-                let mut sum = VEC_ZERO;
-                let mut count = 0;
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
+                let center_color = original_pixels[y * width + x];
+                let mut sum_color = VEC_ZERO;
+                let mut sum_weight = 0.0;
+
+                for dy in -2..=2 {
+                    for dx in -2..=2 {
                         let nx = x as isize + dx;
                         let ny = y as isize + dy;
+
                         if nx >= 0 && nx < width as isize && ny >= 0 && ny < height as isize {
-                            sum = sum + original_pixels[(ny as usize * width) + nx as usize];
-                            count += 1;
+                            let neighbor_color = original_pixels[(ny as usize * width) + nx as usize];
+                            
+                            let dist_sq = (dx * dx + dy * dy) as f32;
+                            let spatial_w = (-dist_sq / (2.0 * sigma_spatial * sigma_spatial)).exp();
+
+                            let color_diff = neighbor_color - center_color;
+                            let color_dist_sq = color_diff.length_squared();
+                            let range_w = (-color_dist_sq / (2.0 * sigma_range * sigma_range)).exp();
+
+                            let weight = spatial_w * range_w;
+                            sum_color = sum_color + neighbor_color * weight;
+                            sum_weight += weight;
                         }
                     }
                 }
-                blurred[y * width + x] = sum / count as f32;
+                filtered[y * width + x] = if sum_weight > 0.0 { sum_color / sum_weight } else { center_color };
             }
         }
 
-        // 2. Gamma Correction & Tone Mapping
         for i in 0..self.pixels.len() {
-            let p = blurred[i];
+            let p = filtered[i];
             let mapped = Vec3::new(
                 p.x / (1.0 + p.x),
                 p.y / (1.0 + p.y),
