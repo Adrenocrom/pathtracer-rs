@@ -76,7 +76,7 @@ impl std::ops::Div<f32> for Vec3 {
 const Vec3_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES: usize = 2048;
+const SAMPLES: usize = 100000;
 const MAX_DEPTH: i32 = 10;
 
 // --- MATERIALS ---
@@ -216,9 +216,14 @@ fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
 }
 
 fn render_rgb(color: Vec3) -> String {
-    let r = (color.x.clamp(0.0, 1.0) * 255.0) as u8;
-    let g = (color.y.clamp(0.0, 1.0) * 255.0) as u8;
-    let b = (color.z.clamp(0.0, 1.0) * 255.0) as u8;
+    let mut r = (color.x.clamp(0.0, 1.0) * 255.0) as u8;
+    let mut g = (color.y.clamp(0.0, 1.0) * 255.0) as u8;
+    let mut b = (color.z.clamp(0.0, 1.0) * 255.0) as u8;
+    if r == 0 && g == 0 && b == 0 {
+        r = 1;
+        g = 1;
+        b = 1;
+    }
     format!("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀\x1b[0m", r, g, b, r, g, b)
 }
 
@@ -232,11 +237,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (w as usize, h as usize)
     };
 
-    let white = Material { albedo: Vec3::new(0.2, 0.2, 0.2), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let red = Material { albedo: Vec3::new(0.7, 0.1, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let green = Material { albedo: Vec3::new(0.1, 0.7, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let light = Material { albedo: Vec3_ZERO, emission: Vec3::new(10.0, 10.0, 10.0), mat_type: MaterialType::Emissive };
-    let yellow = Material { albedo: Vec3::new(0.2, 0.2, 0.0), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let red = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let light = Material { albedo: Vec3_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
 
     let scene: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
