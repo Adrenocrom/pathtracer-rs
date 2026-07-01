@@ -253,9 +253,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cam_pos = Vec3::new(0.0, 1.0, -1.0);
 
     // Camera parameters
-    let fov = 70.0f32.to_radians();
+    let fov = 90.0f32.to_radians();
     let aspect = width as f32 / height as f32;
-    let scale  = (fov * 0.7).tan();   // tan(45°) == 1, but keep it general
+    let scale  = (fov * 0.5).tan();   // tan(45°) == 1, but keep it general
     
     let results: Vec<String> = (0..height).into_par_iter().map(|y| {
         let mut row = String::new();
