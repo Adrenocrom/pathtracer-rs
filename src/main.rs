@@ -1,4 +1,3 @@
-use std::io::{self, Write};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -7,6 +6,7 @@ use crossterm::{
 use rand::Rng;
 use image::{RgbImage, Rgb};
 use rayon::prelude::*;
+use std::io::{self, Write};
 
 // --- VEC3 UTILS ---
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +36,14 @@ impl Vec3 {
 
     fn dot(self, other: Vec3) -> f32 {
         self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    fn cross(self, other: Vec3) -> Vec3 {
+        Vec3::new(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        )
     }
 }
 
@@ -168,13 +176,15 @@ impl Intersectable for Plane {
 // --- CAMERA ---
 struct Cam {
     origin: Vec3,
+    lookat: Vec3,
     fov: f32,
 }
 
 impl Cam {
-    fn new(origin: Vec3, fov_deg: f32) -> Self {
+    fn new(origin: Vec3, lookat: Vec3, fov_deg: f32) -> Self {
         Self {
             origin,
+            lookat,
             fov: fov_deg.to_radians(),
         }
     }
@@ -183,15 +193,24 @@ impl Cam {
         let aspect = width as f32 / height as f32;
         let scale = (self.fov * 0.5).tan();
 
+        // Calculate camera coordinate system
+        let forward = (self.lookat - self.origin).normalize();
+        let world_up = Vec3::new(0.0, 1.0, 0.0);
+        let right = world_up.cross(forward).normalize();
+        let up = forward.cross(right).normalize();
+
         let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
             (0..width).into_iter().map(|x| {
                 let mut color = VEC_ZERO;
                 for _ in 0..samples {
                     let u = (x as f32 + 0.5) / width as f32;
                     let v = (y as f32 + 0.5) / height as f32;
+                    
                     let px = (u * 2.0 - 1.0) * aspect * scale;
                     let py = -(v * 2.0 - 1.0) * scale;
-                    let dir = Vec3::new(px, py, 1.0).normalize();
+                    
+                    // Map the 2D plane to 3D camera space
+                    let dir = (right * px + up * py + forward).normalize();
                     let ray = Ray { origin: self.origin, direction: dir };
                     color = color + trace(&ray, scene, MAX_DEPTH);
                 }
@@ -350,7 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
     ];
 
-    let cam = Cam::new(Vec3::new(0.0, 1.0, -1.0), 90.0);
+    let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 90.0);
     
     // Initial terminal render
     let buffer = cam.render(&scene, width, height, SAMPLES);
