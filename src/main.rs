@@ -251,16 +251,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let cam_pos = Vec3::new(0.0, 1.0, -1.0);
+
+    // Camera parameters
+    let fov = 90.0f32.to_radians();
+    let aspect = width as f32 / height as f32;
+    let scale  = (fov * 0.5).tan();   // tan(45°) == 1, but keep it general
     
     let results: Vec<String> = (0..height).into_par_iter().map(|y| {
         let mut row = String::new();
         for x in 0..width {
             let mut color = Vec3_ZERO;
             for _ in 0..SAMPLES {
-                let px = (x as f32 / width as f32 * 2.0 - 1.0) * (width as f32 / height as f32) * 0.5;
-                let py = (1.0 - y as f32 / height as f32) * 2.0 * 0.5; 
-                let dir = Vec3::new(px, py - 1.0, 1.0).normalize();
-                
+                // pixel centre sampling (anti‑aliasing)
+                let u = (x as f32 + 0.5) / width as f32;
+                let v = (y as f32 + 0.5) / height as f32;
+
+                // NDC to world
+                let px = (u * 2.0 - 1.0) * aspect * scale;
+                let py = -(v * 2.0 - 1.0) * scale;   // no *aspect here
+
+                let dir = Vec3::new(px, py, 1.0).normalize();
                 let ray = Ray { origin: cam_pos, direction: dir };
                 color = color + trace(&ray, &scene, MAX_DEPTH);
             }
