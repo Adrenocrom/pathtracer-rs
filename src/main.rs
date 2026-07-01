@@ -241,21 +241,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scene: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 2.0, 0.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
-        Box::new(Plane { point: Vec3::new(-1.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
-        Box::new(Plane { point: Vec3::new(1.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
+        Box::new(Plane { point: Vec3::new(-3.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
+        Box::new(Plane { point: Vec3::new(3.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
         Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
-        Box::new(Sphere { center: Vec3::new(-0.2, 0.5, 0.2), radius: 0.2, mat: white }),
-        Box::new(Sphere { center: Vec3::new(0.4, 0.5, 0.4), radius: 0.2, mat: yellow }),
-        Box::new(Sphere { center: Vec3::new(0.0, 0.5, 0.0), radius: 0.2, mat: white }),
+        //Box::new(Sphere { center: Vec3::new(-1.0, 0.5, 0.2), radius: 0.2, mat: white }),
+        Box::new(Sphere { center: Vec3::new(0.5, 0.5, 0.5), radius: 0.4, mat: yellow }),
+        Box::new(Sphere { center: Vec3::new(-0.3, 0.5, 0.1), radius: 0.4, mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
     ];
 
     let cam_pos = Vec3::new(0.0, 1.0, -1.0);
 
     // Camera parameters
-    let fov = 90.0f32.to_radians();
+    let fov = 70.0f32.to_radians();
     let aspect = width as f32 / height as f32;
-    let scale  = (fov * 0.5).tan();   // tan(45°) == 1, but keep it general
+    let scale  = (fov * 0.7).tan();   // tan(45°) == 1, but keep it general
     
     let results: Vec<String> = (0..height).into_par_iter().map(|y| {
         let mut row = String::new();
@@ -267,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let v = (y as f32 + 0.5) / height as f32;
 
                 // NDC to world
-                let px = (u * 2.0 - 1.0) * aspect * scale;
+                let px = (u * 2.0 - 1.0) * 0.5 * aspect * scale;
                 let py = -(v * 2.0 - 1.0) * scale;   // no *aspect here
 
                 let dir = Vec3::new(px, py, 1.0).normalize();
