@@ -76,7 +76,7 @@ impl std::ops::Div<f32> for Vec3 {
 const Vec3_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES: usize = 100000;
+const SAMPLES: usize = 1024;
 const MAX_DEPTH: i32 = 10;
 
 // --- MATERIALS ---
