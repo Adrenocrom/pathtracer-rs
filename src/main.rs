@@ -76,8 +76,8 @@ impl std::ops::Div<f32> for Vec3 {
 const Vec3_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES: usize = 16;
-const MAX_DEPTH: i32 = 5;
+const SAMPLES: usize = 2048;
+const MAX_DEPTH: i32 = 10;
 
 // --- MATERIALS ---
 #[derive(Clone, Copy)]
@@ -232,10 +232,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (w as usize, h as usize)
     };
 
-    let white = Material { albedo: Vec3::new(0.7, 0.7, 0.7), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let white = Material { albedo: Vec3::new(0.2, 0.2, 0.2), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
     let red = Material { albedo: Vec3::new(0.7, 0.1, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
     let green = Material { albedo: Vec3::new(0.1, 0.7, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
     let light = Material { albedo: Vec3_ZERO, emission: Vec3::new(10.0, 10.0, 10.0), mat_type: MaterialType::Emissive };
+    let yellow = Material { albedo: Vec3::new(0.2, 0.2, 0.0), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
 
     let scene: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
@@ -243,7 +244,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(-1.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
         Box::new(Plane { point: Vec3::new(1.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
         Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
-        Box::new(Sphere { center: Vec3::new(0.0, 0.5, 1.0), radius: 0.4, mat: white }),
+        Box::new(Sphere { center: Vec3::new(-0.2, 0.5, 0.2), radius: 0.2, mat: white }),
+        Box::new(Sphere { center: Vec3::new(0.4, 0.5, 0.4), radius: 0.2, mat: yellow }),
+        Box::new(Sphere { center: Vec3::new(0.0, 0.5, 0.0), radius: 0.2, mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
     ];
 
