@@ -214,7 +214,7 @@ fn render_rgb(color: Vec3) -> String {
     let r = (color.x.clamp(0.0, 1.0) * 255.0) as u8;
     let g = (color.y.clamp(0.0, 1.0) * 255.0) as u8;
     let b = (color.z.clamp(0.0, 1.0) * 255.0) as u8;
-    format!("\x1b[38;2;{};{};{}m▀\x1b[0m", r, g, b)
+    format!("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀\x1b[0m", r, g, b, r, g, b)
 }
 
 fn main() {
