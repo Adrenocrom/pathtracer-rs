@@ -449,10 +449,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let height = term_h * 2;
 
     let white = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let red_light = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: Vec3::new(1.0, 0.1, 0.1), mat_type: MaterialType::Diffuse };
+    let _red_light = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: Vec3::new(1.0, 0.1, 0.1), mat_type: MaterialType::Diffuse };
     let red = Material { albedo: Vec3::new(1.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let _yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let light = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(1.0, 1.0, 0.4), mat_type: MaterialType::Emissive };
 
     let scene: Vec<Box<dyn Intersectable>> = vec![
