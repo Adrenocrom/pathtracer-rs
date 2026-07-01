@@ -87,7 +87,7 @@ const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
 const SAMPLES_PREVIEW: usize = 16; 
-const SAMPLES_FHD: usize = 256;
+const SAMPLES_FHD: usize = 512;
 const MAX_DEPTH: i32 = 4;
 
 // --- MATERIALS ---
@@ -448,22 +448,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = term_w;
     let height = term_h * 2;
 
-    let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let red = Material { albedo: Vec3::new(1.1, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let white = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let red_light = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: Vec3::new(1.0, 0.1, 0.1), mat_type: MaterialType::Diffuse };
+    let red = Material { albedo: Vec3::new(1.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let light = Material { albedo: VEC_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
+    let light = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(1.0, 1.0, 0.4), mat_type: MaterialType::Emissive };
 
     let scene: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 2.0, 0.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
-        Box::new(Plane { point: Vec3::new(-3.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
-        Box::new(Plane { point: Vec3::new(3.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
+        Box::new(Plane { point: Vec3::new(-2.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
+        Box::new(Plane { point: Vec3::new(2.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
         Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
-        Box::new(Sphere { center: Vec3::new(0.5, 0.5, 0.5), radius: 0.4, mat: yellow }),
-        Box::new(Sphere { center: Vec3::new(-0.3, 0.5, 0.1), radius: 0.4, mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 2.0, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
-        Box::new(Sphere { center: Vec3::new(0.0, 1.9, 1.0), radius: 0.1, mat: light }),
+        Box::new(Sphere { center: Vec3::new(0.5, 0.4, 0.5), radius: 0.4, mat: white }),
+        Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
+        //Box::new(Plane { point: Vec3::new(0.0, 2.0, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
+        //Box::new(Sphere { center: Vec3::new(0.0, 1.9, 1.0), radius: 0.1, mat: light }),
+        Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
     ];
 
     let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 90.0);
@@ -487,7 +489,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('p') => {
                         write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
                         stdout.flush()?;
-                        let fhd_buffer = cam.render(&scene, 1920, 1080, SAMPLES_FHD);
+                        let mut fhd_buffer = cam.render(&scene, 1920, 1080, SAMPLES_FHD);
+                        fhd_buffer.apply_filters();
                         if let Err(e) = fhd_buffer.save_as_png("screenshot.png") {
                             write!(stdout, "Failed to save: {}", e).unwrap();
                         } else {
