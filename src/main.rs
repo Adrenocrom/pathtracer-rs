@@ -1,4 +1,3 @@
-use rayon::prelude::*;
 use std::io::{self, Write};
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -7,6 +6,7 @@ use crossterm::{
 };
 use rand::Rng;
 use image::{RgbImage, Rgb};
+use rayon::prelude::*;
 
 // --- VEC3 UTILS ---
 #[derive(Clone, Copy, Debug)]
@@ -74,10 +74,11 @@ impl std::ops::Div<f32> for Vec3 {
     }
 }
 
-const Vec3_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES: usize = 128; // Lowered for responsiveness; increase for PNG
+const SAMPLES: usize = 64; 
+const SAMPLES_FHD: usize = 256;
 const MAX_DEPTH: i32 = 10;
 
 // --- MATERIALS ---
@@ -178,14 +179,14 @@ impl Cam {
         }
     }
 
-    fn render(&self, scene: &[Box<dyn Intersectable>], width: usize, height: usize) -> PixelBuffer {
+    fn render(&self, scene: &[Box<dyn Intersectable>], width: usize, height: usize, samples: usize) -> PixelBuffer {
         let aspect = width as f32 / height as f32;
         let scale = (self.fov * 0.5).tan();
 
         let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
             (0..width).into_iter().map(|x| {
-                let mut color = Vec3_ZERO;
-                for _ in 0..SAMPLES {
+                let mut color = VEC_ZERO;
+                for _ in 0..samples {
                     let u = (x as f32 + 0.5) / width as f32;
                     let v = (y as f32 + 0.5) / height as f32;
                     let px = (u * 2.0 - 1.0) * 0.5 * aspect * scale;
@@ -194,7 +195,7 @@ impl Cam {
                     let ray = Ray { origin: self.origin, direction: dir };
                     color = color + trace(&ray, scene, MAX_DEPTH);
                 }
-                color / SAMPLES as f32
+                color / samples as f32
             }).collect::<Vec<_>>()
         }).collect();
 
@@ -223,7 +224,7 @@ fn random_unit_vector() -> Vec3 {
 
 fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
     if depth <= 0 {
-        return Vec3_ZERO;
+        return VEC_ZERO;
     }
 
     let mut closest_hit: Option<HitRecord> = None;
@@ -295,7 +296,7 @@ fn buffer_to_string(buffer: &PixelBuffer) -> String {
             let bottom_pixel = if y + 1 < buffer.height {
                 buffer.get_pixel(x, y + 1)
             } else {
-                Vec3_ZERO
+                VEC_ZERO
             };
 
             let r_top = (top_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
@@ -329,11 +330,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = term_w;
     let height = term_h * 2;
 
-    let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let red = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let light = Material { albedo: Vec3_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
+    let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let red = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let light = Material { albedo: VEC_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
 
     let scene: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
@@ -347,13 +348,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let cam = Cam::new(Vec3::new(0.0, 1.0, -1.0), 90.0);
-    let buffer = cam.render(&scene, width, height);
     
-    // Save high-res screenshot
-    if let Err(e) = buffer.save_as_png("screenshot.png") {
-        eprintln!("Failed to save screenshot: {}", e);
-    }
-
+    // Initial terminal render
+    let buffer = cam.render(&scene, width, height, SAMPLES);
     let frame_string = buffer_to_string(&buffer);
     execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
     writeln!(stdout, "{}", frame_string).unwrap();
@@ -364,6 +361,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
                     break;
+                } else if key.code == KeyCode::Char('p') {
+                    // Render FHD (1920x1080)
+                    execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
+                    writeln!(stdout, "Rendering FHD screenshot... please wait...").unwrap();
+                    stdout.flush()?;
+                    
+                    let fhd_buffer = cam.render(&scene, 1920, 1080, SAMPLES_FHD);
+                    if let Err(e) = fhd_buffer.save_as_png("screenshot.png") {
+                        writeln!(stdout, "Failed to save screenshot: {}", e).unwrap();
+                    } else {
+                        writeln!(stdout, "FHD screenshot saved to screenshot.png!").unwrap();
+                    }
+                    stdout.flush()?;
                 }
             }
         }
