@@ -320,6 +320,47 @@ impl PixelBuffer {
         self.pixels[y * self.width + x]
     }
 
+    fn apply_filters(&mut self) {
+        let width = self.width;
+        let height = self.height;
+        let original_pixels = self.pixels.clone();
+
+        // 1. Spatial Denoising (3x3 Box Blur)
+        let mut blurred = vec![VEC_ZERO; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = VEC_ZERO;
+                let mut count = 0;
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let nx = x as isize + dx;
+                        let ny = y as isize + dy;
+                        if nx >= 0 && nx < width as isize && ny >= 0 && ny < height as isize {
+                            sum = sum + original_pixels[(ny as usize * width) + nx as usize];
+                            count += 1;
+                        }
+                    }
+                }
+                blurred[y * width + x] = sum / count as f32;
+            }
+        }
+
+        // 2. Gamma Correction & Tone Mapping
+        for i in 0..self.pixels.len() {
+            let p = blurred[i];
+            let mapped = Vec3::new(
+                p.x / (1.0 + p.x),
+                p.y / (1.0 + p.y),
+                p.z / (1.0 + p.z),
+            );
+            self.pixels[i] = Vec3::new(
+                mapped.x.powf(1.0 / 2.2),
+                mapped.y.powf(1.0 / 2.2),
+                mapped.z.powf(1.0 / 2.2),
+            );
+        }
+    }
+
     fn save_as_png(&self, path: &str) -> Result<(), image::ImageError> {
         let mut img = RgbImage::new(self.width as u32, self.height as u32);
         for y in 0..self.height {
@@ -403,7 +444,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     loop {
         if needs_render {
-            let buffer = cam.render(&scene, width, height, SAMPLES_PREVIEW);
+            let mut buffer = cam.render(&scene, width, height, SAMPLES_PREVIEW);
+            buffer.apply_filters();
             let frame_string = buffer_to_string(&buffer);
             execute!(stdout, cursor::MoveTo(0, 0))?;
             writeln!(stdout, "{}", frame_string).unwrap();
