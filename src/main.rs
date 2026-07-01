@@ -88,7 +88,7 @@ const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 // --- CONFIGURATION ---
 const SAMPLES_PREVIEW: usize = 16; 
 const SAMPLES_FHD: usize = 256;
-const MAX_DEPTH: i32 = 10;
+const MAX_DEPTH: i32 = 4;
 
 // --- MATERIALS ---
 #[derive(Clone, Copy)]
@@ -404,13 +404,23 @@ fn buffer_to_string(buffer: &PixelBuffer) -> String {
                 VEC_ZERO
             };
 
-            let r_top = (top_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
-            let g_top = (top_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
-            let b_top = (top_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
+            let mut r_top = (top_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
+            let mut g_top = (top_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
+            let mut b_top = (top_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
+            if r_top == 0 && g_top == 0 && b_top == 0 {
+                r_top = 1;
+                g_top = 1;
+                b_top = 1;
+            }
 
-            let r_bot = (bottom_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
-            let g_bot = (bottom_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
-            let b_bot = (bottom_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
+            let mut r_bot = (bottom_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
+            let mut g_bot = (bottom_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
+            let mut b_bot = (bottom_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
+            if r_bot == 0 && g_bot == 0 && b_bot == 0 {
+                r_bot = 1;
+                g_bot = 1;
+                b_bot = 1;
+            }
 
             output.push_str(&format!(
                 "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
