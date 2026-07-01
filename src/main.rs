@@ -230,7 +230,7 @@ impl Cam {
         self.lookat = self.lookat + forward * dist;
     }
 
-    fn move_right(&mut self, dist: f32) {
+    fn _move_right(&mut self, dist: f32) {
         let forward = (self.lookat - self.origin).normalize();
         let right = Vec3::new(0.0, 1.0, 0.0).cross(forward).normalize();
         self.origin = self.origin + right * dist;
@@ -337,8 +337,8 @@ impl PixelBuffer {
                 let mut sum_color = VEC_ZERO;
                 let mut sum_weight = 0.0;
 
-                for dy in -2..=2 {
-                    for dx in -2..=2 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
                         let nx = x as isize + dx;
                         let ny = y as isize + dy;
 
@@ -439,7 +439,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let height = term_h * 2;
 
     let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let red = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let red = Material { albedo: Vec3::new(1.1, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let light = Material { albedo: VEC_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
@@ -452,7 +452,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
         Box::new(Sphere { center: Vec3::new(0.5, 0.5, 0.5), radius: 0.4, mat: yellow }),
         Box::new(Sphere { center: Vec3::new(-0.3, 0.5, 0.1), radius: 0.4, mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
+        Box::new(Plane { point: Vec3::new(0.0, 2.0, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
+        Box::new(Sphere { center: Vec3::new(0.0, 1.9, 1.0), radius: 0.1, mat: light }),
     ];
 
     let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 90.0);
