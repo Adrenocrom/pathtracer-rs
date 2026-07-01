@@ -6,6 +6,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, ClearType, Clear},
 };
 use rand::Rng;
+use image::{RgbImage, Rgb};
 
 // --- VEC3 UTILS ---
 #[derive(Clone, Copy, Debug)]
@@ -73,10 +74,10 @@ impl std::ops::Div<f32> for Vec3 {
     }
 }
 
-const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+const Vec3_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES: usize = 1024;
+const SAMPLES: usize = 128; // Lowered for responsiveness; increase for PNG
 const MAX_DEPTH: i32 = 10;
 
 // --- MATERIALS ---
@@ -163,6 +164,48 @@ impl Intersectable for Plane {
     }
 }
 
+// --- CAMERA ---
+struct Cam {
+    origin: Vec3,
+    fov: f32,
+}
+
+impl Cam {
+    fn new(origin: Vec3, fov_deg: f32) -> Self {
+        Self {
+            origin,
+            fov: fov_deg.to_radians(),
+        }
+    }
+
+    fn render(&self, scene: &[Box<dyn Intersectable>], width: usize, height: usize) -> PixelBuffer {
+        let aspect = width as f32 / height as f32;
+        let scale = (self.fov * 0.5).tan();
+
+        let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
+            (0..width).into_iter().map(|x| {
+                let mut color = Vec3_ZERO;
+                for _ in 0..SAMPLES {
+                    let u = (x as f32 + 0.5) / width as f32;
+                    let v = (y as f32 + 0.5) / height as f32;
+                    let px = (u * 2.0 - 1.0) * 0.5 * aspect * scale;
+                    let py = -(v * 2.0 - 1.0) * scale;
+                    let dir = Vec3::new(px, py, 1.0).normalize();
+                    let ray = Ray { origin: self.origin, direction: dir };
+                    color = color + trace(&ray, scene, MAX_DEPTH);
+                }
+                color / SAMPLES as f32
+            }).collect::<Vec<_>>()
+        }).collect();
+
+        PixelBuffer {
+            width,
+            height,
+            pixels,
+        }
+    }
+}
+
 // --- PATH TRACING ---
 fn random_unit_vector() -> Vec3 {
     let mut rng = rand::thread_rng();
@@ -180,7 +223,7 @@ fn random_unit_vector() -> Vec3 {
 
 fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
     if depth <= 0 {
-        return VEC_ZERO;
+        return Vec3_ZERO;
     }
 
     let mut closest_hit: Option<HitRecord> = None;
@@ -217,7 +260,6 @@ fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
 
 // --- RENDERING PIPELINE ---
 
-/// Pixel buffer stores the final RGB colors of the scene.
 struct PixelBuffer {
     width: usize,
     height: usize,
@@ -225,39 +267,35 @@ struct PixelBuffer {
 }
 
 impl PixelBuffer {
-    fn new(width: usize, height: usize) -> Self {
-        Self {
-            width,
-            height,
-            pixels: vec![VEC_ZERO; width * height],
-        }
-    }
-
-    fn set_pixel(&mut self, x: usize, y: usize, color: Vec3) {
-        self.pixels[y * self.width + x] = color;
-    }
-
     fn get_pixel(&self, x: usize, y: usize) -> Vec3 {
         self.pixels[y * self.width + x]
     }
+
+    fn save_as_png(&self, path: &str) -> Result<(), image::ImageError> {
+        let mut img = RgbImage::new(self.width as u32, self.height as u32);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let color = self.get_pixel(x, y);
+                img.put_pixel(x as u32, y as u32, Rgb([
+                    (color.x.clamp(0.0, 1.0) * 255.0) as u8,
+                    (color.y.clamp(0.0, 1.0) * 255.0) as u8,
+                    (color.z.clamp(0.0, 1.0) * 255.0) as u8,
+                ]));
+            }
+        }
+        img.save(path)
+    }
 }
 
-/// Converts the pixel buffer into a string representation.
-/// We use the half-block character '▀' and set both foreground and background
-/// colors to represent two vertical pixels per cell.
 fn buffer_to_string(buffer: &PixelBuffer) -> String {
     let mut output = String::new();
-    
-    // We iterate through the buffer. To increase vertical resolution,
-    // we treat each console row as TWO pixels vertically.
-    // Therefore, we iterate Y in steps of 2.
     for y in (0..buffer.height).step_by(2) {
         for x in 0..buffer.width {
             let top_pixel = buffer.get_pixel(x, y);
             let bottom_pixel = if y + 1 < buffer.height {
                 buffer.get_pixel(x, y + 1)
             } else {
-                VEC_ZERO
+                Vec3_ZERO
             };
 
             let r_top = (top_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
@@ -268,8 +306,6 @@ fn buffer_to_string(buffer: &PixelBuffer) -> String {
             let g_bot = (bottom_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
             let b_bot = (bottom_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
 
-            // \x1b[38;2;R;G;Bm  -> Foreground (Top half of cell)
-            // \x1b[48;2;R;G;Bm  -> Background (Bottom half of cell)
             output.push_str(&format!(
                 "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
                 r_top, g_top, b_top, r_bot, g_bot, b_bot
@@ -290,15 +326,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (w as usize, h as usize)
     };
 
-    // Since we use ▀ to render 2 pixels vertically, our logical height is 2 * term_h
     let width = term_w;
     let height = term_h * 2;
 
-    let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let red = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let light = Material { albedo: VEC_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
+    let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let red = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
+    let light = Material { albedo: Vec3_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
 
     let scene: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
@@ -311,47 +346,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
     ];
 
-    let cam_pos = Vec3::new(0.0, 1.0, -1.0);
-    let fov = 90.0f32.to_radians();
-    let aspect = width as f32 / height as f32;
-    let scale  = (fov * 0.5).tan();
-
-    // Create the pixel buffer
-    let mut buffer = PixelBuffer::new(width, height);
-
-    // We use a flat vec for the pixel calculation to allow rayon's parallel iterator
-    let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
-        (0..width).into_iter().map(|x| {
-            let mut color = VEC_ZERO;
-            for _ in 0..SAMPLES {
-                let u = (x as f32 + 0.5) / width as f32;
-                let v = (y as f32 + 0.5) / height as f32;
-                let px = (u * 2.0 - 1.0) * aspect * scale;
-                let py = -(v * 2.0 - 1.0) * scale;
-                let dir = Vec3::new(px, py, 1.0).normalize();
-                let ray = Ray { origin: cam_pos, direction: dir };
-                color = color + trace(&ray, &scene, MAX_DEPTH);
-            }
-            color / SAMPLES as f32
-        }).collect::<Vec<_>>()
-    }).collect();
-
-    // Fill the buffer
-    for (i, color) in pixels.into_iter().enumerate() {
-        let x = i % width;
-        let y = i / width;
-        buffer.set_pixel(x, y, color);
+    let cam = Cam::new(Vec3::new(0.0, 1.0, -1.0), 90.0);
+    let buffer = cam.render(&scene, width, height);
+    
+    // Save high-res screenshot
+    if let Err(e) = buffer.save_as_png("screenshot.png") {
+        eprintln!("Failed to save screenshot: {}", e);
     }
 
-    // Convert buffer to terminal string
     let frame_string = buffer_to_string(&buffer);
-    
-    // Render the image
     execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
     writeln!(stdout, "{}", frame_string).unwrap();
     stdout.flush()?;
 
-    // Wait for 'q' or ESC to quit
     loop {
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
