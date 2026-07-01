@@ -196,7 +196,7 @@ fn mandelbrot_iter(c: Complex64, max_iter: u32) -> u32 {
     i
 }
 
-fn p1_render_half(cam: &Camera) -> String {
+fn render(cam: &Camera) -> String {
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
 
     let img_rows = rows as f64 * 2.0;
@@ -228,38 +228,6 @@ fn p1_render_half(cam: &Camera) -> String {
 
         //line.push_str(RESET);
         line
-    })
-    .collect();
-
-    lines.join("\r\n") + "\r\n"
-}
-
-fn _p2_render_half(cam: &Camera) -> String {
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
-
-    let img_rows = rows as f64 * 2.0;
-    let img_cols = cols as f64;
-
-    let x_scale = cam.zoom * (3.5 / img_cols);
-    let y_scale = cam.zoom * (2.0 / img_rows);
-
-    // parallel over terminal lines
-    let lines: Vec<String> = (0..rows).into_par_iter().map(|term_y| {
-        let y_up   = term_y as f64 * 2.0;
-        let y_down = y_up + 1.0;
-
-        (0..cols).into_par_iter().map(|term_x| {
-            let x      = term_x as f64;
-            let re     = cam.center.re + ((x - img_cols / 2.0) * x_scale);
-            let im_up   = cam.center.im + ((y_up   - img_rows / 2.0) * y_scale);
-            let im_down = cam.center.im + ((y_down - img_rows / 2.0) * y_scale);
-
-            let up_col    = iteration_to_rgb( mandelbrot_iter(Complex64::new(re, im_up), MAX_ITER), MAX_ITER);
-            let down_col  = iteration_to_rgb( mandelbrot_iter(Complex64::new(re, im_down), MAX_ITER), MAX_ITER);
-
-            format!("{}{}▀", fg(up_col.0, up_col.1, up_col.2), bg(down_col.0, down_col.1, down_col.2))
-        })
-        .collect::<String>()   // concat all column fragments into one line
     })
     .collect();
 
@@ -306,7 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if need_redraw {
-            let frame = p1_render_half(&cam);   // or any of your rendering functions
+            let frame = render(&cam);   // or any of your rendering functions
             if frame != last_frame {
                 execute!(
                     stdout,
