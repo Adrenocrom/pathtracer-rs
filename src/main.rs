@@ -189,7 +189,7 @@ impl Cam {
                 for _ in 0..samples {
                     let u = (x as f32 + 0.5) / width as f32;
                     let v = (y as f32 + 0.5) / height as f32;
-                    let px = (u * 2.0 - 1.0) * 0.5 * aspect * scale;
+                    let px = (u * 2.0 - 1.0) * aspect * scale;
                     let py = -(v * 2.0 - 1.0) * scale;
                     let dir = Vec3::new(px, py, 1.0).normalize();
                     let ray = Ray { origin: self.origin, direction: dir };
@@ -363,15 +363,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 } else if key.code == KeyCode::Char('p') {
                     // Render FHD (1920x1080)
-                    execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
-                    writeln!(stdout, "Rendering FHD screenshot... please wait...").unwrap();
+                    write!(stdout, "Rendering FHD screenshot... ").unwrap();
                     stdout.flush()?;
                     
                     let fhd_buffer = cam.render(&scene, 1920, 1080, SAMPLES_FHD);
                     if let Err(e) = fhd_buffer.save_as_png("screenshot.png") {
-                        writeln!(stdout, "Failed to save screenshot: {}", e).unwrap();
+                        write!(stdout, "Failed to save screenshot: {}", e).unwrap();
                     } else {
-                        writeln!(stdout, "FHD screenshot saved to screenshot.png!").unwrap();
+                        write!(stdout, "FHD screenshot saved to screenshot.png!").unwrap();
                     }
                     stdout.flush()?;
                 }
