@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use std::io::{self, Write};
 
 // --- VEC3 UTILS ---
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Vec3 {
     x: f32,
     y: f32,
@@ -238,7 +238,6 @@ impl Cam {
     }
 
     fn rotate(&mut self, angle_rad: f32) {
-        // Rotate around world Y axis for simplicity (yaw)
         let cos_a = angle_rad.cos();
         let sin_a = angle_rad.sin();
         
@@ -400,14 +399,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 90.0);
+    let mut needs_render = true;
     
     loop {
-        // Render Preview
-        let buffer = cam.render(&scene, width, height, SAMPLES_PREVIEW);
-        let frame_string = buffer_to_string(&buffer);
-        execute!(stdout, cursor::MoveTo(0, 0))?;
-        writeln!(stdout, "{}", frame_string).unwrap();
-        stdout.flush()?;
+        if needs_render {
+            let buffer = cam.render(&scene, width, height, SAMPLES_PREVIEW);
+            let frame_string = buffer_to_string(&buffer);
+            execute!(stdout, cursor::MoveTo(0, 0))?;
+            writeln!(stdout, "{}", frame_string).unwrap();
+            stdout.flush()?;
+            needs_render = false;
+        }
 
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
@@ -425,10 +427,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         stdout.flush()?;
                         std::thread::sleep(std::time::Duration::from_secs(2));
                     }
-                    KeyCode::Char('w') => cam.move_forward(0.1),
-                    KeyCode::Char('s') => cam.move_forward(-0.1),
-                    KeyCode::Char('a') => cam.rotate(0.05),
-                    KeyCode::Char('d') => cam.rotate(-0.05),
+                    KeyCode::Char('w') => {
+                        cam.move_forward(0.1);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('s') => {
+                        cam.move_forward(-0.1);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('a') => {
+                        cam.rotate(0.05);
+                        needs_render = true;
+                    }
+                    KeyCode::Char('d') => {
+                        cam.rotate(-0.05);
+                        needs_render = true;
+                    }
                     _ => {}
                 }
             }
