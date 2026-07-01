@@ -314,6 +314,9 @@ fn buffer_to_string(buffer: &PixelBuffer) -> String {
         }
         output.push_str("\x1b[0m\r\n");
     }
+    if output.ends_with("\r\n") {
+        output.truncate(output.len() - 2);
+    }
     output
 }
 
