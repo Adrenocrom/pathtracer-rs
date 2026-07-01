@@ -1,4 +1,3 @@
-use rand::Rng;
 use rayon::prelude::*;
 use std::io::{self, Write};
 use crossterm::{
@@ -6,6 +5,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, ClearType, Clear},
 };
+use rand::Rng;
 
 // --- VEC3 UTILS ---
 #[derive(Clone, Copy, Debug)]
@@ -73,7 +73,7 @@ impl std::ops::Div<f32> for Vec3 {
     }
 }
 
-const Vec3_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
 const SAMPLES: usize = 1024;
@@ -180,7 +180,7 @@ fn random_unit_vector() -> Vec3 {
 
 fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
     if depth <= 0 {
-        return Vec3_ZERO;
+        return VEC_ZERO;
     }
 
     let mut closest_hit: Option<HitRecord> = None;
@@ -215,16 +215,69 @@ fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
     Vec3::new(0.02, 0.02, 0.05) 
 }
 
-fn render_rgb(color: Vec3) -> String {
-    let mut r = (color.x.clamp(0.0, 1.0) * 255.0) as u8;
-    let mut g = (color.y.clamp(0.0, 1.0) * 255.0) as u8;
-    let mut b = (color.z.clamp(0.0, 1.0) * 255.0) as u8;
-    if r == 0 && g == 0 && b == 0 {
-        r = 1;
-        g = 1;
-        b = 1;
+// --- RENDERING PIPELINE ---
+
+/// Pixel buffer stores the final RGB colors of the scene.
+struct PixelBuffer {
+    width: usize,
+    height: usize,
+    pixels: Vec<Vec3>,
+}
+
+impl PixelBuffer {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![VEC_ZERO; width * height],
+        }
     }
-    format!("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀\x1b[0m", r, g, b, r, g, b)
+
+    fn set_pixel(&mut self, x: usize, y: usize, color: Vec3) {
+        self.pixels[y * self.width + x] = color;
+    }
+
+    fn get_pixel(&self, x: usize, y: usize) -> Vec3 {
+        self.pixels[y * self.width + x]
+    }
+}
+
+/// Converts the pixel buffer into a string representation.
+/// We use the half-block character '▀' and set both foreground and background
+/// colors to represent two vertical pixels per cell.
+fn buffer_to_string(buffer: &PixelBuffer) -> String {
+    let mut output = String::new();
+    
+    // We iterate through the buffer. To increase vertical resolution,
+    // we treat each console row as TWO pixels vertically.
+    // Therefore, we iterate Y in steps of 2.
+    for y in (0..buffer.height).step_by(2) {
+        for x in 0..buffer.width {
+            let top_pixel = buffer.get_pixel(x, y);
+            let bottom_pixel = if y + 1 < buffer.height {
+                buffer.get_pixel(x, y + 1)
+            } else {
+                VEC_ZERO
+            };
+
+            let r_top = (top_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
+            let g_top = (top_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
+            let b_top = (top_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
+
+            let r_bot = (bottom_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
+            let g_bot = (bottom_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
+            let b_bot = (bottom_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
+
+            // \x1b[38;2;R;G;Bm  -> Foreground (Top half of cell)
+            // \x1b[48;2;R;G;Bm  -> Background (Bottom half of cell)
+            output.push_str(&format!(
+                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
+                r_top, g_top, b_top, r_bot, g_bot, b_bot
+            ));
+        }
+        output.push_str("\x1b[0m\r\n");
+    }
+    output
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -232,16 +285,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
 
-    let (width, height) = {
+    let (term_w, term_h) = {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 40));
         (w as usize, h as usize)
     };
 
-    let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let red = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: Vec3_ZERO, mat_type: MaterialType::Diffuse };
-    let light = Material { albedo: Vec3_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
+    // Since we use ▀ to render 2 pixels vertically, our logical height is 2 * term_h
+    let width = term_w;
+    let height = term_h * 2;
+
+    let white = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let red = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let light = Material { albedo: VEC_ZERO, emission: Vec3::new(1.5, 1.5, 1.4), mat_type: MaterialType::Emissive };
 
     let scene: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
@@ -249,46 +306,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(-3.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
         Box::new(Plane { point: Vec3::new(3.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
         Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
-        //Box::new(Sphere { center: Vec3::new(-1.0, 0.5, 0.2), radius: 0.2, mat: white }),
         Box::new(Sphere { center: Vec3::new(0.5, 0.5, 0.5), radius: 0.4, mat: yellow }),
         Box::new(Sphere { center: Vec3::new(-0.3, 0.5, 0.1), radius: 0.4, mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
     ];
 
     let cam_pos = Vec3::new(0.0, 1.0, -1.0);
-
-    // Camera parameters
     let fov = 90.0f32.to_radians();
     let aspect = width as f32 / height as f32;
-    let scale  = (fov * 0.5).tan();   // tan(45°) == 1, but keep it general
-    
-    let results: Vec<String> = (0..height).into_par_iter().map(|y| {
-        let mut row = String::new();
-        for x in 0..width {
-            let mut color = Vec3_ZERO;
+    let scale  = (fov * 0.5).tan();
+
+    // Create the pixel buffer
+    let mut buffer = PixelBuffer::new(width, height);
+
+    // We use a flat vec for the pixel calculation to allow rayon's parallel iterator
+    let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
+        (0..width).into_iter().map(|x| {
+            let mut color = VEC_ZERO;
             for _ in 0..SAMPLES {
-                // pixel centre sampling (anti‑aliasing)
                 let u = (x as f32 + 0.5) / width as f32;
                 let v = (y as f32 + 0.5) / height as f32;
-
-                // NDC to world
-                let px = (u * 2.0 - 1.0) * 0.5 * aspect * scale;
-                let py = -(v * 2.0 - 1.0) * scale;   // no *aspect here
-
+                let px = (u * 2.0 - 1.0) * aspect * scale;
+                let py = -(v * 2.0 - 1.0) * scale;
                 let dir = Vec3::new(px, py, 1.0).normalize();
                 let ray = Ray { origin: cam_pos, direction: dir };
                 color = color + trace(&ray, &scene, MAX_DEPTH);
             }
-            color = color / SAMPLES as f32;
-            row.push_str(&render_rgb(color));
-        }
-        row.push_str("\r");
-        row
+            color / SAMPLES as f32
+        }).collect::<Vec<_>>()
     }).collect();
 
-    for row in &results {
-        writeln!(stdout, "{}", row).unwrap();
+    // Fill the buffer
+    for (i, color) in pixels.into_iter().enumerate() {
+        let x = i % width;
+        let y = i / width;
+        buffer.set_pixel(x, y, color);
     }
+
+    // Convert buffer to terminal string
+    let frame_string = buffer_to_string(&buffer);
+    
+    // Render the image
+    execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
+    writeln!(stdout, "{}", frame_string).unwrap();
     stdout.flush()?;
 
     // Wait for 'q' or ESC to quit
