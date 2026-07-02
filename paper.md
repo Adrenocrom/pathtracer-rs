@@ -97,14 +97,28 @@ A random number $\xi \in [0,1]$ is generated; if $\xi < P$, the path continues a
 
 ---
 
-## 7. Modern Optimization and Denoising
-The final stage of modern path tracing involves reducing the noise produced by Monte Carlo sampling.
+## 8. GPU Acceleration and Optimization
+To transition from a theoretical path tracer to a high-performance production renderer, the algorithm must be optimized for the massively parallel architecture of modern GPUs (e.g., NVIDIA CUDA/OptiX or AMD ROCm).
 
-### 7.1 Spatio-Temporal Resampling (ReSTIR)
-A recent breakthrough, ReSTIR uses reservoir-based sampling to reuse paths from neighboring pixels and previous frames, allowing for high-quality results in real-time applications.
+### 8.1 Spatial Partitioning and BVH Construction
+The primary bottleneck in GPU ray tracing is the cost of intersection tests. To mitigate this, we employ **Bounding Volume Hierarchies (BVH)**. A scene's geometry is organized into a tree where each node contains a bounding volume (typically an Axis-Aligned Bounding Box, AABB).
 
-### 7.2 AI Denoising
-Modern engines use Convolutional Neural Networks (CNNs) or other deep learning models to "fill in" the noise of a low-sample-count path-traced image, using temporal data to maintain consistency across frames.
+To optimize the construction of these trees, we utilize the **Surface Area Heuristic (SAH)**. The cost of a partition is defined as:
+$$Cost = C_{traversal} + \frac{Area(A)}{Area(Parent)} \cdot N_A \cdot C_{intersection} + \frac{Area(B)}{Area(Parent)} \cdot N_B \cdot C_{intersection}$$
+By minimizing this cost during construction, we ensure that the most likely paths for a ray are pruned as early as possible, significantly reducing the number of intersection tests.
+
+### 8.2 Mitigating SIMD Divergence
+GPUs execute threads in groups (Warps or Wavefronts). When different threads in a group follow different execution paths (e.g., one hits a triangle while another misses), it causes **Branch Divergence**, forcing the hardware to serialize the operations.
+
+*   **Ray Bundling:** Instead of processing rays individually, we group "coherent" rays—those traveling in similar directions or hitting the same BVH nodes—into bundles. This ensures that all threads in a warp are executing the same instructions simultaneously.
+*   **Wide BVH (e.g., 4-way or 8-way):** Unlike binary trees, Wide BVHs allow a single GPU instruction to test multiple child nodes at once. This reduces the depth of the tree and improves the utilization of SIMD lanes.
+
+### 8.3 Memory Management and Bindless Resources
+Modern GPUs suffer from overhead when switching between different material states or textures. **Bindless Rendering** allows the GPU to access an arbitrary number of textures and buffers without re-binding them for every ray hit. This is critical for path tracing, where a single ray may encounter dozens of different materials in a single frame.
+
+### 8.4 Optimized Intersection Kernels
+While the Möller-Trumbore algorithm is standard, it involves several divisions. For GPU kernels, we often use **pre-transformed triangle data** and simplified intersection tests that rely on Multiply-Add (MAD) instructions, which are highly optimized in hardware.
+
 
 ---
 
