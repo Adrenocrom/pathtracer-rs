@@ -263,6 +263,73 @@ impl Intersectable for Plane {
     fn is_light(&self) -> bool { matches!(self.mat.mat_type, MaterialType::Emissive) }
 }
 
+struct Cube {
+    min: Vec3,
+    max: Vec3,
+    mat: Material,
+}
+
+impl Cube {
+    fn new(center: Vec3, size: f32, mat: Material) -> Self {
+        let half = size * 0.5;
+        Self {
+            min: center - Vec3::new(half, half, half),
+            max: center + Vec3::new(half, half, half),
+            mat,
+        }
+    }
+}
+
+impl Intersectable for Cube {
+    fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
+        let mut t_min = f32::NEG_INFINITY;
+        let mut t_max = f32::INFINITY;
+
+        let dirs = [ray.direction.x, ray.direction.y, ray.direction.z];
+        let origins = [ray.origin.x, ray.origin.y, ray.origin.z];
+        let mins = [self.min.x, self.min.y, self.min.z];
+        let maxs = [self.max.x, self.max.y, self.max.z];
+
+        for i in 0..3 {
+            let inv_d = 1.0 / dirs[i];
+            let mut t0 = (mins[i] - origins[i]) * inv_d;
+            let mut t1 = (maxs[i] - origins[i]) * inv_d;
+            if inv_d < 0.0 { std::mem::swap(&mut t0, &mut t1); }
+            t_min = t_min.max(t0);
+            t_max = t_max.min(t1);
+        }
+
+        if t_max >= t_min && t_max > 0.0 && t_min < 1e6 {
+            let t = if t_min < 0.001 { t_max } else { t_min };
+            if t < 0.001 { return None; }
+
+            let p = ray.at(t);
+            
+            // Calculate normal based on which face was hit
+            let mut normal = VEC_ZERO;
+            let eps = 0.001;
+            if (p.x - self.min.x).abs() < eps { normal = Vec3::new(-1.0, 0.0, 0.0); }
+            else if (p.x - self.max.x).abs() < eps { normal = Vec3::new(1.0, 0.0, 0.0); }
+            else if (p.y - self.min.y).abs() < eps { normal = Vec3::new(0.0, -1.0, 0.0); }
+            else if (p.y - self.max.y).abs() < eps { normal = Vec3::new(0.0, 1.0, 0.0); }
+            else if (p.z - self.min.z).abs() < eps { normal = Vec3::new(0.0, 0.0, -1.0); }
+            else if (p.z - self.max.z).abs() < eps { normal = Vec3::new(0.0, 0.0, 1.0); }
+
+            Some(HitRecord { t, p, normal, mat: self.mat })
+        } else {
+            None
+        }
+    }
+
+    fn bounding_box(&self) -> BBox {
+        BBox { min: self.min, max: self.max }
+    }
+
+    fn get_emission(&self) -> Vec3 { self.mat.emission }
+    fn get_position(&self) -> Vec3 { (self.min + self.max) * 0.5 }
+    fn is_light(&self) -> bool { matches!(self.mat.mat_type, MaterialType::Emissive) }
+}
+
 struct BVHNode {
     bbox: BBox,
     left: Box<dyn Intersectable>,
@@ -608,6 +675,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 2.0, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: dim_light }),
+        Box::new(Cube::new(Vec3::new(0.0, 0.5, -0.5), 0.6, white)),
     ];
 
     for i in 0..1 {
@@ -625,6 +693,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if needs_render {
             let mut buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW);
             if filter_enabled {
+                buffer.apply_filters();
                 buffer.apply_filters();
             }
             let frame_string = buffer_to_string(&buffer);
