@@ -212,16 +212,19 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
     device.poll(wgpu::PollType::Poll);
     
     if let Ok(Ok(_)) = receiver.recv() {
-        let data = slice.get_mapped_range();
-        let result = bytemuck::cast_slice(&data[..]).to_vec();
-        drop(data);
-        staging_buffer.unmap();
-        
-        let mut pixels = vec![Vec3::default(); width * height];
-        for (i, chunk) in result.chunks(3).enumerate() {
-            pixels[i] = Vec3::new(chunk[0], chunk[1], chunk[2]);
+        if let Ok(data) = slice.get_mapped_range() {
+            let result = bytemuck::cast_slice::<u8, f32>(&data[..]).to_vec();
+            drop(data);
+            staging_buffer.unmap();
+            
+            let mut pixels = vec![Vec3::default(); width * height];
+            for (i, chunk) in result.chunks(3).enumerate() {
+                if i < pixels.len() {
+                    pixels[i] = Vec3::new(chunk[0], chunk[1], chunk[2]);
+                }
+            }
+            return PixelBuffer { width, height, pixels };
         }
-        return PixelBuffer { width, height, pixels };
     }
 
     PixelBuffer { 
