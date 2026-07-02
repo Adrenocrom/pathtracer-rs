@@ -86,7 +86,7 @@ impl std::ops::Div<f32> for Vec3 {
 const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES_PREVIEW: usize = 16; 
+const SAMPLES_PREVIEW: usize = 32; 
 const SAMPLES_FHD: usize = 512;
 const MAX_DEPTH: i32 = 4;
 
@@ -125,6 +125,9 @@ struct HitRecord {
 
 trait Intersectable: Sync + Send {
     fn intersect(&self, ray: &Ray) -> Option<HitRecord>;
+    fn get_emission(&self) -> Vec3 { VEC_ZERO }
+    fn get_position(&self) -> Vec3 { VEC_ZERO }
+    fn is_light(&self) -> bool { false }
 }
 
 struct Sphere {
@@ -150,6 +153,10 @@ impl Intersectable for Sphere {
         let normal = (p - self.center).normalize();
         Some(HitRecord { t, p, normal, mat: self.mat })
     }
+
+    fn get_emission(&self) -> Vec3 { self.mat.emission }
+    fn get_position(&self) -> Vec3 { self.center }
+    fn is_light(&self) -> bool { matches!(self.mat.mat_type, MaterialType::Emissive) }
 }
 
 struct Plane {
@@ -172,6 +179,10 @@ impl Intersectable for Plane {
             mat: self.mat,
         })
     }
+
+    fn get_emission(&self) -> Vec3 { self.mat.emission }
+    fn get_position(&self) -> Vec3 { self.point }
+    fn is_light(&self) -> bool { matches!(self.mat.mat_type, MaterialType::Emissive) }
 }
 
 // --- CAMERA ---
@@ -192,36 +203,27 @@ impl Cam {
 
     fn render(&self, scene: &[Box<dyn Intersectable>], width: usize, height: usize, samples: usize) -> PixelBuffer {
         let aspect = width as f32 / height as f32;
-        // Calculate the half-height of the virtual window at distance 1.0
-        // This defines the perspective "zoom" based on FOV
         let theta = self.fov_deg.to_radians();
         let h = (theta * 0.5).tan(); 
         let w = aspect * h;
 
-        // Setup orthonormal basis for the camera orientation
         let forward = (self.lookat - self.origin).normalize();
         let world_up = Vec3::new(0.0, 1.0, 0.0);
         let right = world_up.cross(forward).normalize();
         let up = forward.cross(right).normalize();
 
         let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
-            let mut rng = rand::thread_rng(); // Local RNG per thread for jittering
+            let mut rng = rand::thread_rng();
             (0..width).into_iter().map(move |x| {
                 let mut color = VEC_ZERO;
 
                 for _ in 0..samples {
-                    // --- PERSPECTIVE ANTI-ALIASING ---
-                    // Instead of taking the center of the pixel, we pick a random 
-                    // point inside the pixel. This smooths out edges significantly.
                     let u_jitter = (x as f32 + rng.gen::<f32>()) / width as f32;
                     let v_jitter = (y as f32 + rng.gen::<f32>()) / height as f32;
 
-                    // Map [0, 1] to [-w/2, w/2] and [h/2, -h/2]
-                    // This creates the perspective frustum mapping
                     let px = (u_jitter * 2.0 - 1.0) * w;
                     let py = -(v_jitter * 2.0 - 1.0) * h;
 
-                    // The ray direction is the vector from origin to the point on our virtual screen
                     let dir = (right * px + up * py + forward).normalize();
                     
                     let ray = Ray { origin: self.origin, direction: dir };
@@ -248,7 +250,6 @@ impl Cam {
         let cos_a = angle_rad.cos();
         let sin_a = angle_rad.sin();
         
-        // Standard Y-axis rotation matrix application
         let rel_lookat = self.lookat - self.origin;
         let rotated_lookat = Vec3::new(
             rel_lookat.x * cos_a - rel_lookat.z * sin_a,
@@ -298,14 +299,52 @@ fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
             return emission;
         }
 
+        // --- NEXT EVENT ESTIMATION (Direct Lighting) ---
+        let mut direct_light = VEC_ZERO;
+        for obj in scene {
+            if obj.is_light() {
+                let light_pos = obj.get_position();
+                let light_emission = obj.get_emission();
+                
+                let to_light = light_pos - hit.p;
+                let dist_sq = to_light.length_squared();
+                let light_dir = to_light.normalize();
+                
+                // Shadow ray to check visibility
+                let shadow_ray = Ray {
+                    origin: hit.p + hit.normal * 0.001,
+                    direction: light_dir,
+                };
+                
+                let mut obscured = false;
+                for other in scene {
+                    if let Some(s_hit) = other.intersect(&shadow_ray) {
+                        if s_hit.t < dist_sq.sqrt() - 0.001 {
+                            obscured = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if !obscured {
+                    let cos_theta = hit.normal.dot(light_dir).max(0.0);
+                    let attenuation = 1.0 / (dist_sq + 1.0); // Soften singularity
+                    direct_light = direct_light + light_emission * cos_theta * attenuation;
+                }
+            }
+        }
+
+        // --- INDIRECT LIGHTING (Recursive Path Trace) ---
         let target = hit.normal + random_unit_vector();
         let scattered_ray = Ray {
-            origin: hit.p,
+            origin: hit.p + hit.normal * 0.001,
             direction: target.normalize(),
         };
 
         let indirect = trace(&scattered_ray, scene, depth - 1);
-        return emission + hit.mat.albedo * indirect;
+        
+        // Final color = Emission + Albedo * (Direct + Indirect)
+        return emission + hit.mat.albedo * (direct_light + indirect);
     }
 
     Vec3::new(0.02, 0.02, 0.05) 
@@ -329,32 +368,28 @@ impl PixelBuffer {
         let height = self.height;
         let original_pixels = self.pixels.clone();
 
-        // Bilateral Filter Parameters
         let sigma_spatial = 1.0; 
         let sigma_range = 0.15;  
 
         let filtered: Vec<Vec3> = (0..height)
-            .into_par_iter() // Parallelize the Y loop
+            .into_par_iter()
             .flat_map(|y| {
-                // Process each pixel in the row
                 (0..width).into_iter().map(|x| {
                     let center_color = original_pixels[y * width + x];
                     let mut sum_color = VEC_ZERO;
                     let mut sum_weight = 0.0;
 
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
+                    for dy in -2..=2 {
+                        for dx in -2..=2 {
                             let nx = x as isize + dx;
                             let ny = y as isize + dy;
 
                             if nx >= 0 && nx < width as isize && ny >= 0 && ny < height as isize {
                                 let neighbor_color = original_pixels[(ny as usize * width) + nx as usize];
                                 
-                                // Spatial weight: based on distance between pixels
                                 let dist_sq = (dx * dx + dy * dy) as f32;
                                 let spatial_w = (-dist_sq / (2.0 * sigma_spatial * sigma_spatial)).exp();
 
-                                // Range weight: based on difference in color intensity
                                 let color_diff = neighbor_color - center_color;
                                 let color_dist_sq = color_diff.length_squared();
                                 let range_w = (-color_dist_sq / (2.0 * sigma_range * sigma_range)).exp();
@@ -366,9 +401,9 @@ impl PixelBuffer {
                         }
                     }
                     if sum_weight > 0.0 { sum_color / sum_weight } else { center_color }
-                }).collect::<Vec<_>>() // Collect row into a Vec
+                }).collect::<Vec<_>>()
             })
-            .collect(); // Flatten all rows into the final filtered Vec
+            .collect();
 
         for i in 0..self.pixels.len() {
             let p = filtered[i];
@@ -457,10 +492,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let height = term_h * 2;
 
     let white = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let _red_light = Material { albedo: Vec3::new(0.5, 0.1, 0.1), emission: Vec3::new(1.0, 0.1, 0.1), mat_type: MaterialType::Diffuse };
     let red = Material { albedo: Vec3::new(1.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let _yellow = Material { albedo: Vec3::new(0.5, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let light = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(1.0, 1.0, 0.4), mat_type: MaterialType::Emissive };
 
     let scene: Vec<Box<dyn Intersectable>> = vec![
