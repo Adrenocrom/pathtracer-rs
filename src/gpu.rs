@@ -1,4 +1,5 @@
-use crate::*;
+use wgpu::util::DeviceExt;
+use crate::{Vec3, Material, MaterialType, VEC_ZERO, Cam, PixelBuffer};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -64,7 +65,7 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
     // Initialize WebGPU
     let instance = wgpu::Instance::default();
     let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.expect("Failed to find adapter");
-    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.expect("Failed to create device");
+    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.expect("Failed to create device");
 
     // Define Scene Data (Mirroring main.rs)
     let white_mat = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
@@ -152,31 +153,13 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
         mapped_at_creation: false,
     });
 
-    // Camera config
-    let cam_forward = (cam.lookat - cam.origin).normalize();
-    let cam_right = Vec3::new(0.0, 1.0, 0.0).cross(cam_forward).normalize();
-    let cam_up = cam_forward.cross(cam_right).normalize();
-
-    let cam_data = [
-        cam.origin.x, cam.origin.y, cam.origin.z, 0.0,
-        cam_right.x, cam_right.y, cam_right.z, 0.0,
-        cam_up.x, cam_up.y, cam_up.z, 0.0,
-        cam_forward.x, cam_forward.y, cam_forward.z, 0.0,
-    ];
-    let cam_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Camera"),
-        contents: bytemuck::cast_slice(&cam_data),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-
-    // Shader
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("PathTracer"),
+        label: Some("Shader"),
         source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shader.wgsl"))),
     });
 
     let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("Compute Pipeline"),
+        label: Some("Pipeline"),
         layout: None,
         module: &shader,
         entry_point: Some("main"),
@@ -184,17 +167,17 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
         compilation_options: Default::default(),
     });
 
+    let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: &compute_pipeline.get_bind_group_layout(0),
+        layout: &bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: mat_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: sphere_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: cube_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: plane_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: scene_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: cam_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: output_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 0, resource: mat_buffer.as_entirely_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: sphere_buffer.as_entirely_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: cube_buffer.as_entirely_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: plane_buffer.as_entirely_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scene_buffer.as_entirely_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: output_buffer.as_entirely_binding() },
         ],
     });
 
@@ -206,28 +189,38 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
         });
         compute_pass.set_pipeline(&compute_pipeline);
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups((width as u32 + 15) / 16, (height as u32 + 15) / 16, 1);
+        compute_pass.dispatch_workgroups(
+            (width as u32 + 15) / 16,
+            (height as u32 + 15) / 16,
+            1,
+        );
     }
+
     encoder.copy_buffer_to_buffer(
         &output_buffer,
-        0,
         &staging_buffer,
-        0,
         (width * height * 12) as u64,
     );
-    queue.submit(Some(encoder.finish()));
 
+    queue.submit(std::iter::once(encoder.finish()));
+    
     let slice = staging_buffer.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
     device.poll(wgpu::PollType::Poll);
     
-    let data = slice.get_mapped_range();
-    let result: &[f32] = bytemuck::cast_slice(&data);
-    
-    let mut pixels = Vec::with_capacity(width * height);
-    for i in 0..(width * height) {
-        pixels.push(Vec3::new(result[i*3], result[i*3+1], result[i*3+2]));
+    if let Ok(Ok(_)) = receiver.recv() {
+        let data = slice.get_mapped_range();
+        let result = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging_buffer.unmap();
+        
+        let mut pixels = vec![Vec3::default(); width * height];
+        for (i, chunk) in result.chunks(3).enumerate() {
+            pixels[i] = Vec3::new(chunk[0], chunk[1], chunk[2]);
+        }
+        return PixelBuffer { pixels };
     }
 
-    PixelBuffer { width, height, pixels }
+    PixelBuffer { pixels: vec![Vec3::default(); width * height] }
 }
