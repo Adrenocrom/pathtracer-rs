@@ -94,9 +94,9 @@ impl std::ops::Div<f32> for Vec3 {
 const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES_PREVIEW: usize = 16; 
+const SAMPLES_PREVIEW: usize = 32; 
 const SAMPLES_FHD: usize = 512;
-const MAX_DEPTH: i32 = 4;
+const MAX_DEPTH: i32 = 3;
 
 // --- MATERIALS ---
 #[derive(Clone, Copy)]
@@ -596,8 +596,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let red = Material { albedo: Vec3::new(1.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let green = Material { albedo: Vec3::new(0.1, 0.9, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let light = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(1.0, 1.0, 0.4), mat_type: MaterialType::Emissive };
+    let dim_light = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: Vec3::new(0.001, 0.001, 0.001), mat_type: MaterialType::Emissive };
 
-    let objects: Vec<Box<dyn Intersectable>> = vec![
+    let mut objects: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 2.0, 0.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
         Box::new(Plane { point: Vec3::new(-2.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
@@ -605,8 +606,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
         Box::new(Sphere { center: Vec3::new(0.5, 0.4, 0.5), radius: 0.4, mat: white }),
         Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
+        Box::new(Plane { point: Vec3::new(0.0, 2.0, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
+        Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: dim_light }),
     ];
+
+    for i in 0..1 {
+        let z = i * 2;
+        objects.push( Box::new(Sphere { center: Vec3::new(-2.0, 2.0, -z as f32), radius: 0.2, mat: light }) );
+    }
 
     let scene = BVHNode::build(objects);
 
