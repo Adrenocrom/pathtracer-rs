@@ -95,8 +95,8 @@ const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
 const SAMPLES_PREVIEW: usize = 32; 
-const SAMPLES_FHD: usize = 512;
-const MAX_DEPTH: i32 = 3;
+const SAMPLES_FHD: usize = 6400;
+const MAX_DEPTH: i32 = 10;
 
 // --- MATERIALS ---
 #[derive(Clone, Copy)]
@@ -547,8 +547,8 @@ impl PixelBuffer {
                     let mut sum_color = VEC_ZERO;
                     let mut sum_weight = 0.0;
 
-                    for dy in -3..=3 {
-                        for dx in -3..=3 {
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
                             let nx = x as isize + dx;
                             let ny = y as isize + dy;
 
@@ -671,17 +671,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(-2.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
         Box::new(Plane { point: Vec3::new(2.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
         Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
+        Box::new(Plane { point: Vec3::new(0.0, 1.0, -2.0), normal: Vec3::new(0.0, 0.0, 1.0), mat: white }),
+
         Box::new(Sphere { center: Vec3::new(0.5, 0.4, 0.5), radius: 0.4, mat: white }),
         Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 2.0, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: dim_light }),
-        Box::new(Cube::new(Vec3::new(0.0, 0.5, -0.5), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(0.0, 0.3, -0.5), 0.6, white)),
     ];
 
-    for i in 0..1 {
-        let z = i * 2;
-        objects.push( Box::new(Sphere { center: Vec3::new(-2.0, 2.0, -z as f32), radius: 0.2, mat: light }) );
-    }
+    objects.push( Box::new(Sphere { center: Vec3::new(2.0, 2.0, -2.0), radius: 0.2, mat: light }) );
+    objects.push( Box::new(Sphere { center: Vec3::new(-2.0, 2.0, -2.0), radius: 0.2, mat: light }) );
 
     let scene = BVHNode::build(objects);
 
@@ -693,7 +692,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if needs_render {
             let mut buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW);
             if filter_enabled {
-                buffer.apply_filters();
                 buffer.apply_filters();
             }
             let frame_string = buffer_to_string(&buffer);
