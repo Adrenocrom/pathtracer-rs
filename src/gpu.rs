@@ -172,12 +172,12 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
         label: None,
         layout: &bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: mat_buffer.as_entirely_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: sphere_buffer.as_entirely_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: cube_buffer.as_entirely_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: plane_buffer.as_entirely_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: scene_buffer.as_entirely_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: output_buffer.as_entirely_binding() },
+            wgpu::BindGroupEntry { binding: 0, resource: mat_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: sphere_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: cube_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: plane_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: scene_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: output_buffer.as_entire_binding() },
         ],
     });
 
@@ -198,7 +198,9 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
 
     encoder.copy_buffer_to_buffer(
         &output_buffer,
+        0,
         &staging_buffer,
+        0,
         (width * height * 12) as u64,
     );
 
