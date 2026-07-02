@@ -491,30 +491,30 @@ fn random_unit_vector() -> Vec3 {
 }
 
 fn trace(ray: &Ray, scene: &dyn Intersectable, depth: i32) -> Vec3 {
-    // 1. Base case for recursion
     if depth <= 0 {
         return VEC_ZERO;
     }
 
     if let Some(hit) = scene.intersect(ray) {
-        let material = &hit.mat;
-        
-        // The object emits light regardless of whether it reflects
-        let emitted = material.emission;
+        let emission = hit.mat.emission;
 
-        // Ask the material: "If a ray hits you, how does it bounce?"
-        if let Some(scatter_record) = material.scatter(ray, &hit) {
-            let indirect = trace(&scatter_record.ray, scene, depth - 1);
-            
-            // Rendering Equation: Outgoing = Emission + (Reflection * Incoming)
-            return emitted + (material.albedo * indirect);
+        if let MaterialType::Emissive = hit.mat.mat_type {
+            return emission;
         }
 
-        // If the material doesn't scatter (absorbed), only return emission
-        return emitted;
+        // --- INDIRECT LIGHTING (Recursive Path Trace) ---
+        let target = hit.normal + random_unit_vector();
+        let scattered_ray = Ray {
+            origin: hit.p + hit.normal * 0.001,
+            direction: target.normalize(),
+        };
+
+        let indirect = trace(&scattered_ray, scene, depth - 1);
+
+        // Final color = Emission + Albedo * Indirect
+        return emission + hit.mat.albedo * indirect;
     }
 
-    // Background color / Skybox
     Vec3::new(0.02, 0.02, 0.05) 
 }
 
