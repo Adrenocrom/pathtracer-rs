@@ -1,3 +1,4 @@
+mod gpu;
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
@@ -8,6 +9,8 @@ use rand::Rng;
 use image::{RgbImage, Rgb};
 use rayon::prelude::*;
 use std::io::{self, Write};
+
+// ... [rest of the file unchanged until main]
 
 // --- VEC3 UTILS ---
 #[derive(Clone, Copy, Debug, PartialEq)]
