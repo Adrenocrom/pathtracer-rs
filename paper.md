@@ -88,8 +88,12 @@ $$L_{direct} = \sum_{l \in Lights} \frac{f_r(x, \omega_i, \omega_o) L_e(x, \omeg
 ### 6.2 Bidirectional Path Tracing (BDPT)
 BDPT generates two paths: one from the camera and one from the light source. They are connected at every vertex of the path. This is mathematically superior for "caustics" where light passes through a refractive medium to hit a surface.
 
-### 6.3 Metropolis Light Transport (MLT)
-MLT uses Markov Chain Monte Carlo (MCMC) to sample paths that are likely to contribute most to the image, such as light passing through a small crack in a door. It "walks" through the solution space of the Rendering Equation.
+### 6.4 Russian Roulette
+To manage the depth of recursion without introducing bias into the final image, **Russian Roulette** is employed. In a path tracing context, as a ray travels deeper into a scene, its contribution to the final image may diminish. Instead of using a fixed maximum depth (which can lead to biased results if paths are cut off prematurely), Russian Roulette randomly determines whether a path should continue based on its current energy.
+
+Mathematically, at each bounce, we determine a probability $P$ that the ray continues:
+$$P = \frac{\text{Current Energy}}{\text{Current Energy} + \text{Threshold}}$$
+A random number $\xi \in [0,1]$ is generated; if $\xi < P$, the path continues and its contribution is scaled by $1/P$. If $\xi \geq P$, the path is terminated. This ensures that while some paths are discarded, the expected value of the remaining paths remains unbiased, allowing for an infinite theoretical depth with a finite average computation time.
 
 ---
 
