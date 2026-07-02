@@ -1,0 +1,25 @@
+<svg width="400" height="200" viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="400" height="200" fill="#f8f9fa" />
+  
+  <!-- Eye Path (Blue) -->
+  <path d="M 50,150 L 150,100 L 250,130" fill="none" stroke="blue" stroke-width="3" />
+  <circle cx="50" cy="150" r="4" fill="blue" /> <!-- Eye -->
+  <circle cx="150" cy="100" r="4" fill="blue" /> <!-- Vertex 1 -->
+  <circle cx="250" cy="130" r="4" fill="blue" /> <!-- Vertex 2 -->
+  <text x="10" y="170" font-family="Arial" font-size="12" fill="blue">Eye Path</text>
+
+  <!-- Light Path (Red) -->
+  <path d="M 350,50 L 300,80 L 200,160" fill="none" stroke="red" stroke-width="3" />
+  <circle cx="350" cy="50" r="4" fill="red" /> <!-- Light -->
+  <circle cx="300" cy="80" r="4" fill="red" /> <!-- Vertex 3 -->
+  <circle cx="200" cy="160" r="4" fill="red" /> <!-- Vertex 4 -->
+  <text x="310" y="30" font-family="Arial" font-size="12" fill="red">Light Path</text>
+
+  <!-- Connection Lines (Dashed) -->
+  <line x1="150" y1="100" x2="300" y2="80" stroke="green" stroke-dasharray="4" stroke-width="1" />
+  <line x1="250" y1="130" x2="200" y2="160" stroke="green" stroke-dasharray="4" stroke-width="1" />
+  <line x1="150" y1="100" x2="200" y2="160" stroke="green" stroke-dasharray="4" stroke-width="1" />
+  
+  <text x="180" y="190" font-family="Arial" font-size="10" fill="green">Possible Connections</text>
+</svg>

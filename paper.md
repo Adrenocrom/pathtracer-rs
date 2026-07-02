@@ -86,7 +86,13 @@ In scenes with small light sources, a random path is unlikely to hit the light d
 $$L_{direct} = \sum_{l \in Lights} \frac{f_r(x, \omega_i, \omega_o) L_e(x, \omega_i) \cos(\theta_i)}{p(\omega_i)}$$
 
 ### 6.2 Bidirectional Path Tracing (BDPT)
-BDPT generates two paths: one from the camera and one from the light source. They are connected at every vertex of the path. This is mathematically superior for "caustics" where light passes through a refractive medium to hit a surface.
+Bidirectional Path Tracing (BDPT) addresses the difficulty of sampling complex light paths—such as those involving multiple specular reflections or refractions (caustics)—by generating two paths simultaneously: one starting from the camera (**eye path**) and one starting from a light source (**light path**).
+
+Instead of just "connecting" them at the end, BDPT considers every vertex on the eye path and attempts to connect it to every vertex on the light path. A connection is valid if there is a direct line of sight between the two vertices (i.e., no geometry blocks the path). This allows the algorithm to find paths that are statistically "rare" in unidirectional sampling but physically significant, such as light reflecting off a mirror and then hitting a refractive surface before reaching the eye.
+
+![Connection between two vertices](figure_bdpt.svg)
+
+This approach ensures that even if a light path is very "difficult" to find from the camera's perspective, it can still be captured by the bidirectional search.
 
 ### 6.4 Russian Roulette
 To manage the depth of recursion without introducing bias into the final image, **Russian Roulette** is employed. In a path tracing context, as a ray travels deeper into a scene, its contribution to the final image may diminish. Instead of using a fixed maximum depth (which can lead to biased results if paths are cut off prematurely), Russian Roulette randomly determines whether a path should continue based on its current energy.
