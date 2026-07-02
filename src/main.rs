@@ -46,6 +46,14 @@ impl Vec3 {
             self.x * other.y - self.y * other.x,
         )
     }
+
+    fn min(self, other: Vec3) -> Vec3 {
+        Vec3::new(self.x.min(other.x), self.y.min(other.y), self.z.min(other.z))
+    }
+
+    fn max(self, other: Vec3) -> Vec3 {
+        Vec3::new(self.x.max(other.x), self.y.max(other.y), self.z.max(other.z))
+    }
 }
 
 impl std::ops::Add for Vec3 {
@@ -104,6 +112,60 @@ struct Material {
     mat_type: MaterialType,
 }
 
+// --- BOUNDING BOX ---
+#[derive(Clone, Copy, Debug)]
+struct BBox {
+    min: Vec3,
+    max: Vec3,
+}
+
+impl BBox {
+    fn empty() -> Self {
+        BBox {
+            min: Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+            max: Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+        }
+    }
+
+    fn surround(self, other: BBox) -> BBox {
+        BBox {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
+    }
+
+    fn intersect(&self, ray: &Ray) -> bool {
+        let mut t_min = f32::NEG_INFINITY;
+        let mut t_max = f32::INFINITY;
+
+        // X
+        let inv_dir_x = 1.0 / ray.direction.x;
+        let mut t0x = (self.min.x - ray.origin.x) * inv_dir_x;
+        let mut t1x = (self.max.x - ray.origin.x) * inv_dir_x;
+        if inv_dir_x < 0.0 { std::mem::swap(&mut t0x, &mut t1x); }
+        t_min = t_min.max(t0x);
+        t_max = t_max.min(t1x);
+
+        // Y
+        let inv_dir_y = 1.0 / ray.direction.y;
+        let mut t0y = (self.min.y - ray.origin.y) * inv_dir_y;
+        let mut t1y = (self.max.y - ray.origin.y) * inv_dir_y;
+        if inv_dir_y < 0.0 { std::mem::swap(&mut t0y, &mut t1y); }
+        t_min = t_min.max(t0y);
+        t_max = t_max.min(t1y);
+
+        // Z
+        let inv_dir_z = 1.0 / ray.direction.z;
+        let mut t0z = (self.min.z - ray.origin.z) * inv_dir_z;
+        let mut t1z = (self.max.z - ray.origin.z) * inv_dir_z;
+        if inv_dir_z < 0.0 { std::mem::swap(&mut t0z, &mut t1z); }
+        t_min = t_min.max(t0z);
+        t_max = t_max.min(t1z);
+
+        t_max >= t_min && t_max > 0.0
+    }
+}
+
 // --- GEOMETRY ---
 struct Ray {
     origin: Vec3,
@@ -125,6 +187,7 @@ struct HitRecord {
 
 trait Intersectable: Sync + Send {
     fn intersect(&self, ray: &Ray) -> Option<HitRecord>;
+    fn bounding_box(&self) -> BBox;
     fn get_emission(&self) -> Vec3 { VEC_ZERO }
     fn get_position(&self) -> Vec3 { VEC_ZERO }
     fn is_light(&self) -> bool { false }
@@ -154,6 +217,13 @@ impl Intersectable for Sphere {
         Some(HitRecord { t, p, normal, mat: self.mat })
     }
 
+    fn bounding_box(&self) -> BBox {
+        BBox {
+            min: self.center - Vec3::new(self.radius, self.radius, self.radius),
+            max: self.center + Vec3::new(self.radius, self.radius, self.radius),
+        }
+    }
+
     fn get_emission(&self) -> Vec3 { self.mat.emission }
     fn get_position(&self) -> Vec3 { self.center }
     fn is_light(&self) -> bool { matches!(self.mat.mat_type, MaterialType::Emissive) }
@@ -180,9 +250,87 @@ impl Intersectable for Plane {
         })
     }
 
+    fn bounding_box(&self) -> BBox {
+        // Planes are infinite, but for BVH we use a very large box
+        BBox {
+            min: Vec3::new(-1e6, -1e6, -1e6),
+            max: Vec3::new(1e6, 1e6, 1e6),
+        }
+    }
+
     fn get_emission(&self) -> Vec3 { self.mat.emission }
     fn get_position(&self) -> Vec3 { self.point }
     fn is_light(&self) -> bool { matches!(self.mat.mat_type, MaterialType::Emissive) }
+}
+
+struct BVHNode {
+    bbox: BBox,
+    left: Box<dyn Intersectable>,
+    right: Box<dyn Intersectable>,
+}
+
+impl BVHNode {
+    fn build(mut objects: Vec<Box<dyn Intersectable>>) -> Box<dyn Intersectable> {
+        if objects.len() == 0 {
+            panic!("BVH build with no objects");
+        }
+        if objects.len() == 1 {
+            return objects.pop().unwrap();
+        }
+
+        // Calculate bounds of all objects in the node
+        let mut total_bbox = BBox::empty();
+        for obj in &objects {
+            total_bbox = total_bbox.surround(obj.bounding_box());
+        }
+
+        // Split along the longest axis
+        let dx = total_bbox.max.x - total_bbox.min.x;
+        let dy = total_bbox.max.y - total_bbox.min.y;
+        let dz = total_bbox.max.z - total_bbox.min.z;
+
+        if dx > dy && dx > dz {
+            objects.sort_by(|a, b| a.bounding_box().min.x.partial_cmp(&b.bounding_box().min.x).unwrap());
+        } else if dy > dz {
+            objects.sort_by(|a, b| a.bounding_box().min.y.partial_cmp(&b.bounding_box().min.y).unwrap());
+        } else {
+            objects.sort_by(|a, b| a.bounding_box().min.z.partial_cmp(&b.bounding_box().min.z).unwrap());
+        }
+
+        let mid = objects.len() / 2;
+        let right_objs = objects.split_off(mid);
+        
+        let left = Self::build(objects);
+        let right = Self::build(right_objs);
+
+        Box::new(BVHNode {
+            bbox: total_bbox,
+            left,
+            right,
+        })
+    }
+}
+
+impl Intersectable for BVHNode {
+    fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
+        if !self.bbox.intersect(ray) {
+            return None;
+        }
+
+        let left_hit = self.left.intersect(ray);
+        let right_hit = self.right.intersect(ray);
+
+        match (left_hit, right_hit) {
+            (Some(l), Some(r)) => if l.t < r.t { Some(l) } else { Some(r) },
+            (Some(l), None) => Some(l),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        }
+    }
+
+    fn bounding_box(&self) -> BBox {
+        self.bbox
+    }
 }
 
 // --- CAMERA ---
@@ -201,7 +349,7 @@ impl Cam {
         }
     }
 
-    fn render(&self, scene: &[Box<dyn Intersectable>], width: usize, height: usize, samples: usize) -> PixelBuffer {
+    fn render(&self, scene: &dyn Intersectable, width: usize, height: usize, samples: usize) -> PixelBuffer {
         let aspect = width as f32 / height as f32;
         let theta = self.fov_deg.to_radians();
         let h = (theta * 0.5).tan(); 
@@ -275,63 +423,16 @@ fn random_unit_vector() -> Vec3 {
     }
 }
 
-fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
+fn trace(ray: &Ray, scene: &dyn Intersectable, depth: i32) -> Vec3 {
     if depth <= 0 {
         return VEC_ZERO;
     }
 
-    let mut closest_hit: Option<HitRecord> = None;
-    let mut min_t = f32::INFINITY;
-
-    for obj in scene {
-        if let Some(hit) = obj.intersect(ray) {
-            if hit.t < min_t {
-                min_t = hit.t;
-                closest_hit = Some(hit);
-            }
-        }
-    }
-
-    if let Some(hit) = closest_hit {
+    if let Some(hit) = scene.intersect(ray) {
         let emission = hit.mat.emission;
         
         if let MaterialType::Emissive = hit.mat.mat_type {
             return emission;
-        }
-
-        // --- NEXT EVENT ESTIMATION (Direct Lighting) ---
-        let mut direct_light = VEC_ZERO;
-        for obj in scene {
-            if obj.is_light() {
-                let light_pos = obj.get_position();
-                let light_emission = obj.get_emission();
-                
-                let to_light = light_pos - hit.p;
-                let dist_sq = to_light.length_squared();
-                let light_dir = to_light.normalize();
-                
-                // Shadow ray to check visibility
-                let shadow_ray = Ray {
-                    origin: hit.p + hit.normal * 0.001,
-                    direction: light_dir,
-                };
-                
-                let mut obscured = false;
-                for other in scene {
-                    if let Some(s_hit) = other.intersect(&shadow_ray) {
-                        if s_hit.t < dist_sq.sqrt() - 0.001 {
-                            obscured = true;
-                            break;
-                        }
-                    }
-                }
-                
-                if !obscured {
-                    let cos_theta = hit.normal.dot(light_dir).max(0.0);
-                    let attenuation = 1.0 / (dist_sq + 1.0); // Soften singularity
-                    direct_light = direct_light + light_emission * cos_theta * attenuation;
-                }
-            }
         }
 
         // --- INDIRECT LIGHTING (Recursive Path Trace) ---
@@ -343,8 +444,8 @@ fn trace(ray: &Ray, scene: &[Box<dyn Intersectable>], depth: i32) -> Vec3 {
 
         let indirect = trace(&scattered_ray, scene, depth - 1);
         
-        // Final color = Emission + Albedo * (Direct + Indirect)
-        return emission + hit.mat.albedo * (direct_light + indirect);
+        // Final color = Emission + Albedo * Indirect
+        return emission + hit.mat.albedo * indirect;
     }
 
     Vec3::new(0.02, 0.02, 0.05) 
@@ -379,8 +480,8 @@ impl PixelBuffer {
                     let mut sum_color = VEC_ZERO;
                     let mut sum_weight = 0.0;
 
-                    for dy in -2..=2 {
-                        for dx in -2..=2 {
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
                             let nx = x as isize + dx;
                             let ny = y as isize + dy;
 
@@ -496,7 +597,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let light = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(1.0, 1.0, 0.4), mat_type: MaterialType::Emissive };
 
-    let scene: Vec<Box<dyn Intersectable>> = vec![
+    let objects: Vec<Box<dyn Intersectable>> = vec![
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
         Box::new(Plane { point: Vec3::new(0.0, 2.0, 0.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
         Box::new(Plane { point: Vec3::new(-2.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
@@ -504,17 +605,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
         Box::new(Sphere { center: Vec3::new(0.5, 0.4, 0.5), radius: 0.4, mat: white }),
         Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
-        //Box::new(Plane { point: Vec3::new(0.0, 2.0, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
-        //Box::new(Sphere { center: Vec3::new(0.0, 1.9, 1.0), radius: 0.1, mat: light }),
         Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
     ];
+
+    let scene = BVHNode::build(objects);
 
     let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 90.0);
     let mut needs_render = true;
     
     loop {
         if needs_render {
-            let mut buffer = cam.render(&scene, width, height, SAMPLES_PREVIEW);
+            let mut buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW);
             buffer.apply_filters();
             let frame_string = buffer_to_string(&buffer);
             execute!(stdout, cursor::MoveTo(0, 0))?;
@@ -530,7 +631,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('p') => {
                         write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
                         stdout.flush()?;
-                        let mut fhd_buffer = cam.render(&scene, 1920, 1080, SAMPLES_FHD);
+                        let mut fhd_buffer = cam.render(&*scene, 1920, 1080, SAMPLES_FHD);
                         fhd_buffer.apply_filters();
                         if let Err(e) = fhd_buffer.save_as_png("screenshot.png") {
                             write!(stdout, "Failed to save: {}", e).unwrap();
