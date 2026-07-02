@@ -94,7 +94,7 @@ impl std::ops::Div<f32> for Vec3 {
 const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES_PREVIEW: usize = 32; 
+const SAMPLES_PREVIEW: usize = 16; 
 const SAMPLES_FHD: usize = 512;
 const MAX_DEPTH: i32 = 4;
 
@@ -389,7 +389,7 @@ impl Cam {
     }
 
     fn move_forward(&mut self, dist: f32) {
-        let forward = (self.lookat - self.origin).normalize();
+        let forward = (Vec3::new(self.lookat.x, 1.0, self.lookat.z) - self.origin).normalize();
         self.origin = self.origin + forward * dist;
         self.lookat = self.lookat + forward * dist;
     }
@@ -480,8 +480,8 @@ impl PixelBuffer {
                     let mut sum_color = VEC_ZERO;
                     let mut sum_weight = 0.0;
 
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
+                    for dy in -3..=3 {
+                        for dx in -3..=3 {
                             let nx = x as isize + dx;
                             let ny = y as isize + dy;
 
@@ -594,7 +594,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let white = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let red = Material { albedo: Vec3::new(1.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let green = Material { albedo: Vec3::new(0.1, 0.5, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let green = Material { albedo: Vec3::new(0.1, 0.9, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let light = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(1.0, 1.0, 0.4), mat_type: MaterialType::Emissive };
 
     let objects: Vec<Box<dyn Intersectable>> = vec![
@@ -610,13 +610,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let scene = BVHNode::build(objects);
 
-    let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 90.0);
+    let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.5, 0.0), 90.0);
     let mut needs_render = true;
+    let mut filter_enabled = true;
     
     loop {
         if needs_render {
             let mut buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW);
-            buffer.apply_filters();
+            if filter_enabled {
+                buffer.apply_filters();
+            }
             let frame_string = buffer_to_string(&buffer);
             execute!(stdout, cursor::MoveTo(0, 0))?;
             writeln!(stdout, "{}", frame_string).unwrap();
@@ -628,11 +631,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('f') => {
+                        filter_enabled = !filter_enabled;
+                        needs_render = true;
+                    },
                     KeyCode::Char('p') => {
                         write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
                         stdout.flush()?;
                         let mut fhd_buffer = cam.render(&*scene, 1920, 1080, SAMPLES_FHD);
-                        fhd_buffer.apply_filters();
+                        if filter_enabled {
+                            fhd_buffer.apply_filters();
+                        }
                         if let Err(e) = fhd_buffer.save_as_png("screenshot.png") {
                             write!(stdout, "Failed to save: {}", e).unwrap();
                         } else {
