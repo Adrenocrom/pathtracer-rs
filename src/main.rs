@@ -178,7 +178,7 @@ impl Intersectable for Plane {
 struct Cam {
     origin: Vec3,
     lookat: Vec3,
-    fov: f32,
+    fov_deg: f32, // Vertical Field of View
 }
 
 impl Cam {
@@ -186,30 +186,44 @@ impl Cam {
         Self {
             origin,
             lookat,
-            fov: fov_deg.to_radians(),
+            fov_deg,
         }
     }
 
     fn render(&self, scene: &[Box<dyn Intersectable>], width: usize, height: usize, samples: usize) -> PixelBuffer {
         let aspect = width as f32 / height as f32;
-        let scale = (self.fov * 0.5).tan();
+        // Calculate the half-height of the virtual window at distance 1.0
+        // This defines the perspective "zoom" based on FOV
+        let theta = self.fov_deg.to_radians();
+        let h = (theta * 0.5).tan(); 
+        let w = aspect * h;
 
+        // Setup orthonormal basis for the camera orientation
         let forward = (self.lookat - self.origin).normalize();
         let world_up = Vec3::new(0.0, 1.0, 0.0);
         let right = world_up.cross(forward).normalize();
         let up = forward.cross(right).normalize();
 
         let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
-            (0..width).into_iter().map(|x| {
+            let mut rng = rand::thread_rng(); // Local RNG per thread for jittering
+            (0..width).into_iter().map(move |x| {
                 let mut color = VEC_ZERO;
+
                 for _ in 0..samples {
-                    let u = (x as f32 + 0.5) / width as f32;
-                    let v = (y as f32 + 0.5) / height as f32;
-                    
-                    let px = (u * 2.0 - 1.0) * aspect * scale;
-                    let py = -(v * 2.0 - 1.0) * scale;
-                    
+                    // --- PERSPECTIVE ANTI-ALIASING ---
+                    // Instead of taking the center of the pixel, we pick a random 
+                    // point inside the pixel. This smooths out edges significantly.
+                    let u_jitter = (x as f32 + rng.gen::<f32>()) / width as f32;
+                    let v_jitter = (y as f32 + rng.gen::<f32>()) / height as f32;
+
+                    // Map [0, 1] to [-w/2, w/2] and [h/2, -h/2]
+                    // This creates the perspective frustum mapping
+                    let px = (u_jitter * 2.0 - 1.0) * w;
+                    let py = -(v_jitter * 2.0 - 1.0) * h;
+
+                    // The ray direction is the vector from origin to the point on our virtual screen
                     let dir = (right * px + up * py + forward).normalize();
+                    
                     let ray = Ray { origin: self.origin, direction: dir };
                     color = color + trace(&ray, scene, MAX_DEPTH);
                 }
@@ -230,27 +244,17 @@ impl Cam {
         self.lookat = self.lookat + forward * dist;
     }
 
-    fn _move_right(&mut self, dist: f32) {
-        let forward = (self.lookat - self.origin).normalize();
-        let right = Vec3::new(0.0, 1.0, 0.0).cross(forward).normalize();
-        self.origin = self.origin + right * dist;
-        self.lookat = self.lookat + right * dist;
-    }
-
     fn rotate(&mut self, angle_rad: f32) {
         let cos_a = angle_rad.cos();
         let sin_a = angle_rad.sin();
         
-        let rotate_vec = |v: Vec3| -> Vec3 {
-            Vec3::new(
-                v.x * cos_a - v.z * sin_a,
-                v.y,
-                v.x * sin_a + v.z * cos_a,
-            )
-        };
-
+        // Standard Y-axis rotation matrix application
         let rel_lookat = self.lookat - self.origin;
-        let rotated_lookat = rotate_vec(rel_lookat);
+        let rotated_lookat = Vec3::new(
+            rel_lookat.x * cos_a - rel_lookat.z * sin_a,
+            rel_lookat.y,
+            rel_lookat.x * sin_a + rel_lookat.z * cos_a,
+        );
         self.lookat = self.origin + rotated_lookat;
     }
 }
