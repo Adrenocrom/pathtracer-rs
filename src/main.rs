@@ -1,5 +1,4 @@
 mod gpu;
-mod gpu;
 
 use crossterm::{
     cursor,
@@ -651,6 +650,7 @@ fn buffer_to_string(buffer: &PixelBuffer) -> String {
     output
 }
 
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
