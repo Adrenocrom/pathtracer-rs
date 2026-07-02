@@ -13,7 +13,7 @@ use std::io::{self, Write};
 // ... [rest of the file unchanged until main]
 
 // --- VEC3 UTILS ---
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 struct Vec3 {
     x: f32,
     y: f32,
