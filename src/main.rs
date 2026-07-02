@@ -1,4 +1,6 @@
 mod gpu;
+mod gpu;
+
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
@@ -649,7 +651,7 @@ fn buffer_to_string(buffer: &PixelBuffer) -> String {
     output
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
@@ -662,38 +664,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = term_w;
     let height = term_h * 2;
 
-    let white = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let red = Material { albedo: Vec3::new(1.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let green = Material { albedo: Vec3::new(0.1, 0.9, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let light = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(1.0, 1.0, 0.4), mat_type: MaterialType::Emissive };
-    let dim_light = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: Vec3::new(0.001, 0.001, 0.001), mat_type: MaterialType::Emissive };
-
-    let mut objects: Vec<Box<dyn Intersectable>> = vec![
-        Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 2.0, 0.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
-        Box::new(Plane { point: Vec3::new(-2.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
-        Box::new(Plane { point: Vec3::new(2.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
-        Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 1.0, -2.0), normal: Vec3::new(0.0, 0.0, 1.0), mat: white }),
-
-        Box::new(Sphere { center: Vec3::new(0.5, 0.4, 0.5), radius: 0.4, mat: white }),
-        Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: dim_light }),
-        Box::new(Cube::new(Vec3::new(0.0, 0.3, -0.5), 0.6, white)),
-    ];
-
-    objects.push( Box::new(Sphere { center: Vec3::new(2.0, 2.0, -2.0), radius: 0.2, mat: light }) );
-    objects.push( Box::new(Sphere { center: Vec3::new(-2.0, 2.0, -2.0), radius: 0.2, mat: light }) );
-
-    let scene = BVHNode::build(objects);
-
     let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.5, 0.0), 90.0);
     let mut needs_render = true;
     let mut filter_enabled = true;
     
     loop {
         if needs_render {
-            let mut buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW);
+            let mut buffer = gpu::render_gpu(width, height, SAMPLES_PREVIEW, &cam).await;
             if filter_enabled {
                 buffer.apply_filters();
             }
@@ -715,7 +692,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('p') => {
                         write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
                         stdout.flush()?;
-                        let mut fhd_buffer = cam.render(&*scene, 1920, 1080, SAMPLES_FHD);
+                        let mut fhd_buffer = gpu::render_gpu(1920, 1080, SAMPLES_FHD, &cam).await;
                         if filter_enabled {
                             fhd_buffer.apply_filters();
                         }
