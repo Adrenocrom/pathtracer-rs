@@ -213,7 +213,7 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
     
     if let Ok(Ok(_)) = receiver.recv() {
         let data = slice.get_mapped_range();
-        let result = bytemuck::cast_slice(&data).to_vec();
+        let result = bytemuck::cast_slice(&data[..]).to_vec();
         drop(data);
         staging_buffer.unmap();
         
