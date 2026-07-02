@@ -221,8 +221,12 @@ pub async fn render_gpu(width: usize, height: usize, samples: usize, cam: &Cam) 
         for (i, chunk) in result.chunks(3).enumerate() {
             pixels[i] = Vec3::new(chunk[0], chunk[1], chunk[2]);
         }
-        return PixelBuffer { pixels };
+        return PixelBuffer { width, height, pixels };
     }
 
-    PixelBuffer { pixels: vec![Vec3::default(); width * height] }
+    PixelBuffer { 
+        width, 
+        height, 
+        pixels: vec![Vec3::default(); width * height] 
+    }
 }
