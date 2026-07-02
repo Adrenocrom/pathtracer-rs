@@ -95,7 +95,7 @@ const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
 const SAMPLES_PREVIEW: usize = 32; 
-const SAMPLES_FHD: usize = 6400;
+const SAMPLES_FHD: usize = 1024;
 const MAX_DEPTH: i32 = 10;
 
 // --- MATERIALS ---
@@ -491,30 +491,30 @@ fn random_unit_vector() -> Vec3 {
 }
 
 fn trace(ray: &Ray, scene: &dyn Intersectable, depth: i32) -> Vec3 {
+    // 1. Base case for recursion
     if depth <= 0 {
         return VEC_ZERO;
     }
 
     if let Some(hit) = scene.intersect(ray) {
-        let emission = hit.mat.emission;
+        let material = &hit.mat;
         
-        if let MaterialType::Emissive = hit.mat.mat_type {
-            return emission;
+        // The object emits light regardless of whether it reflects
+        let emitted = material.emission;
+
+        // Ask the material: "If a ray hits you, how does it bounce?"
+        if let Some(scatter_record) = material.scatter(ray, &hit) {
+            let indirect = trace(&scatter_record.ray, scene, depth - 1);
+            
+            // Rendering Equation: Outgoing = Emission + (Reflection * Incoming)
+            return emitted + (material.albedo * indirect);
         }
 
-        // --- INDIRECT LIGHTING (Recursive Path Trace) ---
-        let target = hit.normal + random_unit_vector();
-        let scattered_ray = Ray {
-            origin: hit.p + hit.normal * 0.001,
-            direction: target.normalize(),
-        };
-
-        let indirect = trace(&scattered_ray, scene, depth - 1);
-        
-        // Final color = Emission + Albedo * Indirect
-        return emission + hit.mat.albedo * indirect;
+        // If the material doesn't scatter (absorbed), only return emission
+        return emitted;
     }
 
+    // Background color / Skybox
     Vec3::new(0.02, 0.02, 0.05) 
 }
 
@@ -675,12 +675,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Box::new(Sphere { center: Vec3::new(0.5, 0.4, 0.5), radius: 0.4, mat: white }),
         Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: dim_light }),
+        Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
         Box::new(Cube::new(Vec3::new(0.0, 0.3, -0.5), 0.6, white)),
     ];
 
-    objects.push( Box::new(Sphere { center: Vec3::new(2.0, 2.0, -2.0), radius: 0.2, mat: light }) );
-    objects.push( Box::new(Sphere { center: Vec3::new(-2.0, 2.0, -2.0), radius: 0.2, mat: light }) );
+    //objects.push( Box::new(Sphere { center: Vec3::new(2.0, 2.0, -2.0), radius: 0.2, mat: light }) );
+    //objects.push( Box::new(Sphere { center: Vec3::new(-2.0, 2.0, -2.0), radius: 0.2, mat: light }) );
 
     let scene = BVHNode::build(objects);
 
