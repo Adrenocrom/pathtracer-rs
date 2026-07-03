@@ -1,0 +1,24 @@
+<svg width="600" height="400" xmlns="http://www.w3.org/2000/svg">
+  <rect width="100%" height="100%" fill="white"/>
+  <!-- Geometry -->
+  <path d="M 100,300 L 300,300 L 200,150 Z" fill="#e6e6e6" stroke="#333" stroke-width="2" />
+  <text x="180" y="280" font-family="Arial" font-size="14" fill="#333">Surface Point (x)</text>
+  
+  <!-- Normal Vector -->
+  <line x1="200" y1="150" x2="200" y2="-50" stroke="red" stroke-width="2" stroke-dasharray="4"/>
+  <text x="212" y="-30" font-family="Arial" font-size="14" fill="red">$\\vec{n}$</text>
+
+  <!-- Light source -->
+  <circle cx="500" cy="50" r="20" fill="yellow"/>
+  <text x="530" y="50" font-family="Arial" font-size="14">Light Source (L_e)</text>
+
+  <!-- Pathways -->
+  <path d="M 100,300 Q 200,100 500,50" stroke="orange" stroke-width="2" fill="none" />
+  <line x1="100" y1="300" x2="200" y2="-100" stroke="blue" stroke-width="2"/> 
+  <!-- Representation of the integral over hemisphere -->
+  <path d="M 100,300 A 150,150 0 0 1 400,300" fill="none" stroke="green" stroke-dasharray="2"/>
+  <text x="70" y="150" font-family="Arial" font-size="12" fill="green">$\\Omega$ (Hemisphere)</text>
+
+  <!-- Labels -->
+  <text x="40" y="380" font-family="Arial" font-weight="bold">Rendering Equation Diagram</text>
+</svg>

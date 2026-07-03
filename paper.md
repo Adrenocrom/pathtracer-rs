@@ -32,6 +32,8 @@ Where:
 - $L_e$ is the emitted radiance (light sources).
 - $f_r$ is the **Bidirectional Reflectance Distribution Function (BRDF)**, which defines how light is reflected at a surface point.
 - $\cos(\theta_i)$ is the Lambertian cosine factor.
+![The Rendering Equation illustrates the integration of light over the hemisphere.](rendering_equation.svg)
+
 
 ---
 
@@ -43,6 +45,7 @@ $$\int_{\Omega} g(\omega) d\omega \approx \frac{1}{N} \sum_{i=1}^{N} \frac{g(\om
 ### 3.1 Importance Sampling
 To reduce the variance (noise) in our estimate, we choose a Probability Density Function (PDF), $p(\omega)$, that matches the shape of the integrand. For a Lambertian surface, where $f_r = \frac{\rho}{\pi}$, the optimal PDF is:
 $$p(\omega) = \frac{\cos(\theta)}{\pi}$$
+![Comparison of uniform vs. importance sampling showing reduced variance.](importance_sampling.svg)
 By choosing this, the $\cos(\theta)$ term in the Rendering Equation and the denominator of the MC estimator cancel out, significantly reducing noise.
 
 ### 3.2 Low-Discrepancy Sequences
@@ -90,7 +93,7 @@ Bidirectional Path Tracing (BDPT) addresses the difficulty of sampling complex l
 
 Instead of just "connecting" them at the end, BDPT considers every vertex on the eye path and attempts to connect it to every vertex on the light path. A connection is valid if there is a direct line of sight between the two vertices (i.e., no geometry blocks the path). This allows the algorithm to find paths that are statistically "rare" in unidirectional sampling but physically significant, such as light reflecting off a mirror and then hitting a refractive surface before reaching the eye.
 
-![Connection between two vertices](figure_bdpt.svg)
+![A diagram showing the connection of eye and light paths in BDPT.](figure_bdpt.svg)
 
 This approach ensures that even if a light path is very "difficult" to find from the camera's perspective, it can still be captured by the bidirectional search.
 
