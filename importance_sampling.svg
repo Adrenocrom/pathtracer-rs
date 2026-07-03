@@ -1,29 +1,40 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300">
   <rect width="100%" height="100%" fill="white"/>
-  
-  <!-- Uniform Sampling -->
-  <text x="50" y="30" font-family="Arial" font-weight="bold" font-size="16">Uniform Sampling</text>
-  <path d="M 40,100 A 80,80 0 0 1 200,100" fill="none" stroke="#ccc" stroke-dasharray="4"/>
-  <circle cx="70" cy="150" r="3" fill="blue" />
-  <circle cx="130" cy="120" r="3" fill="blue" />
-  <circle cx="180" cy="160" r="3" fill="blue" />
-  <circle cx="100" cy="90" r="3" fill="blue" />
-
-  <!-- Actually, just stick to simple labels and shapes first -->
-  <g transform="translate(50, 100)">
-    <path d="M 80,40 L 160,40 A 80,80 0 0 1 80,120" fill="none" stroke="#333" />
-    <text x="95" y="-10" font-size="14">Uniform (Higher Variance)</text>
-    <circle cx="120" cy="50" r="3" fill="blue" />
-    <circle cx="150" cy="70" r="3" fill="blue" />
-    <circle cx="90" cy="85" r="3" fill="blue" />
+  <g transform="translate(150, 160)">
+    <path d="M -80,0 A 80,80 0 0 1 80,0" fill="none" stroke="#333" stroke-width="2"/>
+    <path d="M -80,0 L -80,20" stroke="#333" stroke-width="2"/>
+    <path d="M 80,0 L 80,20" stroke="#333" stroke-width="2"/>
+    <line x1="-80" y1="20" x2="80" y2="20" stroke="#333" stroke-width="2"/>
+    <circle cx="-60" cy="-40" r="3" fill="#3498db" />
+    <circle cx="-30" cy="-60" r="3" fill="#3498db" />
+    <circle cx="10" cy="-75" r="3" fill="#3498db" />
+    <circle cx="50" cy="-60" r="3" fill="#3498db" />
+    <circle cx="70" cy="-30" r="3" fill="#3498db" />
+    <circle cx="-10" cy="-20" r="3" fill="#3498db" />
+    <circle cx="30" cy="-10" r="3" fill="#3498db" />
+    <circle cx="-50" cy="10" r="3" fill="#3498db" />
+    <circle cx="0" cy="15" r="3" fill="#3498db" />
+    <circle cx="-70" cy="-10" r="3" fill="#3498db" />
+    <circle cx="60" cy="10" r="3" fill="#3498db" />
+    <text x="0" y="50" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" fill="#333">Uniform Sampling</text>
   </g>
-
-  <g transform="translate(320, 100)">
-    <path d="M 80,40 L 160,40 A 80,80 0 0 1 80,120" fill="none" stroke="#cccccc" />
-    <text x="95" y="-10" font-size="14">Importance (Lower Variance)</text>
-    <!-- Cluster points towards the zenith -->
-    <circle cx="110" cy="40" r="3" fill="green" />
-    <circle cx="120" cy="45" r="3" fill="green" />
-    <circle cx="130" cy="50" r="3" fill="green" />
+  <g transform="translate(490, 160)">
+    <path d="M -80,0 A 80,80 0 0 1 80,0" fill="none" stroke="#333" stroke-width="2"/>
+    <path d="M -80,0 L -80,20" stroke="#333" stroke-width="2"/>
+    <path d="M 80,0 L 80,20" stroke="#333" stroke-width="2"/>
+    <line x1="-80" y1="20" x2="80" y2="20" stroke="#333" stroke-width="2"/>
+    <circle cx="-10" cy="-75" r="3" fill="#e67e22" />
+    <circle cx="10" cy="-70" r="3" fill="#e67e22" />
+    <circle cx="30" cy="-65" r="3" fill="#e67e22" />
+    <circle cx="-30" cy="-65" r="3" fill="#e67e22" />
+    <circle cx="0" cy="-75" r="3" fill="#e67e22" />
+    <circle cx="50" cy="-55" r="3" fill="#e67e22" />
+    <circle cx="-50" cy="-55" r="3" fill="#e67e22" />
+    <circle cx="15" cy="-40" r="3" fill="#e67e22" />
+    <circle cx="-15" cy="-40" r="3" fill="#e67e22" />
+    <circle cx="40" cy="-20" r="3" fill="#e67e22" />
+    <circle cx="-40" cy="-20" r="3" fill="#e67e22" />
+    <text x="0" y="50" font-family="Arial, sans-serif" font-size="14" text-anchor="middle" fill="#333">Importance Sampling</text>
   </g>
+  <text x="320" y="30" font-family="Arial, sans-serif" font-weight="bold" font-size="18" text-anchor="middle" fill="#333">Sampling Distribution Comparison</text>
 </svg>
