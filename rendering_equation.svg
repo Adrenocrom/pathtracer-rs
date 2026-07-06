@@ -1,24 +1,53 @@
-<svg width="600" height="400" xmlns="http://www.w3.org/2000/svg">
-  <rect width="100%" height="100%" fill="white"/>
-  <!-- Geometry -->
-  <path d="M 100,300 L 300,300 L 200,150 Z" fill="#e6e6e6" stroke="#333" stroke-width="2" />
-  <text x="180" y="280" font-family="Arial" font-size="14" fill="#333">Surface Point (x)</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 500">
+  <defs>
+    <!-- Arrow markers -->
+    <marker id="arrowBlack" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0,0 10,3.5 0,7" fill="#2c3e50"/></marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0,0 10,3.5 0,7" fill="#e74c3c"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0,0 10,3.5 0,7" fill="#2ecc71"/></marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="640" height="500" fill="#f8f9fa"/>
+
+  <!-- Local Surface Geometry (curved tangent plane) -->
+  <path d="M 100 320 Q 320 380 540 320" stroke="#7f8c8d" stroke-width="6" fill="none"/>
   
-  <!-- Normal Vector -->
-  <line x1="200" y1="150" x2="200" y2="-50" stroke="red" stroke-width="2" stroke-dasharray="4"/>
-  <text x="212" y="-30" font-family="Arial" font-size="14" fill="red">$\\vec{n}$</text>
+  <!-- Interaction Point P -->
+  <circle cx="320" cy="240" r="12" fill="#fff" stroke="#e67e22" stroke-width="3"/>
 
-  <!-- Light source -->
-  <circle cx="500" cy="50" r="20" fill="yellow"/>
-  <text x="530" y="50" font-family="Arial" font-size="14">Light Source (L_e)</text>
+  <!-- Tangent Plane (dashed reference line) -->
+  <line x1="150" y1="240" x2="490" y2="240" stroke="#bdc3c7" stroke-width="1.5" stroke-dasharray="6,4"/>
 
-  <!-- Pathways -->
-  <path d="M 100,300 Q 200,100 500,50" stroke="orange" stroke-width="2" fill="none" />
-  <line x1="100" y1="300" x2="200" y2="-100" stroke="blue" stroke-width="2"/> 
-  <!-- Representation of the integral over hemisphere -->
-  <path d="M 100,300 A 150,150 0 0 1 400,300" fill="none" stroke="green" stroke-dasharray="2"/>
-  <text x="70" y="150" font-family="Arial" font-size="12" fill="green">$\\Omega$ (Hemisphere)</text>
+  <!-- Normal n (points outward/upward from surface) -->
+  <line x1="320" y1="240" x2="320" y2="80" stroke="#2c3e50" stroke-width="3" marker-end="url(#arrowBlack)"/>
+  <text x="335" y="75" font-family="Arial, sans-serif" font-size="16" fill="#2c3e50"><tspan font-weight="bold">n</tspan></text>
 
-  <!-- Labels -->
-  <text x="40" y="380" font-family="Arial" font-weight="bold">Rendering Equation Diagram</text>
+  <!-- Incoming Direction ωᵢ (points toward light source) -->
+  <line x1="320" y1="240" x2="180" y2="90" stroke="#e74c3c" stroke-width="3" marker-end="url(#arrowRed)"/>
+  <!-- Incoming Ray path (opposite to ωᵢ, shows light travel direction) -->
+  <line x1="160" y1="75" x2="320" y2="240" stroke="#e74c3c" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <text x="190" y="85" font-family="Arial, sans-serif" font-size="16" fill="#e74c3c">L<tspan dy="-0.3em">i</tspan></text>
+
+  <!-- Outgoing Direction ωₒ (points toward camera/viewer) -->
+  <line x1="320" y1="240" x2="480" y2="390" stroke="#2ecc71" stroke-width="3" marker-end="url(#arrowGreen)"/>
+  <!-- Outgoing Ray path (same direction as ωₒ) -->
+  <line x1="320" y1="240" x2="500" y2="400" stroke="#2ecc71" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <text x="485" y="405" font-family="Arial, sans-serif" font-size="16" fill="#2ecc71">L<tspan dy="-0.3em">o</tspan></text>
+
+  <!-- Angles relative to tangent plane -->
+  <path d="M 320 215 A 25 25 0 0 1 346.7 227" fill="none" stroke="#e74c3c" stroke-width="1"/>
+  <text x="338" y="218" font-family="Arial, sans-serif" font-size="12" fill="#e74c3c">θ<tspan dy="-0.3em">i</tspan></text>
+
+  <path d="M 320 265 A 25 25 0 0 0 346.7 253" fill="none" stroke="#2ecc71" stroke-width="1"/>
+  <text x="338" y="280" font-family="Arial, sans-serif" font-size="12" fill="#2ecc71">θ<tspan dy="-0.3em">o</tspan></text>
+
+  <!-- Legend -->
+  <rect x="450" y="390" width="160" height="80" rx="6" fill="#fff" stroke="#bdc3c7"/>
+  <line x1="465" y1="412" x2="495" y2="412" stroke="#e74c3c" stroke-width="3" marker-end="url(#arrowRed)"/>
+  <text x="500" y="418" font-family="Arial, sans-serif" font-size="13">L<tspan dy="-0.3em">i</tspan> (incoming)</text>
+  <line x1="465" y1="442" x2="495" y2="442" stroke="#2ecc71" stroke-width="3" marker-end="url(#arrowGreen)"/>
+  <text x="500" y="448" font-family="Arial, sans-serif" font-size="13">L<tspan dy="-0.3em">o</tspan> (outgoing)</text>
+
+  <!-- Title -->
+  <text x="320" y="490" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#7f8c8d">Rendering Equation: Directional Geometry</text>
 </svg>
