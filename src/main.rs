@@ -495,7 +495,7 @@ fn random_unit_vector() -> Vec3 {
 }
 
 fn bdpt_trace(ray: &Ray, scene: &dyn Intersectable, max_depth: i32) -> Vec3 {
-    let mut rng = rand::thread_rng();
+    //let mut rng = rand::thread_rng();
     
     // 1. Generate Eye Path
     let mut eye_path = vec![Vertex {
@@ -803,7 +803,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
         //Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
         Box::new(Cube::new(Vec3::new(0.0, 0.3, -0.5), 0.6, white)),
-        Box::new(Sphere { center: Vec3::new(0.0, 2.0, 0.0), radius: 0.4, mat: light }),
+        Box::new(Sphere { center: Vec3::new(0.0, 2.0, 0.0), radius: 0.2, mat: light }),
     ];
 
     let scene = BVHNode::build(objects);
