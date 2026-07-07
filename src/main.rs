@@ -94,9 +94,10 @@ impl std::ops::Div<f32> for Vec3 {
 const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES_PREVIEW: usize = 16; 
+const SAMPLES_PREVIEW: usize = 4; 
+const MAX_DEPTH_PREVIEW: i32 = 2;
 const SAMPLES_FHD: usize = 1024;
-const MAX_DEPTH: i32 = 4;
+const MAX_DEPTH_FHD: i32 = 8;
 
 // --- MATERIALS ---
 #[derive(Clone, Copy, PartialEq)]
@@ -412,7 +413,7 @@ impl Cam {
         }
     }
 
-    fn render(&self, scene: &dyn Intersectable, width: usize, height: usize, samples: usize) -> PixelBuffer {
+    fn render(&self, scene: &dyn Intersectable, width: usize, height: usize, samples: usize, max_depth: i32) -> PixelBuffer {
         let aspect = width as f32 / height as f32;
         let theta = self.fov_deg.to_radians();
         let h = (theta * 0.5).tan(); 
@@ -438,7 +439,7 @@ impl Cam {
                     let dir = (right * px + up * py + forward).normalize();
                     
                     let ray = Ray { origin: self.origin, direction: dir };
-                    color = color + bdpt_trace(&ray, scene, MAX_DEPTH);
+                    color = color + bdpt_trace(&ray, scene, max_depth);
                 }
                 color / samples as f32
             }).collect::<Vec<_>>()
@@ -801,8 +802,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Box::new(Sphere { center: Vec3::new(0.5, 0.4, 0.5), radius: 0.4, mat: white }),
         Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
-        //Box::new(Plane { point: Vec3::new(0.0, 1.9, 1.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light }),
-        Box::new(Cube::new(Vec3::new(0.0, 0.3, -0.5), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(0.0, 0.3, 1.2), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(-1.6, 0.3, -1.6), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(-0.9, 0.3, -1.6), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(-1.2, 0.9, -1.5), 0.6, white)),
+
         Box::new(Sphere { center: Vec3::new(0.0, 2.0, 0.0), radius: 0.2, mat: light }),
     ];
 
@@ -814,7 +818,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     loop {
         if needs_render {
-            let mut buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW);
+            let mut buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW, MAX_DEPTH_PREVIEW);
             if filter_enabled {
                 buffer.apply_filters();
             }
@@ -836,7 +840,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('p') => {
                         write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
                         stdout.flush()?;
-                        let mut fhd_buffer = cam.render(&*scene, 1920, 1080, SAMPLES_FHD);
+                        let mut fhd_buffer = cam.render(&*scene, 1920, 1080, SAMPLES_FHD, MAX_DEPTH_FHD);
                         if filter_enabled {
                             fhd_buffer.apply_filters();
                         }
