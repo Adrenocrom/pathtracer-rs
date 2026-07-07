@@ -94,10 +94,10 @@ impl std::ops::Div<f32> for Vec3 {
 const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES_PREVIEW: usize = 4; 
-const MAX_DEPTH_PREVIEW: i32 = 2;
+const SAMPLES_PREVIEW: usize = 32; 
+const MAX_DEPTH_PREVIEW: i32 = 1;
 const SAMPLES_FHD: usize = 1024;
-const MAX_DEPTH_FHD: i32 = 8;
+const MAX_DEPTH_FHD: i32 = 1;
 
 // --- MATERIALS ---
 #[derive(Clone, Copy, PartialEq)]
@@ -709,9 +709,9 @@ impl PixelBuffer {
                 p.z / (1.0 + p.z),
             );
             self.pixels[i] = Vec3::new(
-                mapped.x.powf(1.0 / 2.2),
-                mapped.y.powf(1.0 / 2.2),
-                mapped.z.powf(1.0 / 2.2),
+                mapped.x.powf(0.5),
+                mapped.y.powf(0.5),
+                mapped.z.powf(0.5),
             );
         }
     }
