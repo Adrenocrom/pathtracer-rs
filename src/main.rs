@@ -612,7 +612,7 @@ fn bdpt_trace(ray: &Ray, scene: &dyn Intersectable, max_depth: i32) -> Vec3 {
     for eye_v in &eye_path {
         for l_path in &light_paths {
             for light_v in l_path {
-                let d = (light_v.p - eye_v.p);
+                let d = light_v.p - eye_v.p;
                 let dist_sq = d.length_squared();
                 if dist_sq < 0.0001 { continue; }
                 
