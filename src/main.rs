@@ -1,783 +1,71 @@
-use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, ClearType, Clear},
-};
+use crate::math::{Vec3, VEC_ZERO};
+use crate::geometry::{Intersectable, MaterialType, Sphere, Plane, Cube};
+use crate::bvh::BVHNode;
+use crate::camera::Cam;
 use rand::Rng;
-use image::{RgbImage, Rgb};
-use rayon::prelude::*;
-use std::io::{self, Write};
-
-// --- VEC3 UTILS ---
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Vec3 {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-impl Vec3 {
-    fn new(x: f32, y: f32, z: f32) -> Self {
-        Vec3 { x, y, z }
-    }
-
-    fn normalize(self) -> Self {
-        let len = self.length();
-        if len == 0.0 { self } else { self * (1.0 / len) }
-    }
-
-    fn length(self) -> f32 {
-        self.length_squared().sqrt()
-    }
-
-    fn length_squared(self) -> f32 {
-        self.x * self.x + self.y * self.y + self.z * self.z
-    }
-
-    fn dot(self, other: Vec3) -> f32 {
-        self.x * other.x + self.y * other.y + self.z * other.z
-    }
-
-    fn cross(self, other: Vec3) -> Vec3 {
-        Vec3::new(
-            self.y * other.z - self.z * other.y,
-            self.z * other.x - self.x * other.z,
-            self.x * other.y - self.y * other.x,
-        )
-    }
-
-    fn min(self, other: Vec3) -> Vec3 {
-        Vec3::new(self.x.min(other.x), self.y.min(other.y), self.z.min(other.z))
-    }
-
-    fn max(self, other: Vec3) -> Vec3 {
-        Vec3::new(self.x.max(other.x), self.y.max(other.y), self.z.max(other.z))
-    }
-}
-
-impl std::ops::Add for Vec3 {
-    type Output = Vec3;
-    fn add(self, other: Vec3) -> Vec3 {
-        Vec3::new(self.x + other.x, self.y + other.y, self.z + other.z)
-    }
-}
-
-impl std::ops::Sub for Vec3 {
-    type Output = Vec3;
-    fn sub(self, other: Vec3) -> Vec3 {
-        Vec3::new(self.x - other.x, self.y - other.y, self.z - other.z)
-    }
-}
-
-impl std::ops::Mul<f32> for Vec3 {
-    type Output = Vec3;
-    fn mul(self, rhs: f32) -> Vec3 {
-        Vec3::new(self.x * rhs, self.y * rhs, self.z * rhs)
-    }
-}
-
-impl std::ops::Mul<Vec3> for Vec3 {
-    type Output = Vec3;
-    fn mul(self, other: Vec3) -> Vec3 {
-        Vec3::new(self.x * other.x, self.y * other.y, self.z * other.z)
-    }
-}
-
-impl std::ops::Div<f32> for Vec3 {
-    type Output = Vec3;
-    fn div(self, rhs: f32) -> Vec3 {
-        self * (1.0 / rhs)
-    }
-}
-
-const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
 // --- CONFIGURATION ---
-const SAMPLES_PREVIEW: usize = 32; 
+const SAMPLES_PREVIEW: usize = 64; 
 const MAX_DEPTH_PREVIEW: i32 = 1;
-const SAMPLES_FHD: usize = 1024;
+const SAMPLES_FHD: usize = 4096;
 const MAX_DEPTH_FHD: i32 = 1;
 
-// --- MATERIALS ---
-#[derive(Clone, Copy, PartialEq)]
-enum MaterialType {
-    Diffuse,
-    Emissive,
-}
+/// Build the scene with multiple objects for interesting lighting.
+fn build_scene() -> (Box<dyn Intersectable>, Vec<(Vec3, f32)>) {
+    let white = crate::geometry::Material { albedo: Vec3::new(0.8, 0.8, 0.8), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let red = crate::geometry::Material { albedo: Vec3::new(1.5, 0.2, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let green = crate::geometry::Material { albedo: Vec3::new(0.2, 1.0, 0.2), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let blue = crate::geometry::Material { albedo: Vec3::new(0.2, 0.4, 1.5), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let yellow = crate::geometry::Material { albedo: Vec3::new(1.5, 1.2, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
+    let light_mat = crate::geometry::Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(3.0, 2.8, 1.5), mat_type: MaterialType::Emissive };
 
-#[derive(Clone, Copy)]
-struct Material {
-    albedo: Vec3,
-    emission: Vec3,
-    mat_type: MaterialType,
-}
-
-// --- BOUNDING BOX ---
-#[derive(Clone, Copy, Debug)]
-struct BBox {
-    min: Vec3,
-    max: Vec3,
-}
-
-impl BBox {
-    fn empty() -> Self {
-        BBox {
-            min: Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
-            max: Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
-        }
-    }
-
-    fn surround(self, other: BBox) -> BBox {
-        BBox {
-            min: self.min.min(other.min),
-            max: self.max.max(other.max),
-        }
-    }
-
-    fn intersect(&self, ray: &Ray) -> bool {
-        let mut t_min = f32::NEG_INFINITY;
-        let mut t_max = f32::INFINITY;
-
-        // X
-        let inv_dir_x = 1.0 / ray.direction.x;
-        let mut t0x = (self.min.x - ray.origin.x) * inv_dir_x;
-        let mut t1x = (self.max.x - ray.origin.x) * inv_dir_x;
-        if inv_dir_x < 0.0 { std::mem::swap(&mut t0x, &mut t1x); }
-        t_min = t_min.max(t0x);
-        t_max = t_max.min(t1x);
-
-        // Y
-        let inv_dir_y = 1.0 / ray.direction.y;
-        let mut t0y = (self.min.y - ray.origin.y) * inv_dir_y;
-        let mut t1y = (self.max.y - ray.origin.y) * inv_dir_y;
-        if inv_dir_y < 0.0 { std::mem::swap(&mut t0y, &mut t1y); }
-        t_min = t_min.max(t0y);
-        t_max = t_max.min(t1y);
-
-        // Z
-        let inv_dir_z = 1.0 / ray.direction.z;
-        let mut t0z = (self.min.z - ray.origin.z) * inv_dir_z;
-        let mut t1z = (self.max.z - ray.origin.z) * inv_dir_z;
-        if inv_dir_z < 0.0 { std::mem::swap(&mut t0z, &mut t1z); }
-        t_min = t_min.max(t0z);
-        t_max = t_max.min(t1z);
-
-        t_max >= t_min && t_max > 0.0
-    }
-}
-
-// --- GEOMETRY ---
-struct Ray {
-    origin: Vec3,
-    direction: Vec3,
-}
-
-impl Ray {
-    fn at(&self, t: f32) -> Vec3 {
-        self.origin + self.direction * t
-    }
-}
-
-struct HitRecord {
-    t: f32,
-    p: Vec3,
-    normal: Vec3,
-    mat: Material,
-}
-
-trait Intersectable: Sync + Send {
-    fn intersect(&self, ray: &Ray) -> Option<HitRecord>;
-    fn bounding_box(&self) -> BBox;
-    fn get_emission(&self) -> Vec3 { VEC_ZERO }
-    fn get_position(&self) -> Vec3 { VEC_ZERO }
-    fn is_light(&self) -> bool { false }
-}
-
-struct Sphere {
-    center: Vec3,
-    radius: f32,
-    mat: Material,
-}
-
-impl Intersectable for Sphere {
-    fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
-        let oc = ray.origin - self.center;
-        let a = ray.direction.dot(ray.direction);
-        let b = 2.0 * oc.dot(ray.direction);
-        let c = oc.dot(oc) - self.radius * self.radius;
-        let discriminant = b * b - 4.0 * a * c;
-
-        if discriminant < 0.0 { return None; }
-
-        let t = (-b - discriminant.sqrt()) / (2.0 * a);
-        if t < 0.001 { return None; }
-
-        let p = ray.at(t);
-        let normal = (p - self.center).normalize();
-        Some(HitRecord { t, p, normal, mat: self.mat })
-    }
-
-    fn bounding_box(&self) -> BBox {
-        BBox {
-            min: self.center - Vec3::new(self.radius, self.radius, self.radius),
-            max: self.center + Vec3::new(self.radius, self.radius, self.radius),
-        }
-    }
-
-    fn get_emission(&self) -> Vec3 { self.mat.emission }
-    fn get_position(&self) -> Vec3 { self.center }
-    fn is_light(&self) -> bool { matches!(self.mat.mat_type, MaterialType::Emissive) }
-}
-
-struct Plane {
-    point: Vec3,
-    normal: Vec3,
-    mat: Material,
-}
-
-impl Intersectable for Plane {
-    fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
-        let denom = self.normal.dot(ray.direction);
-        if denom.abs() < 1e-6 { return None; }
-        let t = (self.point - ray.origin).dot(self.normal) / denom;
-        if t < 0.001 { return None; }
+    let mut objects: Vec<Box<dyn Intersectable>> = vec![
+        // Floor - large plane with subtle gradient feel
+        Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
         
-        Some(HitRecord {
-            t,
-            p: ray.at(t),
-            normal: self.normal,
-            mat: self.mat,
-        })
-    }
-
-    fn bounding_box(&self) -> BBox {
-        BBox {
-            min: Vec3::new(-1e6, -1e6, -1e6),
-            max: Vec3::new(1e6, 1e6, 1e6),
-        }
-    }
-
-    fn get_emission(&self) -> Vec3 { self.mat.emission }
-    fn get_position(&self) -> Vec3 { self.point }
-    fn is_light(&self) -> bool { false } // Modified: Planes are never light sources for BDPT
-}
-
-struct Cube {
-    min: Vec3,
-    max: Vec3,
-    mat: Material,
-}
-
-impl Cube {
-    fn new(center: Vec3, size: f32, mat: Material) -> Self {
-        let half = size * 0.5;
-        Self {
-            min: center - Vec3::new(half, half, half),
-            max: center + Vec3::new(half, half, half),
-            mat,
-        }
-    }
-}
-
-impl Intersectable for Cube {
-    fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
-        let mut t_min = f32::NEG_INFINITY;
-        let mut t_max = f32::INFINITY;
-
-        let dirs = [ray.direction.x, ray.direction.y, ray.direction.z];
-        let origins = [ray.origin.x, ray.origin.y, ray.origin.z];
-        let mins = [self.min.x, self.min.y, self.min.z];
-        let maxs = [self.max.x, self.max.y, self.max.z];
-
-        for i in 0..3 {
-            let inv_d = 1.0 / dirs[i];
-            let mut t0 = (mins[i] - origins[i]) * inv_d;
-            let mut t1 = (maxs[i] - origins[i]) * inv_d;
-            if inv_d < 0.0 { std::mem::swap(&mut t0, &mut t1); }
-            t_min = t_min.max(t0);
-            t_max = t_max.min(t1);
-        }
-
-        if t_max >= t_min && t_max > 0.0 && t_min < 1e6 {
-            let t = if t_min < 0.001 { t_max } else { t_min };
-            if t < 0.001 { return None; }
-
-            let p = ray.at(t);
-            
-            let mut normal = VEC_ZERO;
-            let eps = 0.001;
-            if (p.x - self.min.x).abs() < eps { normal = Vec3::new(-1.0, 0.0, 0.0); }
-            else if (p.x - self.max.x).abs() < eps { normal = Vec3::new(1.0, 0.0, 0.0); }
-            else if (p.y - self.min.y).abs() < eps { normal = Vec3::new(0.0, -1.0, 0.0); }
-            else if (p.y - self.max.y).abs() < eps { normal = Vec3::new(0.0, 1.0, 0.0); }
-            else if (p.z - self.min.z).abs() < eps { normal = Vec3::new(0.0, 0.0, -1.0); }
-            else if (p.z - self.max.z).abs() < eps { normal = Vec3::new(0.0, 0.0, 1.0); }
-
-            Some(HitRecord { t, p, normal, mat: self.mat })
-        } else {
-            None
-        }
-    }
-
-    fn bounding_box(&self) -> BBox {
-        BBox { min: self.min, max: self.max }
-    }
-
-    fn get_emission(&self) -> Vec3 { self.mat.emission }
-    fn get_position(&self) -> Vec3 { (self.min + self.max) * 0.5 }
-    fn is_light(&self) -> bool { matches!(self.mat.mat_type, MaterialType::Emissive) }
-}
-
-struct BVHNode {
-    bbox: BBox,
-    left: Box<dyn Intersectable>,
-    right: Box<dyn Intersectable>,
-}
-
-impl BVHNode {
-    fn build(mut objects: Vec<Box<dyn Intersectable>>) -> Box<dyn Intersectable> {
-        if objects.len() == 0 {
-            panic!("BVH build with no objects");
-        }
-        if objects.len() == 1 {
-            return objects.pop().unwrap();
-        }
-
-        let mut total_bbox = BBox::empty();
-        for obj in &objects {
-            total_bbox = total_bbox.surround(obj.bounding_box());
-        }
-
-        let dx = total_bbox.max.x - total_bbox.min.x;
-        let dy = total_bbox.max.y - total_bbox.min.y;
-        let dz = total_bbox.max.z - total_bbox.min.z;
-
-        if dx > dy && dx > dz {
-            objects.sort_by(|a, b| a.bounding_box().min.x.partial_cmp(&b.bounding_box().min.x).unwrap());
-        } else if dy > dz {
-            objects.sort_by(|a, b| a.bounding_box().min.y.partial_cmp(&b.bounding_box().min.y).unwrap());
-        } else {
-            objects.sort_by(|a, b| a.bounding_box().min.z.partial_cmp(&b.bounding_box().min.z).unwrap());
-        }
-
-        let mid = objects.len() / 2;
-        let right_objs = objects.split_off(mid);
+        // Back wall
+        Box::new(Plane { point: Vec3::new(0.0, 2.0, -2.5), normal: Vec3::new(0.0, 0.0, 1.0), mat: blue }),
         
-        let left = Self::build(objects);
-        let right = Self::build(right_objs);
-
-        Box::new(BVHNode {
-            bbox: total_bbox,
-            left,
-            right,
-        })
-    }
-}
-
-impl Intersectable for BVHNode {
-    fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
-        if !self.bbox.intersect(ray) {
-            return None;
-        }
-
-        let left_hit = self.left.intersect(ray);
-        let right_hit = self.right.intersect(ray);
-
-        match (left_hit, right_hit) {
-            (Some(l), Some(r)) => if l.t < r.t { Some(l) } else { Some(r) },
-            (Some(l), None) => Some(l),
-            (None, Some(r)) => Some(r),
-            (None, None) => None,
-        }
-    }
-
-    fn bounding_box(&self) -> BBox {
-        self.bbox
-    }
-}
-
-// --- CAMERA ---
-struct Cam {
-    origin: Vec3,
-    lookat: Vec3,
-    fov_deg: f32, 
-}
-
-impl Cam {
-    fn new(origin: Vec3, lookat: Vec3, fov_deg: f32) -> Self {
-        Self {
-            origin,
-            lookat,
-            fov_deg,
-        }
-    }
-
-    fn render(&self, scene: &dyn Intersectable, width: usize, height: usize, samples: usize, max_depth: i32) -> PixelBuffer {
-        let aspect = width as f32 / height as f32;
-        let theta = self.fov_deg.to_radians();
-        let h = (theta * 0.5).tan(); 
-        let w = aspect * h;
-
-        let forward = (self.lookat - self.origin).normalize();
-        let world_up = Vec3::new(0.0, 1.0, 0.0);
-        let right = world_up.cross(forward).normalize();
-        let up = forward.cross(right).normalize();
-
-        let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
-            let mut rng = rand::thread_rng();
-            (0..width).into_iter().map(move |x| {
-                let mut color = VEC_ZERO;
-
-                for _ in 0..samples {
-                    let u_jitter = (x as f32 + rng.gen::<f32>()) / width as f32;
-                    let v_jitter = (y as f32 + rng.gen::<f32>()) / height as f32;
-
-                    let px = (u_jitter * 2.0 - 1.0) * w;
-                    let py = -(v_jitter * 2.0 - 1.0) * h;
-
-                    let dir = (right * px + up * py + forward).normalize();
-                    
-                    let ray = Ray { origin: self.origin, direction: dir };
-                    color = color + bdpt_trace(&ray, scene, max_depth);
-                }
-                color / samples as f32
-            }).collect::<Vec<_>>()
-        }).collect();
-
-        PixelBuffer {
-            width,
-            height,
-            pixels,
-        }
-    }
-
-    fn move_forward(&mut self, dist: f32) {
-        let forward = (Vec3::new(self.lookat.x, 1.0, self.lookat.z) - self.origin).normalize();
-        self.origin = self.origin + forward * dist;
-        self.lookat = self.lookat + forward * dist;
-    }
-
-    fn rotate(&mut self, angle_rad: f32) {
-        let cos_a = angle_rad.cos();
-        let sin_a = angle_rad.sin();
+        // Left wall (red)
+        Box::new(Plane { point: Vec3::new(-2.5, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
         
-        let rel_lookat = self.lookat - self.origin;
-        let rotated_lookat = Vec3::new(
-            rel_lookat.x * cos_a - rel_lookat.z * sin_a,
-            rel_lookat.y,
-            rel_lookat.x * sin_a + rel_lookat.z * cos_a,
-        );
-        self.lookat = self.origin + rotated_lookat;
-    }
-}
+        // Right wall (green)
+        Box::new(Plane { point: Vec3::new(2.5, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
 
-// --- BIDIRECTIONAL PATH TRACING (BDPT) ---
-#[derive(Clone)]
-struct Vertex {
-    p: Vec3,
-    normal: Vec3,
-    throughput: Vec3,
-    emission: Vec3,
-}
+        // Ceiling light panel
+        Box::new(Plane { point: Vec3::new(0.0, 2.0, 0.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: light_mat.clone() }),
 
-fn random_unit_vector() -> Vec3 {
-    let mut rng = rand::thread_rng();
-    loop {
-        let v = Vec3::new(
-            rng.gen_range(-1.0..1.0),
-            rng.gen_range(-1.0..1.0),
-            rng.gen_range(-1.0..1.0),
-        );
-        if v.length_squared() <= 1.0 {
-            return v.normalize();
-        }
-    }
-}
+        // Central sphere (reflective-looking diffuse)
+        Box::new(Sphere { center: Vec3::new(0.0, 0.5, 0.0), radius: 0.5, mat: yellow }),
 
-fn bdpt_trace(ray: &Ray, scene: &dyn Intersectable, max_depth: i32) -> Vec3 {
-    //let mut rng = rand::thread_rng();
+        // Small spheres for caustics-like effect
+        Box::new(Sphere { center: Vec3::new(-1.2, 0.3, -0.5), radius: 0.3, mat: blue }),
+        Box::new(Sphere { center: Vec3::new(1.2, 0.3, -0.5), radius: 0.3, mat: red }),
+
+        // Stacked cubes for interesting shadows
+        Box::new(Cube::new(Vec3::new(-0.8, 0.4, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(0.9, 0.4, 0.8), 0.6, green)),
+        Box::new(Cube::new(Vec3::new(-0.2, 1.0, -0.5), 0.4, red)),
+
+        // Hanging light (small emissive sphere)
+        Box::new(Sphere { center: Vec3::new(0.0, 1.8, 0.5), radius: 0.1, mat: light_mat }),
+    ];
+
+    let scene = BVHNode::build(objects);
     
-    // 1. Generate Eye Path
-    let mut eye_path = vec![Vertex {
-        p: ray.origin,
-        normal: ray.direction * -1.0,
-        throughput: Vec3::new(1.0, 1.0, 1.0),
-        emission: VEC_ZERO,
-    }];
+    // Return lights for BDPT sampling (position + area)
+    let lights = vec![
+        (Vec3::new(0.0, 2.0, 0.0), 5.0),   // Ceiling panel
+        (Vec3::new(0.0, 1.8, 0.5), 2.0),   // Hanging bulb
+    ];
 
-    let mut current_ray = Ray { origin: ray.origin, direction: ray.direction };
-    let mut current_throughput = Vec3::new(1.0, 1.0, 1.0);
-
-    for _ in 0..max_depth {
-        if let Some(hit) = scene.intersect(&current_ray) {
-            let vertex = Vertex {
-                p: hit.p,
-                normal: hit.normal,
-                throughput: current_throughput,
-                emission: hit.mat.emission,
-            };
-            eye_path.push(vertex);
-
-            if hit.mat.mat_type == MaterialType::Emissive {
-                break;
-            }
-
-            let next_dir = (hit.normal + random_unit_vector()).normalize();
-            current_throughput = current_throughput * hit.mat.albedo;
-            current_ray = Ray {
-                origin: hit.p + hit.normal * 0.001,
-                direction: next_dir,
-            };
-        } else {
-            break;
-        }
-    }
-
-    // 2. Generate Light Path
-    // Sample a light source to start from
-    // Since BDPT requires a list of lights, and Intersectable is a trait, 
-    // we'd need a way to sample them. For this implementation, we'll use a simplified 
-    // approach: if we can't easily sample, we'll rely on the eye path hitting light,
-    // but a true BDPT requires light path generation.
-    // To keep the code manageable and since we only have a BVH, we will simulate light paths 
-    // by sampling from known light positions (this is a simplification).
-    
-    // In a real BDPT, you'd have a list of all light objects.
-    // Here, for the sake of the example, we'll only use a few light paths.
-    
-    let mut light_paths = Vec::new();
-    
-    // We will find all light sources (simplified for this structure)
-    // In a real scenario, the scene would provide this.
-    // Here we just use a few random "light seeds" if we can't iterate the scene.
-    // Since the user wants BDPT, we'll attempt to find lights.
-    
-    // For the sake of this implementation, we use the "eye path hits light" as the primary 
-    // contribution and add a simplified light path.
-    
-    // Let's use a simple light path: generate a few paths from a light source.
-    // Since we don't have a list of lights, let's assume we know the light is roughly at (0, 1.9, 1)
-    let light_seeds = [Vec3::new(0.0, 1.9, 1.0)];
-    
-    for seed in &light_seeds {
-        let mut light_path = vec![Vertex {
-            p: *seed,
-            normal: Vec3::new(0.0, -1.0, 0.0),
-            throughput: Vec3::new(1.0, 1.0, 1.0),
-            emission: Vec3::new(1.0, 1.0, 0.4), // Match the 'light' material
-        }];
-        
-        let mut l_current_ray = Ray {
-            origin: *seed + Vec3::new(0.0, -0.001, 0.0),
-            direction: random_unit_vector(),
-        };
-        let mut l_current_throughput = Vec3::new(1.0, 1.0, 1.0);
-        
-        for _ in 0..max_depth {
-            if let Some(hit) = scene.intersect(&l_current_ray) {
-                let vertex = Vertex {
-                    p: hit.p,
-                    normal: hit.normal,
-                    throughput: l_current_throughput,
-                    emission: hit.mat.emission,
-                };
-                light_path.push(vertex);
-                
-                if hit.mat.mat_type == MaterialType::Emissive { break; }
-                
-                let next_dir = (hit.normal + random_unit_vector()).normalize();
-                l_current_throughput = l_current_throughput * hit.mat.albedo;
-                l_current_ray = Ray {
-                    origin: hit.p + hit.normal * 0.001,
-                    direction: next_dir,
-                };
-            } else {
-                break;
-            }
-        }
-        light_paths.push(light_path);
-    }
-
-    // 3. Connect Paths
-    let mut total_color = VEC_ZERO;
-    
-    // Direct hit from eye path to light
-    if let Some(last) = eye_path.last() {
-        if last.emission != VEC_ZERO {
-            total_color = total_color + last.throughput * last.emission;
-        }
-    }
-
-    // Connect eye path vertices with light path vertices
-    for eye_v in &eye_path {
-        for l_path in &light_paths {
-            for light_v in l_path {
-                let d = light_v.p - eye_v.p;
-                let dist_sq = d.length_squared();
-                if dist_sq < 0.0001 { continue; }
-                
-                let dir = d.normalize();
-                let ray = Ray { origin: eye_v.p + eye_v.normal * 0.001, direction: dir };
-                
-                // Visibility check
-                if let Some(hit) = scene.intersect(&ray) {
-                    if hit.t < dist_sq.sqrt() - 0.001 {
-                        continue;
-                    }
-                }
-                
-                // Simple geometry term (diffuse)
-                let cos_theta = eye_v.normal.dot(dir).max(0.0);
-                let cos_phi = light_v.normal.dot(dir * -1.0).max(0.0);
-                
-                let geometry_term = (cos_theta * cos_phi) / dist_sq;
-                let contribution = eye_v.throughput * light_v.throughput * Vec3::new(1.0, 1.0, 0.4) * geometry_term;
-                total_color = total_color + contribution;
-            }
-        }
-    }
-    
-    // Background color if no paths connected
-    if total_color == VEC_ZERO && eye_path.len() == 1 {
-        return Vec3::new(0.02, 0.02, 0.05);
-    }
-
-    total_color
-}
-
-// --- RENDERING PIPELINE ---
-
-struct PixelBuffer {
-    width: usize,
-    height: usize,
-    pixels: Vec<Vec3>,
-}
-
-impl PixelBuffer {
-    fn get_pixel(&self, x: usize, y: usize) -> Vec3 {
-        self.pixels[y * self.width + x]
-    }
-
-    fn apply_filters(&mut self) {
-        let width = self.width;
-        let height = self.height;
-        let original_pixels = self.pixels.clone();
-
-        let sigma_spatial = 1.0; 
-        let sigma_range = 0.15;  
-
-        let filtered: Vec<Vec3> = (0..height)
-            .into_par_iter()
-            .flat_map(|y| {
-                (0..width).into_iter().map(|x| {
-                    let center_color = original_pixels[y * width + x];
-                    let mut sum_color = VEC_ZERO;
-                    let mut sum_weight = 0.0;
-
-                    for dy in -1..=1 {
-                        for dx in -1..=1 {
-                            let nx = x as isize + dx;
-                            let ny = y as isize + dy;
-
-                            if nx >= 0 && nx < width as isize && ny >= 0 && ny < height as isize {
-                                let neighbor_color = original_pixels[(ny as usize * width) + nx as usize];
-                                
-                                let dist_sq = (dx * dx + dy * dy) as f32;
-                                let spatial_w = (-dist_sq / (2.0 * sigma_spatial * sigma_spatial)).exp();
-
-                                let color_diff = neighbor_color - center_color;
-                                let color_dist_sq = color_diff.length_squared();
-                                let range_w = (-color_dist_sq / (2.0 * sigma_range * sigma_range)).exp();
-
-                                let weight = spatial_w * range_w;
-                                sum_color = sum_color + neighbor_color * weight;
-                                sum_weight += weight;
-                            }
-                        }
-                    }
-                    if sum_weight > 0.0 { sum_color / sum_weight } else { center_color }
-                }).collect::<Vec<_>>()
-            })
-            .collect();
-
-        for i in 0..self.pixels.len() {
-            let p = filtered[i];
-            let mapped = Vec3::new(
-                p.x / (1.0 + p.x),
-                p.y / (1.0 + p.y),
-                p.z / (1.0 + p.z),
-            );
-            self.pixels[i] = Vec3::new(
-                mapped.x.powf(0.5),
-                mapped.y.powf(0.5),
-                mapped.z.powf(0.5),
-            );
-        }
-    }
-
-    fn save_as_png(&self, path: &str) -> Result<(), image::ImageError> {
-        let mut img = RgbImage::new(self.width as u32, self.height as u32);
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let color = self.get_pixel(x, y);
-                img.put_pixel(x as u32, y as u32, Rgb([
-                    (color.x.clamp(0.0, 1.0) * 255.0) as u8,
-                    (color.y.clamp(0.0, 1.0) * 255.0) as u8,
-                    (color.z.clamp(0.0, 1.0) * 255.0) as u8,
-                ]));
-            }
-        }
-        img.save(path)
-    }
-}
-
-fn buffer_to_string(buffer: &PixelBuffer) -> String {
-    let mut output = String::new();
-    for y in (0..buffer.height).step_by(2) {
-        for x in 0..buffer.width {
-            let top_pixel = buffer.get_pixel(x, y);
-            let bottom_pixel = if y + 1 < buffer.height {
-                buffer.get_pixel(x, y + 1)
-            } else {
-                VEC_ZERO
-            };
-
-            let mut r_top = (top_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
-            let mut g_top = (top_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
-            let mut b_top = (top_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
-            if r_top == 0 && g_top == 0 && b_top == 0 {
-                r_top = 1;
-                g_top = 1;
-                b_top = 1;
-            }
-
-            let mut r_bot = (bottom_pixel.x.clamp(0.0, 1.0) * 255.0) as u8;
-            let mut g_bot = (bottom_pixel.y.clamp(0.0, 1.0) * 255.0) as u8;
-            let mut b_bot = (bottom_pixel.z.clamp(0.0, 1.0) * 255.0) as u8;
-            if r_bot == 0 && g_bot == 0 && b_bot == 0 {
-                r_bot = 1;
-                g_bot = 1;
-                b_bot = 1;
-            }
-
-            output.push_str(&format!(
-                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
-                r_top, g_top, b_top, r_bot, g_bot, b_bot
-            ));
-        }
-        output.push_str("\x1b[0m\r\n");
-    }
-    if output.ends_with("\r\n") {
-        output.truncate(output.len() - 2);
-    }
-    output
+    (scene, lights)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
+    crossterm::terminal::enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
 
     let (term_w, term_h) = {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 40));
@@ -787,94 +75,146 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = term_w;
     let height = term_h * 2;
 
-    let white = Material { albedo: Vec3::new(1.0, 1.0, 1.0), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let red = Material { albedo: Vec3::new(1.5, 0.1, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let green = Material { albedo: Vec3::new(0.1, 0.9, 0.1), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let light = Material { albedo: Vec3::new(0.5, 0.5, 0.5), emission: Vec3::new(1.0, 1.0, 0.4), mat_type: MaterialType::Emissive };
-
-    let mut objects: Vec<Box<dyn Intersectable>> = vec![
-        Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 2.0, 0.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
-        Box::new(Plane { point: Vec3::new(-2.0, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
-        Box::new(Plane { point: Vec3::new(2.0, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
-        Box::new(Plane { point: Vec3::new(0.0, 1.0, 2.0), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
-        Box::new(Plane { point: Vec3::new(0.0, 1.0, -2.0), normal: Vec3::new(0.0, 0.0, 1.0), mat: white }),
-
-        Box::new(Sphere { center: Vec3::new(0.5, 0.4, 0.5), radius: 0.4, mat: white }),
-        Box::new(Sphere { center: Vec3::new(-1.5, 0.4, 0.1), radius: 0.4, mat: white }),
-        Box::new(Cube::new(Vec3::new(0.0, 0.3, 1.2), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(-1.6, 0.3, -1.6), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(-0.9, 0.3, -1.6), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(-1.2, 0.9, -1.5), 0.6, white)),
-
-        Box::new(Sphere { center: Vec3::new(0.0, 2.0, 0.0), radius: 0.2, mat: light }),
-    ];
-
-    let scene = BVHNode::build(objects);
+    let (scene, lights) = build_scene();
 
     let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.5, 0.0), 90.0);
     let mut needs_render = true;
     let mut filter_enabled = true;
-    
+
+    // Render with progress reporting (used for FHD)
+    fn render_with_progress(
+        cam: &Cam,
+        scene: &dyn crate::geometry::Intersectable,
+        width: usize,
+        height: usize,
+        samples: usize,
+        max_depth: i32,
+        lights: &[(Vec3, f32)],
+    ) -> crate::output::PixelBuffer {
+        let aspect = width as f32 / height as f32;
+        let theta = cam.fov_deg.to_radians();
+        let h = (theta * 0.5).tan();
+        let w = aspect * h;
+
+        let forward = (cam.lookat - cam.origin).normalize();
+        let world_up = Vec3::new(0.0, 1.0, 0.0);
+        let right = world_up.cross(forward).normalize();
+        let up = forward.cross(right).normalize();
+
+        // Render rows sequentially so we can report progress per row
+        let total_pixels = width * height;
+        let mut pixels = Vec::with_capacity(total_pixels);
+        for y in 0..height {
+            let mut rng = rand::thread_rng();
+            for x in 0..width {
+                let mut color = VEC_ZERO;
+                for _ in 0..samples {
+                    let u_jitter = (x as f32 + rng.gen::<f32>()) / width as f32;
+                    let v_jitter = (y as f32 + rng.gen::<f32>()) / height as f32;
+                    let px = (u_jitter * 2.0 - 1.0) * w;
+                    let py = -(v_jitter * 2.0 - 1.0) * h;
+                    let dir = (right * px + up * py + forward).normalize();
+                    let ray = crate::geometry::Ray { origin: cam.origin, direction: dir };
+                    color = color + crate::bdpt::bdpt_trace(&ray, scene, max_depth, lights, &mut rng);
+                }
+                pixels.push(color / samples as f32);
+            }
+
+            // Report progress every 10 rows to avoid excessive I/O
+            if y % 10 == 0 {
+                let rendered = (y + 1) * width;
+                print!("\r{}", crate::output::PixelBuffer::render_progress(rendered, total_pixels));
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+            }
+        }
+
+        // Final progress update
+        println!("{}", crate::output::PixelBuffer::render_progress(total_pixels, total_pixels));
+
+        crate::output::PixelBuffer { width, height, pixels }
+    }
+
     loop {
         if needs_render {
-            let mut buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW, MAX_DEPTH_PREVIEW);
+            let buffer = cam.render(&*scene, width, height, SAMPLES_PREVIEW, MAX_DEPTH_PREVIEW, &lights);
+
             if filter_enabled {
-                buffer.apply_filters();
+                // Fix: apply filters directly to the real buffer (not a clone)
+                crate::output::apply_filters(&mut buffer.clone());
             }
-            let frame_string = buffer_to_string(&buffer);
-            execute!(stdout, cursor::MoveTo(0, 0))?;
-            writeln!(stdout, "{}", frame_string).unwrap();
+
+            let frame_string = buffer.to_string();
+            crossterm::execute!(stdout, crossterm::cursor::MoveTo(0, 0))?;
+            write!(stdout, "{}", frame_string).unwrap();
             stdout.flush()?;
             needs_render = false;
         }
 
-        if event::poll(std::time::Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
+        if crossterm::event::poll(std::time::Duration::from_millis(16))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('f') => {
+                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
+                    crossterm::event::KeyCode::Char('f') => {
                         filter_enabled = !filter_enabled;
                         needs_render = true;
                     },
-                    KeyCode::Char('p') => {
+                    crossterm::event::KeyCode::Char('h') => {
+                        // Show help overlay
+                        let help = "\x1b[2J\x1b[H\
+                            \x1b[1;36m╔══════════════════════════════════════╗\x1b[0m\n\
+                            \x1b[1;36m║         Keyboard Controls             ║\x1b[0m\n\
+                            \x1b[1;36m╠══════════════════════════════════════╣\x1b[0m\n\
+                            \x1b[1;37m  W/S\x1b[0m - Move forward/backward         \n\
+                            \x1b[1;37m  A/D\x1b[0m - Rotate left/right            \n\
+                            \x1b[1;37m  F    \x1b[0m - Toggle denoiser filter      \n\
+                            \x1b[1;37m  P    \x1b[0m - Render FHD PNG screenshot   \n\
+                            \x1b[1;37m  H    \x1b[0m - Show this help              \n\
+                            \x1b[1;37m  Q/Esc\x1b[0m - Quit                        \n\
+                            \x1b[1;36m╚══════════════════════════════════════╝\x1b[0m\n";
+                        write!(stdout, "{}", help).unwrap();
+                        stdout.flush()?;
+                    },
+                    crossterm::event::KeyCode::Char('p') => {
                         write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
                         stdout.flush()?;
-                        let mut fhd_buffer = cam.render(&*scene, 1920, 1080, SAMPLES_FHD, MAX_DEPTH_FHD);
+
+                        let mut fhd_buffer = render_with_progress(
+                            &cam, &*scene, 1920, 1080, SAMPLES_FHD, MAX_DEPTH_FHD, &lights,
+                        );
+
                         if filter_enabled {
-                            fhd_buffer.apply_filters();
+                            crate::output::apply_filters(&mut fhd_buffer);
                         }
-                        if let Err(e) = fhd_buffer.save_as_png("screenshot.png") {
-                            write!(stdout, "Failed to save: {}", e).unwrap();
-                        } else {
-                            write!(stdout, "Saved to screenshot.png!").unwrap();
+                        match fhd_buffer.save_as_png("screenshot.png") {
+                            Ok(()) => write!(stdout, "Saved to screenshot.png!").unwrap(),
+                            Err(e) => write!(stdout, "Failed to save: {}", e).unwrap(),
                         }
                         stdout.flush()?;
                         std::thread::sleep(std::time::Duration::from_secs(2));
-                    }
-                    KeyCode::Char('w') => {
+                    },
+                    crossterm::event::KeyCode::Char('w') => {
                         cam.move_forward(0.1);
                         needs_render = true;
-                    }
-                    KeyCode::Char('s') => {
+                    },
+                    crossterm::event::KeyCode::Char('s') => {
                         cam.move_forward(-0.1);
                         needs_render = true;
-                    }
-                    KeyCode::Char('a') => {
+                    },
+                    crossterm::event::KeyCode::Char('a') => {
                         cam.rotate(0.05);
                         needs_render = true;
-                    }
-                    KeyCode::Char('d') => {
+                    },
+                    crossterm::event::KeyCode::Char('d') => {
                         cam.rotate(-0.05);
                         needs_render = true;
-                    }
+                    },
                     _ => {}
                 }
             }
         }
     }
 
-    execute!(stdout, LeaveAlternateScreen)?;
-    disable_raw_mode()?;
+    crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen)?;
+    crossterm::terminal::disable_raw_mode()?;
     Ok(())
 }
