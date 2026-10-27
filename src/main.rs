@@ -16,9 +16,9 @@ use std::io::Write;
 
 // --- CONFIGURATION ---
 const SAMPLES_PREVIEW: usize = 16;
-const MAX_DEPTH_PREVIEW: usize = 4;
-const SAMPLES_FHD: usize = 64;
-const MAX_DEPTH_FHD: usize = 6;
+const MAX_DEPTH_PREVIEW: usize = 2;
+const SAMPLES_FHD: usize = 128;
+const MAX_DEPTH_FHD: usize = 8;
 
 /// Build the scene with multiple objects for interesting lighting.
 fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
@@ -43,7 +43,7 @@ fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
 
         // Back wall
-        Box::new(Plane { point: Vec3::new(0.0, 2.0, -2.5), normal: Vec3::new(0.0, 0.0, 1.0), mat: blue }),
+        Box::new(Plane { point: Vec3::new(0.0, 2.0, -2.5), normal: Vec3::new(0.0, 0.0, 1.0), mat: white }),
 
         // Left wall (red)
         Box::new(Plane { point: Vec3::new(-2.5, 1.0, 0.0), normal: Vec3::new(1.0, 0.0, 0.0), mat: red }),
@@ -51,20 +51,26 @@ fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
         // Right wall (green)
         Box::new(Plane { point: Vec3::new(2.5, 1.0, 0.0), normal: Vec3::new(-1.0, 0.0, 0.0), mat: green }),
 
+        // Front
+        Box::new(Plane { point: Vec3::new(0.0, 2.0, 2.5), normal: Vec3::new(0.0, 0.0, -1.0), mat: white }),
+
         // Ceiling light panel
-        Box::new(ceiling_light.clone()),
+        //Box::new(ceiling_light.clone()),
 
         // Central sphere
-        Box::new(Sphere { center: Vec3::new(0.0, 0.5, 0.0), radius: 0.5, mat: yellow }),
+        Box::new(Sphere { center: Vec3::new(-0.7, 0.5, -0.8), radius: 0.5, mat: yellow }),
 
         // Small spheres
-        Box::new(Sphere { center: Vec3::new(-1.2, 0.3, -0.5), radius: 0.3, mat: blue }),
+        Box::new(Sphere { center: Vec3::new(-1.2, 0.3, -0.4), radius: 0.3, mat: blue }),
         Box::new(Sphere { center: Vec3::new(1.2, 0.3, -0.5), radius: 0.3, mat: red }),
 
         // Stacked cubes for interesting shadows
-        Box::new(Cube::new(Vec3::new(-0.8, 0.4, 0.8), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(0.9, 0.4, 0.8), 0.6, green)),
-        Box::new(Cube::new(Vec3::new(-0.2, 1.0, -0.5), 0.4, red)),
+        Box::new(Cube::new(Vec3::new(0.3, 0.5, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(0.92, 0.6, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(1.54, 0.4, 0.8), 0.6, white)),
+
+        Box::new(Cube::new(Vec3::new(0.45, 1.2, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(1.07, 1.2, 0.8), 0.6, white)),
 
         // Hanging light (small emissive sphere)
         Box::new(Sphere { center: Vec3::new(0.0, 1.8, 0.5), radius: 0.1, mat: light_mat }),
@@ -75,7 +81,7 @@ fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
     // Area lights must mirror the emissive geometry so BDPT can connect
     // paths to real surfaces.
     let lights = vec![
-        AreaLight::from_quad(&ceiling_light),
+        //AreaLight::from_quad(&ceiling_light),
         AreaLight::from_sphere(&Sphere { center: Vec3::new(0.0, 1.8, 0.5), radius: 0.1, mat: light_mat }),
     ];
 
