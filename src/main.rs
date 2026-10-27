@@ -121,7 +121,9 @@ mod tests {
     #[test]
     fn scene_builds_and_is_sampleable() {
         let (scene, lights) = build_scene();
-        assert_eq!(lights.len(), 2);
+        // The ceiling quad light is currently disabled; only the hanging
+        // sphere light is sampleable.
+        assert_eq!(lights.len(), 1);
         for light in &lights {
             assert!(light.area() > 0.0);
             assert!(light.emission.x > 0.0 || light.emission.y > 0.0 || light.emission.z > 0.0);

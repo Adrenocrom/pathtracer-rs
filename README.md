@@ -2,18 +2,22 @@
 
 A high-performance, interactive path tracer rendered directly in the terminal using Rust. This project demonstrates the intersection of physically based rendering (PBR) and low-resolution terminal output.
 
+![Example render of the demo scene: a Cornell-box style room lit by a hanging sphere light, with red and green side walls, diffuse spheres and stacked white cubes.](example.png)
+
+*The demo scene rendered with bidirectional path tracing — indirect color bleeding from the red and green walls, soft shadows from the hanging sphere light, and global illumination in the cube stack.*
+
 ## 🚀 Features
 
-- **Bidirectional Path Tracing:** Camera and light subpaths are traced simultaneously and connected at every vertex pair, with multiple-importance sampling (power heuristic) to combine all connection strategies without bias.
+- **Bidirectional Path Tracing:** Camera and light subpaths are traced simultaneously and connected at every vertex pair, with multiple-importance sampling (power heuristic, β = 2) to combine all connection strategies without bias.
 - **Real-time Rendering:** Interactive preview rendered using terminal half-blocks (`▀`) to double vertical resolution.
 - **Temporal Accumulation:** Progressive rendering that averages up to 32 frames while the camera remains stationary, cleaning up noise over time.
 - **Interactive Exploration:** Full WASD controls for navigating the scene in 3D space.
 - **Advanced Post-Processing:**
-    - **Bilateral Filtering:** Edge-preserving denoising to remove path-tracing grain while keeping silhouettes crisp.
-    - **Gamma Correction:** Linear-to-sRGB conversion for natural lighting.
+    - **Bilateral Filtering:** Edge-preserving denoising on the linear HDR buffer to remove path-tracing grain while keeping silhouettes crisp.
     - **Reinhard Tone Mapping:** Preserves detail in high-intensity emissive areas.
-- **High-Quality Export:** Trigger a full FHD (1920x1080) render with high sample counts, saved as a PNG.
-- **BVH Acceleration:** Scene geometry is organized in a bounding volume hierarchy for fast ray intersection.
+    - **Gamma Correction:** Linear-to-sRGB conversion (γ = 2.2) for natural lighting.
+- **High-Quality Export:** Trigger a full FHD (1920×1080) render at 128 samples per pixel with up to 8 bounces, saved as a PNG with a progress bar.
+- **BVH Acceleration:** Scene geometry is organized in a bounding volume hierarchy (median split along the widest axis, with a subtree early-exit test) for fast ray intersection.
 
 ## 🎮 Controls
 
@@ -35,6 +39,7 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 - **Terminal Handling:** `crossterm` for raw mode, alternate screen, and ANSI 24-bit color sequences.
 - **Image Processing:** `image` crate for PNG export.
 - **Light Transport:** Bidirectional path tracing with cosine-weighted diffuse sampling, area-light sampling, and MIS power-heuristic weights. Every path edge sampled from either subpath has area pdf `G/π`, which keeps the MIS weights simple and exact.
+- **Scene:** A Cornell-box style room — red and green side walls, diffuse spheres, a stack of white cubes, and a hanging emissive sphere light that is also sampleable as an area light.
 - **Complexity:** Implements a full orthonormal camera basis and a bidirectional path-tracing loop with vertex connection.
 
 ## 📦 Getting Started
@@ -53,6 +58,7 @@ cargo run --release
 ```bash
 cargo test
 ```
+The test suite covers the MIS weights (hand-computed values and sum-to-one), light-transport sanity checks (direct hits, shadows, energy bounds), geometry intersection, the bilateral denoiser, and temporal accumulation.
 
 ## 📈 Rendering Pipeline
 `Ray Generation` $\rightarrow$ `Intersection Testing (BVH)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output`
