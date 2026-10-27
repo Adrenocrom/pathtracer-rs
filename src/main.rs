@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use std::io::Write;
 
 // --- CONFIGURATION ---
-const SAMPLES_PREVIEW: usize = 16;
+const SAMPLES_PREVIEW: usize = 6;
 const MAX_DEPTH_PREVIEW: usize = 2;
 const SAMPLES_FHD: usize = 128;
 const MAX_DEPTH_FHD: usize = 8;
@@ -27,7 +27,7 @@ fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
     let green = Material { albedo: Vec3::new(0.25, 0.75, 0.25), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let blue = Material { albedo: Vec3::new(0.25, 0.4, 0.75), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
     let yellow = Material { albedo: Vec3::new(0.8, 0.7, 0.2), emission: VEC_ZERO, mat_type: MaterialType::Diffuse };
-    let light_mat = Material { albedo: VEC_ZERO, emission: Vec3::new(3.0, 2.8, 1.5), mat_type: MaterialType::Emissive };
+    let light_mat = Material { albedo: VEC_ZERO, emission: Vec3::new(10.0, 10.0, 4.0), mat_type: MaterialType::Emissive };
 
     // Ceiling light panel (finite quad, so it can be area-sampled).
     let ceiling_light = Quad::new(
@@ -65,12 +65,12 @@ fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
         Box::new(Sphere { center: Vec3::new(1.2, 0.3, -0.5), radius: 0.3, mat: red }),
 
         // Stacked cubes for interesting shadows
-        Box::new(Cube::new(Vec3::new(0.3, 0.5, 0.8), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(0.92, 0.6, 0.8), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(1.54, 0.4, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(0.3, 0.3, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(0.92, 0.3, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(1.54, 0.3, 0.8), 0.6, white)),
 
-        Box::new(Cube::new(Vec3::new(0.45, 1.2, 0.8), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(1.07, 1.2, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(0.45, 0.9, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(1.07, 0.9, 0.8), 0.6, white)),
 
         // Hanging light (small emissive sphere)
         Box::new(Sphere { center: Vec3::new(0.0, 1.8, 0.5), radius: 0.1, mat: light_mat }),
