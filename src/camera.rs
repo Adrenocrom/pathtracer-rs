@@ -1,11 +1,12 @@
 use crate::math::{Vec3, VEC_ZERO};
 use rand::Rng;
+use rayon::prelude::*;
 
 // --- CAMERA ---
 pub struct Cam {
     pub origin: Vec3,
     pub lookat: Vec3,
-    pub fov_deg: f32, 
+    pub fov_deg: f32,
 }
 
 impl Cam {
@@ -17,25 +18,31 @@ impl Cam {
         }
     }
 
-    /// Render the scene using BDPT. `lights` is a list of (position, area) pairs for light sampling.
+    /// Orthonormal camera basis (forward, right, up).
+    fn basis(&self) -> (Vec3, Vec3, Vec3) {
+        let forward = (self.lookat - self.origin).normalize();
+        let world_up = Vec3::new(0.0, 1.0, 0.0);
+        let right = world_up.cross(forward).normalize();
+        let up = forward.cross(right).normalize();
+        (forward, right, up)
+    }
+
+    /// Render the scene using BDPT. `lights` are the sampleable area lights.
     pub fn render(
         &self,
         scene: &dyn crate::geometry::Intersectable,
         width: usize,
         height: usize,
         samples: usize,
-        max_depth: i32,
-        lights: &[(Vec3, f32)],
+        max_depth: usize,
+        lights: &[crate::geometry::AreaLight],
     ) -> crate::output::PixelBuffer {
         let aspect = width as f32 / height as f32;
         let theta = self.fov_deg.to_radians();
-        let h = (theta * 0.5).tan(); 
+        let h = (theta * 0.5).tan();
         let w = aspect * h;
 
-        let forward = (self.lookat - self.origin).normalize();
-        let world_up = Vec3::new(0.0, 1.0, 0.0);
-        let right = world_up.cross(forward).normalize();
-        let up = forward.cross(right).normalize();
+        let (forward, right, up) = self.basis();
 
         // One RNG per thread for performance
         let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
@@ -51,7 +58,7 @@ impl Cam {
                     let py = -(v_jitter * 2.0 - 1.0) * h;
 
                     let dir = (right * px + up * py + forward).normalize();
-                    
+
                     let ray = crate::geometry::Ray { origin: self.origin, direction: dir };
                     color = color + crate::bdpt::bdpt_trace(&ray, scene, max_depth, lights, &mut rng);
                 }
@@ -75,7 +82,7 @@ impl Cam {
     pub fn rotate(&mut self, angle_rad: f32) {
         let cos_a = angle_rad.cos();
         let sin_a = angle_rad.sin();
-        
+
         let rel_lookat = self.lookat - self.origin;
         let rotated_lookat = Vec3::new(
             rel_lookat.x * cos_a - rel_lookat.z * sin_a,

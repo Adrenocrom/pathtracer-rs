@@ -4,14 +4,16 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 
 ## 🚀 Features
 
+- **Bidirectional Path Tracing:** Camera and light subpaths are traced simultaneously and connected at every vertex pair, with multiple-importance sampling (power heuristic) to combine all connection strategies without bias.
 - **Real-time Rendering:** Interactive preview rendered using terminal half-blocks (`▀`) to double vertical resolution.
-- **Temporal Accumulation:** Progressive rendering that cleans up noise and sharpens the image the longer the camera remains stationary.
+- **Temporal Accumulation:** Progressive rendering that averages up to 32 frames while the camera remains stationary, cleaning up noise over time.
 - **Interactive Exploration:** Full WASD controls for navigating the scene in 3D space.
 - **Advanced Post-Processing:**
     - **Bilateral Filtering:** Edge-preserving denoising to remove path-tracing grain while keeping silhouettes crisp.
     - **Gamma Correction:** Linear-to-sRGB conversion for natural lighting.
     - **Reinhard Tone Mapping:** Preserves detail in high-intensity emissive areas.
 - **High-Quality Export:** Trigger a full FHD (1920x1080) render with high sample counts, saved as a PNG.
+- **BVH Acceleration:** Scene geometry is organized in a bounding volume hierarchy for fast ray intersection.
 
 ## 🎮 Controls
 
@@ -21,16 +23,19 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 | `S` | Move Backward |
 | `A` | Rotate Left (Yaw) |
 | `D` | Rotate Right (Yaw) |
+| `F` | Toggle Denoiser |
+| `H` | Show Help |
 | `P` | Render High-Quality FHD Screenshot (`screenshot.png`) |
 | `Q` / `Esc` | Quit |
 
 ## 🛠️ Technical Details
 
 - **Language:** Rust
-- **Parallelism:** Powered by `rayon` for multi-core ray tracing.
+- **Parallelism:** Powered by `rayon` for multi-core ray tracing (preview and FHD renders).
 - **Terminal Handling:** `crossterm` for raw mode, alternate screen, and ANSI 24-bit color sequences.
 - **Image Processing:** `image` crate for PNG export.
-- **Complexity:** Implements a full orthonormal camera basis and a recursive path-tracing loop with diffuse bouncing.
+- **Light Transport:** Bidirectional path tracing with cosine-weighted diffuse sampling, area-light sampling, and MIS power-heuristic weights. Every path edge sampled from either subpath has area pdf `G/π`, which keeps the MIS weights simple and exact.
+- **Complexity:** Implements a full orthonormal camera basis and a bidirectional path-tracing loop with vertex connection.
 
 ## 📦 Getting Started
 
@@ -44,5 +49,10 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 cargo run --release
 ```
 
+### Running the tests
+```bash
+cargo test
+```
+
 ## 📈 Rendering Pipeline
-`Ray Generation` $\rightarrow$ `Intersection Testing` $\rightarrow$ `Recursive Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output`
+`Ray Generation` $\rightarrow$ `Intersection Testing (BVH)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output`

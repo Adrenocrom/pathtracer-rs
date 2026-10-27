@@ -1,4 +1,4 @@
-use crate::math::{BBox, Vec3};
+use crate::math::BBox;
 use crate::geometry::{Intersectable, HitRecord};
 
 // --- BVH NODE ---

@@ -1,5 +1,5 @@
-use image::{RgbImage, Rgb};
-use rayon::prelude::*;
+use crate::math::{Vec3, VEC_ZERO};
+use image::{Rgb, RgbImage};
 
 /// A buffer of pixels ready for output.
 pub struct PixelBuffer {
@@ -107,49 +107,117 @@ impl PixelBuffer {
     }
 }
 
-/// Simple box blur denoiser (much cheaper than bilateral filter).
-fn box_blur(pixels: &[Vec3], width: usize, height: usize, radius: i32) -> Vec<Vec3> {
+/// Edge-preserving bilateral denoiser.
+///
+/// A neighbor contributes with weight `exp(-|d|^2 / 2 sigma_r^2)` based on its
+/// color distance `d` from the center pixel, so flat regions are smoothed
+/// while silhouettes stay crisp. `sigma_r` is in linear-light units.
+fn bilateral(pixels: &[Vec3], width: usize, height: usize, radius: i32, sigma_r: f32) -> Vec<Vec3> {
+    let inv_two_sigma_sq = 1.0 / (2.0 * sigma_r * sigma_r);
     let mut result = vec![VEC_ZERO; width * height];
 
     for y in 0..height {
         for x in 0..width {
+            let center = pixels[y * width + x];
             let mut sum = VEC_ZERO;
-            let mut count = 0u32;
+            let mut weight_sum = 0.0f32;
 
             for dy in -radius..=radius {
                 for dx in -radius..=radius {
                     let nx = x as i32 + dx;
                     let ny = y as i32 + dy;
-                    if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
-                        sum = sum + pixels[ny as usize * width + nx as usize];
-                        count += 1;
+                    if nx < 0 || nx >= width as i32 || ny < 0 || ny >= height as i32 {
+                        continue;
                     }
+                    let neighbor = pixels[ny as usize * width + nx as usize];
+                    let d = neighbor - center;
+                    let dist_sq = d.dot(d);
+                    let w = (-dist_sq * inv_two_sigma_sq).exp();
+                    sum = sum + neighbor * w;
+                    weight_sum += w;
                 }
             }
 
-            result[y * width + x] = if count > 0 { sum / count as f32 } else { VEC_ZERO };
+            result[y * width + x] = if weight_sum > 0.0 {
+                sum / weight_sum
+            } else {
+                center
+            };
         }
     }
 
     result
 }
 
-/// Apply tone mapping and optional denoising to the pixel buffer.
+/// Apply the denoiser to the raw (linear-light) pixel buffer.
+///
+/// This operates on linear HDR values *before* tone mapping; the display
+/// functions apply Reinhard + gamma themselves, so filtering must not
+/// tone-map in place (that would double-apply the gamma curve).
 pub fn apply_filters(buffer: &mut PixelBuffer) {
     let width = buffer.width;
     let height = buffer.height;
 
-    // Step 1: Tone map all pixels first (Reinhard + gamma 2.2)
-    for i in 0..buffer.pixels.len() {
-        buffer.pixels[i] = PixelBuffer::tone_map(buffer.pixels[i]);
+    let filtered = bilateral(&buffer.pixels, width, height, 1, 0.15);
+    buffer.pixels.copy_from_slice(&filtered);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bilateral_smooths_noise_within_flat_regions() {
+        // A flat 0.5 region with one slightly-noisy pixel: the filter must
+        // pull the noisy pixel back toward its neighborhood.
+        let width = 5;
+        let height = 5;
+        let mut pixels = vec![Vec3::new(0.5, 0.5, 0.5); width * height];
+        pixels[2 * width + 2] = Vec3::new(0.55, 0.55, 0.55);
+
+        let out = bilateral(&pixels, width, height, 1, 0.15);
+        let smoothed = out[2 * width + 2];
+        assert!(
+            smoothed.x < 0.52 && smoothed.x > 0.48,
+            "noise not smoothed: {smoothed:?}"
+        );
     }
 
-    // Step 2: Light denoising via box blur (radius 1, very subtle)
-    let blurred = box_blur(&buffer.pixels, width, height, 1);
+    #[test]
+    fn bilateral_preserves_hard_edges() {
+        // A hard 0.1 | 1.0 step: pixels adjacent to the edge must keep their
+        // value (that is the whole point of an edge-preserving filter).
+        let width = 6;
+        let height = 3;
+        let mut pixels = Vec::with_capacity(width * height);
+        for _y in 0..height {
+            for x in 0..width {
+                pixels.push(if x < 3 {
+                    Vec3::new(0.1, 0.1, 0.1)
+                } else {
+                    Vec3::new(1.0, 1.0, 1.0)
+                });
+            }
+        }
 
-    // Blend original and blurred for a mild smoothing effect
-    let blend = 0.3;
-    for i in 0..buffer.pixels.len() {
-        buffer.pixels[i] = buffer.pixels[i] * (1.0 - blend) + blurred[i] * blend;
+        let out = bilateral(&pixels, width, height, 1, 0.15);
+
+        // Bright pixel right at the boundary stays bright...
+        let bright_edge = out[1 * width + 3];
+        assert!(bright_edge.x > 0.95, "edge blurred away: {bright_edge:?}");
+        // ...and its dark neighbor stays dark.
+        let dark_edge = out[1 * width + 2];
+        assert!(dark_edge.x < 0.15, "edge leaked: {dark_edge:?}");
+    }
+
+    #[test]
+    fn tone_map_is_monotonic_and_bounded() {
+        for v in [0.0f32, 0.01, 0.1, 0.5, 1.0, 2.0, 10.0, 100.0] {
+            let t = PixelBuffer::tone_map(Vec3::new(v, v, v));
+            assert!(t.x >= 0.0 && t.x <= 1.0);
+        }
+        let a = PixelBuffer::tone_map(Vec3::new(0.2, 0.2, 0.2));
+        let b = PixelBuffer::tone_map(Vec3::new(0.4, 0.4, 0.4));
+        assert!(a.x < b.x);
     }
 }

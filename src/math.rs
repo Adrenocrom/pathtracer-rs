@@ -1,12 +1,12 @@
-use std::ops::{Add, Sub, Mul, Div};
+//! Minimal linear algebra: 3-component vectors and AABBs.
+
+use std::ops::{Add, Div, Index, Mul, Neg, Sub};
 
 // --- CONSTANTS ---
 pub const EPS_NEAR: f32 = 0.001;
-pub const EPS_NORMAL: f32 = 0.001;
-pub const DENOM_TOLERANCE: f32 = 1e-6;
 pub const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
-// --- VEC3 UTILS ---
+// --- VEC3 ---
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vec3 {
     pub x: f32,
@@ -53,6 +53,24 @@ impl Vec3 {
     }
 }
 
+impl Index<usize> for Vec3 {
+    type Output = f32;
+    fn index(&self, i: usize) -> &f32 {
+        match i {
+            0 => &self.x,
+            1 => &self.y,
+            _ => &self.z,
+        }
+    }
+}
+
+impl Neg for Vec3 {
+    type Output = Vec3;
+    fn neg(self) -> Vec3 {
+        Vec3::new(-self.x, -self.y, -self.z)
+    }
+}
+
 impl Add for Vec3 {
     type Output = Vec3;
     fn add(self, other: Vec3) -> Vec3 {
@@ -74,6 +92,7 @@ impl Mul<f32> for Vec3 {
     }
 }
 
+/// Component-wise product (used for throughput accumulation).
 impl Mul<Vec3> for Vec3 {
     type Output = Vec3;
     fn mul(self, other: Vec3) -> Vec3 {
@@ -110,34 +129,34 @@ impl BBox {
         }
     }
 
+    /// Slab test. Handles axis-parallel rays explicitly so it never produces
+    /// NaN from `0 * infinity` (which would silently drop valid hits).
     pub fn intersect(&self, ray: &crate::geometry::Ray) -> bool {
         let mut t_min = f32::NEG_INFINITY;
         let mut t_max = f32::INFINITY;
 
-        // X
-        let inv_dir_x = 1.0 / ray.direction.x;
-        let mut t0x = (self.min.x - ray.origin.x) * inv_dir_x;
-        let mut t1x = (self.max.x - ray.origin.x) * inv_dir_x;
-        if inv_dir_x < 0.0 { std::mem::swap(&mut t0x, &mut t1x); }
-        t_min = t_min.max(t0x);
-        t_max = t_max.min(t1x);
+        for i in 0..3 {
+            let (o, d) = (ray.origin[i], ray.direction[i]);
+            if d == 0.0 {
+                // Parallel to this slab: the origin must lie inside it.
+                if o < self.min[i] || o > self.max[i] {
+                    return false;
+                }
+            } else {
+                let inv = 1.0 / d;
+                let mut t0 = (self.min[i] - o) * inv;
+                let mut t1 = (self.max[i] - o) * inv;
+                if t0 > t1 {
+                    std::mem::swap(&mut t0, &mut t1);
+                }
+                t_min = t_min.max(t0);
+                t_max = t_max.min(t1);
+                if t_min > t_max {
+                    return false;
+                }
+            }
+        }
 
-        // Y
-        let inv_dir_y = 1.0 / ray.direction.y;
-        let mut t0y = (self.min.y - ray.origin.y) * inv_dir_y;
-        let mut t1y = (self.max.y - ray.origin.y) * inv_dir_y;
-        if inv_dir_y < 0.0 { std::mem::swap(&mut t0y, &mut t1y); }
-        t_min = t_min.max(t0y);
-        t_max = t_max.min(t1y);
-
-        // Z
-        let inv_dir_z = 1.0 / ray.direction.z;
-        let mut t0z = (self.min.z - ray.origin.z) * inv_dir_z;
-        let mut t1z = (self.max.z - ray.origin.z) * inv_dir_z;
-        if inv_dir_z < 0.0 { std::mem::swap(&mut t0z, &mut t1z); }
-        t_min = t_min.max(t0z);
-        t_max = t_max.min(t1z);
-
-        t_max >= t_min && t_max > 0.0
+        t_max > 0.0
     }
 }
