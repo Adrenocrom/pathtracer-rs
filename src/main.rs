@@ -22,14 +22,15 @@ use std::io::Write;
 const SAMPLES_PREVIEW: usize = 1;
 const MAX_DEPTH_PREVIEW: usize = 4;
 const SAMPLES_FHD: usize = 1024;
-const MAX_DEPTH_FHD: usize = 8;
+const MAX_DEPTH_FHD: usize = 4;
 
 /// Build the scene with multiple objects for interesting lighting.
 fn build_scene() -> SceneData {
+    let emision = Vec3::new(100.0, 100.0, 100.0);
     let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
     let red = MaterialData::diffuse(Vec3::new(0.75, 0.25, 0.25));
     let green = MaterialData::diffuse(Vec3::new(0.25, 0.75, 0.25));
-    let light_mat = MaterialData::emissive(Vec3::new(100.0, 100.0, 100.0));
+    let light_mat = MaterialData::emissive(emision);
 
     let mut scene = SceneData::new();
 
@@ -65,12 +66,12 @@ fn build_scene() -> SceneData {
     scene.add_cube(Vec3::new(1.09, 0.9, 0.8), 0.6, white);
 
     // Hanging light (small emissive sphere)
-    scene.add_sphere(Vec3::new(0.2, 0.2, 0.0), 0.1, light_mat);
+    scene.add_sphere(Vec3::new(0.2, 1.8, 0.0), 0.05, light_mat);
 
     // Area lights must mirror the emissive geometry so BDPT can connect
     // paths to real surfaces.
     scene.add_light(LightData::from_sphere(
-        Vec3::new(0.2, 0.2, 0.0), 0.1, Vec3::new(100.0, 100.0, 100.0),
+        Vec3::new(0.2, 1.8, 0.0), 0.05, emision,
     ));
 
     scene
