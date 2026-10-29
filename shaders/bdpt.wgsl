@@ -374,7 +374,13 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         }
         // One-sided surfaces: a back-face hit cannot scatter.
         if (dot(hit.normal, cur_dir) > 0.0) { break; }
-        let edge_g = select(0.0, g_term(eye[eye_len - 1u].p, eye[eye_len - 1u].normal, hit.p, hit.normal), eye_len > 0u);
+        // select() evaluates both branches, so guard the eye[eye_len - 1u]
+        // read with an explicit branch to avoid an out-of-bounds access on
+        // the first step (eye_len == 0).
+        var edge_g = 0.0;
+        if (eye_len > 0u) {
+            edge_g = g_term(eye[eye_len - 1u].p, eye[eye_len - 1u].normal, hit.p, hit.normal);
+        }
         let on_light = hit.mat_type == 1u;
         eye[eye_len] = PathVertex(
             hit.p, hit.normal, hit.albedo, hit.emission, throughput, edge_g, on_light);
@@ -395,7 +401,7 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         let light = lights[min(pick, uniforms.n_lights - 1u)];
         inv_light_pdf = f32(uniforms.n_lights) * light_area(light);
         let p0 = sample_light(light, state);
-        let n0 = light_normal(light);
+        let n0 = light_normal(light, p0);
         var ltp = light.emission * inv_light_pdf;
         light_path[0] = PathVertex(p0, n0, vec3<f32>(0.0), light.emission, ltp, 0.0, true);
         light_len = 1u;
@@ -415,7 +421,8 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
             let edge_g = g_term(prev.p, prev.normal, hit.p, hit.normal);
             // First step has no BSDF at the emitter, so the edge contributes
             // a factor PI; later steps contribute the previous vertex's albedo.
-            ltp = select(ltp * PI, ltp * prev.albedo, light_len == 1u);
+            // NOTE: select(f, t, cond) returns t when cond is TRUE.
+            ltp = select(ltp * prev.albedo, ltp * PI, light_len == 1u);
             light_path[light_len] = PathVertex(
                 hit.p, hit.normal, hit.albedo, hit.emission, ltp, edge_g, false);
             light_len = light_len + 1u;
@@ -488,10 +495,11 @@ fn light_area(l: GpuLight) -> f32 {
     return 4.0 * l.half_w * l.half_h;
 }
 
-fn light_normal(l: GpuLight) -> vec3<f32> {
+fn light_normal(l: GpuLight, p: vec3<f32>) -> vec3<f32> {
     if (l.shape == 0u) {
-        // Sphere normal is computed from the sampled point by the caller.
-        return vec3<f32>(0.0, 1.0, 0.0);
+        // Outward normal at the sampled point — the same direction
+        // geometry.rs AreaLight::sample returns for spheres.
+        return normalize3(p - l.center);
     }
     return l.normal;
 }
