@@ -15,8 +15,8 @@ use rayon::prelude::*;
 use std::io::Write;
 
 // --- CONFIGURATION ---
-const SAMPLES_PREVIEW: usize = 6;
-const MAX_DEPTH_PREVIEW: usize = 2;
+const SAMPLES_PREVIEW: usize = 1;
+const MAX_DEPTH_PREVIEW: usize = 3;
 const SAMPLES_FHD: usize = 128;
 const MAX_DEPTH_FHD: usize = 8;
 
@@ -41,6 +41,7 @@ fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
     let objects: Vec<Box<dyn Intersectable>> = vec![
         // Floor - large plane
         Box::new(Plane { point: Vec3::new(0.0, 0.0, 0.0), normal: Vec3::new(0.0, 1.0, 0.0), mat: white }),
+        Box::new(Plane { point: Vec3::new(0.0, 2.0, 0.0), normal: Vec3::new(0.0, -1.0, 0.0), mat: white }),
 
         // Back wall
         Box::new(Plane { point: Vec3::new(0.0, 2.0, -2.5), normal: Vec3::new(0.0, 0.0, 1.0), mat: white }),
@@ -58,22 +59,26 @@ fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
         //Box::new(ceiling_light.clone()),
 
         // Central sphere
-        Box::new(Sphere { center: Vec3::new(-0.7, 0.5, -0.8), radius: 0.5, mat: yellow }),
+        Box::new(Sphere { center: Vec3::new(-0.7, 0.4, -0.8), radius: 0.4, mat: white }),
+        Box::new(Sphere { center: Vec3::new(-0.3, 0.4, -0.2), radius: 0.4, mat: white }),
+
+        Box::new(Cube::new(Vec3::new(1.0, 0.3, -0.8), 0.6, white)),
+        Box::new(Sphere { center: Vec3::new(1.0, 1.0, -0.8), radius: 0.4, mat: white }),
 
         // Small spheres
-        Box::new(Sphere { center: Vec3::new(-1.2, 0.3, -0.4), radius: 0.3, mat: blue }),
-        Box::new(Sphere { center: Vec3::new(1.2, 0.3, -0.5), radius: 0.3, mat: red }),
+        //Box::new(Sphere { center: Vec3::new(-1.2, 0.3, -0.4), radius: 0.3, mat: blue }),
+        //Box::new(Sphere { center: Vec3::new(1.2, 0.3, -0.5), radius: 0.3, mat: red }),
 
         // Stacked cubes for interesting shadows
         Box::new(Cube::new(Vec3::new(0.3, 0.3, 0.8), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(0.92, 0.3, 0.8), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(1.54, 0.3, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(0.94, 0.3, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(1.58, 0.3, 0.8), 0.6, white)),
 
         Box::new(Cube::new(Vec3::new(0.45, 0.9, 0.8), 0.6, white)),
-        Box::new(Cube::new(Vec3::new(1.07, 0.9, 0.8), 0.6, white)),
+        Box::new(Cube::new(Vec3::new(1.09, 0.9, 0.8), 0.6, white)),
 
         // Hanging light (small emissive sphere)
-        Box::new(Sphere { center: Vec3::new(0.0, 1.8, 0.5), radius: 0.1, mat: light_mat }),
+        Box::new(Sphere { center: Vec3::new(-0.4, 0.05, -0.8), radius: 0.1, mat: light_mat }),
     ];
 
     let scene = BVHNode::build(objects).expect("scene is non-empty");
@@ -82,7 +87,7 @@ fn build_scene() -> (Box<dyn Intersectable>, Vec<AreaLight>) {
     // paths to real surfaces.
     let lights = vec![
         //AreaLight::from_quad(&ceiling_light),
-        AreaLight::from_sphere(&Sphere { center: Vec3::new(0.0, 1.8, 0.5), radius: 0.1, mat: light_mat }),
+        AreaLight::from_sphere(&Sphere { center: Vec3::new(-0.4, 0.05, -0.8), radius: 0.1, mat: light_mat }),
     ];
 
     (scene, lights)
@@ -98,7 +103,7 @@ fn accumulate(accum: &mut [Vec3], frame: &[Vec3], frame_count: usize) {
 }
 
 /// How many preview frames to average while the camera is stationary.
-const MAX_ACCUMULATED_FRAMES: usize = 32;
+const MAX_ACCUMULATED_FRAMES: usize = 128;
 
 #[cfg(test)]
 mod tests {
@@ -168,7 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.5, 0.0), 90.0);
     let mut needs_render = true;
-    let mut filter_enabled = true;
+    let mut filter_enabled = false;
     let mut showing_help = false;
 
     // Temporal accumulation state.
