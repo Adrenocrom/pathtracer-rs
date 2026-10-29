@@ -20,7 +20,7 @@ use std::io::Write;
 // --- CONFIGURATION ---
 const SAMPLES_PREVIEW: usize = 1;
 const MAX_DEPTH_PREVIEW: usize = 4;
-const SAMPLES_FHD: usize = 128;
+const SAMPLES_FHD: usize = 1024;
 const MAX_DEPTH_FHD: usize = 8;
 
 /// Build the scene with multiple objects for interesting lighting.
