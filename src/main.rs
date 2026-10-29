@@ -7,6 +7,7 @@ mod math;
 mod output;
 mod renderer;
 mod scene;
+mod window;
 
 use crate::camera::Cam;
 use crate::math::{Vec3, VEC_ZERO};
@@ -115,6 +116,18 @@ mod tests {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Windowed frontend: winit window + wgpu surface, GPU-only.
+    if std::env::args().any(|a| a == "--window") {
+        let scene = build_scene();
+        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.5, 0.0), 90.0);
+        match window::run_window(scene, cam) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("Windowed frontend unavailable ({}), falling back to terminal UI", e);
+            }
+        }
+    }
+
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;

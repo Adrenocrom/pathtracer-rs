@@ -9,6 +9,7 @@ crossterm = "0.29.0"
 rayon = "1.12.0"
 image = "0.25"
 wgpu = "30"
+winit = "0.30"
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
 

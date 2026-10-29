@@ -9,8 +9,10 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 ## 🚀 Features
 
 - **Bidirectional Path Tracing:** Camera and light subpaths are traced simultaneously and connected at every vertex pair, with multiple-importance sampling (power heuristic, β = 2) to combine all connection strategies without bias.
-- **Real-time Rendering:** Interactive preview rendered using terminal half-blocks (`▀`) to double vertical resolution.
-- **Temporal Accumulation:** Progressive rendering that averages up to 32 frames while the camera remains stationary, cleaning up noise over time.
+- **Two Frontends:**
+    - **Terminal:** Interactive preview rendered using terminal half-blocks (`▀`) to double vertical resolution.
+    - **Windowed (`--window`):** A native winit window with a wgpu surface. The HDR accumulation buffer is post-processed (denoise + tone map + gamma) entirely in a fragment shader, so pixels never round-trip through the CPU while the camera is stationary.
+- **Temporal Accumulation:** Progressive rendering that averages up to 128 frames while the camera remains stationary, cleaning up noise over time.
 - **Interactive Exploration:** Full WASD controls for navigating the scene in 3D space.
 - **Advanced Post-Processing:**
     - **Bilateral Filtering:** Edge-preserving denoising on the linear HDR buffer to remove path-tracing grain while keeping silhouettes crisp.
@@ -28,15 +30,16 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 | `A` | Rotate Left (Yaw) |
 | `D` | Rotate Right (Yaw) |
 | `F` | Toggle Denoiser |
-| `H` | Show Help |
-| `P` | Render High-Quality FHD Screenshot (`screenshot.png`) |
+| `H` | Show Help (terminal only) |
+| `P` | Render High-Quality FHD Screenshot (`screenshot.png`) (terminal only) |
 | `Q` / `Esc` | Quit |
 
 ## 🛠️ Technical Details
 
 - **Language:** Rust
-- **Parallelism:** Powered by `rayon` for multi-core ray tracing (preview and FHD renders).
+- **Parallelism:** Powered by `rayon` for multi-core ray tracing (preview and FHD renders); the GPU backend uses one wgpu compute thread per pixel.
 - **Terminal Handling:** `crossterm` for raw mode, alternate screen, and ANSI 24-bit color sequences.
+- **Windowing:** `winit` 0.30 (`ApplicationHandler`) with a wgpu 30 surface; the display pass reads the accumulation buffer directly (no readback).
 - **Image Processing:** `image` crate for PNG export.
 - **Light Transport:** Bidirectional path tracing with cosine-weighted diffuse sampling, area-light sampling, and MIS power-heuristic weights. Every path edge sampled from either subpath has area pdf `G/π`, which keeps the MIS weights simple and exact.
 - **Scene:** A Cornell-box style room — red and green side walls, diffuse spheres, a stack of white cubes, and a hanging emissive sphere light that is also sampleable as an area light.
@@ -47,18 +50,22 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 ### Prerequisites
 - Rust (Cargo)
 - A terminal that supports 24-bit TrueColor (most modern terminals like Alacritty, iTerm2, Windows Terminal, etc.)
+- For the windowed frontend: a GPU with Vulkan / Metal / DX12 support
 
 ### Running the project
 ```bash
 # Build and run in release mode for maximum performance
 cargo run --release
+
+# Native window frontend (GPU only)
+cargo run --release -- --window
 ```
 
 ### Running the tests
 ```bash
 cargo test
 ```
-The test suite covers the MIS weights (hand-computed values and sum-to-one), light-transport sanity checks (direct hits, shadows, energy bounds), geometry intersection, the bilateral denoiser, and temporal accumulation.
+The test suite covers the MIS weights (hand-computed values and sum-to-one), light-transport sanity checks (direct hits, shadows, energy bounds), geometry intersection, the bilateral denoiser, temporal accumulation, and offline WGSL validation of both shaders.
 
 ## 📈 Rendering Pipeline
-`Ray Generation` $\rightarrow$ `Intersection Testing (BVH)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output`
+`Ray Generation` $\rightarrow$ `Intersection Testing (BVH)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output / wgpu Surface`

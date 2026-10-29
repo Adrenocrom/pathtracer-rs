@@ -174,8 +174,11 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    /// Bind group layout + uploaded scene buffers, kept together so the
+    /// bind group can be rebuilt when the accumulation buffer is
+    /// recreated on resize.
+    res: StaticResources,
     bind_group: wgpu::BindGroup,
-    uniform_buf: wgpu::Buffer,
     accum_buf: wgpu::Buffer,
     readback_buf: wgpu::Buffer,
     width: u32,
@@ -188,6 +191,38 @@ pub struct GpuRenderer {
     adapter_info: String,
 }
 
+/// GPU resources that outlive a resize: the bind group layout, the
+/// per-frame uniform buffer and the scene geometry uploaded once.
+struct StaticResources {
+    bgl: wgpu::BindGroupLayout,
+    uniform_buf: wgpu::Buffer,
+    sphere_buf: wgpu::Buffer,
+    quad_buf: wgpu::Buffer,
+    cube_buf: wgpu::Buffer,
+    plane_buf: wgpu::Buffer,
+    light_buf: wgpu::Buffer,
+}
+
+impl StaticResources {
+    /// Bind group layout order: uniform + 5 read-only storage + 1
+    /// read-write storage (the accumulation buffer).
+    fn bind_group(&self, device: &wgpu::Device, accum_buf: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bdpt-bind-group"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.sphere_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.quad_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.cube_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.plane_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.light_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: accum_buf.as_entire_binding() },
+            ],
+        })
+    }
+}
+
 impl GpuRenderer {
     /// Create a renderer for `scene` at the given resolution.
     pub fn new(scene: &SceneData, width: u32, height: u32) -> Result<Self, String> {
@@ -196,19 +231,22 @@ impl GpuRenderer {
             .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
         let info = adapter.get_info();
         let adapter_info = format!("{} ({})", info.name, info.backend);
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("bdpt-device"),
-            required_features: wgpu::Features::empty(),
-            // The BDPT shader binds 6 storage buffers (5 scene + 1 accum);
-            // downlevel defaults only allow 4. Request the standard WebGPU
-            // limits, which allow 8.
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-        }))
-        .map_err(|e| format!("failed to create GPU device: {e}"))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&device_descriptor()))
+            .map_err(|e| format!("failed to create GPU device: {e}"))?;
 
+        Ok(Self::from_parts(device, queue, scene, width, height, adapter_info))
+    }
+
+    /// Build a renderer from an existing device/queue (shared with the
+    /// windowed frontend's surface) at the given resolution.
+    pub fn from_parts(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        scene: &SceneData,
+        width: u32,
+        height: u32,
+        adapter_info: String,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/bdpt.wgsl"));
 
         // --- Scene buffers (flat POD arrays, uploaded once) ---
@@ -336,23 +374,20 @@ impl GpuRenderer {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bdpt-bind-group"),
-            layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: sphere_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: quad_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: cube_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: plane_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: light_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: accum_buf.as_entire_binding() },
-            ],
-        });
+        let res = StaticResources {
+            bgl,
+            uniform_buf,
+            sphere_buf,
+            quad_buf,
+            cube_buf,
+            plane_buf,
+            light_buf,
+        };
+        let bind_group = res.bind_group(&device, &accum_buf);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("bdpt-pipeline-layout"),
-            bind_group_layouts: &[Some(&bgl)],
+            bind_group_layouts: &[Some(&res.bgl)],
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -364,12 +399,12 @@ impl GpuRenderer {
             cache: None,
         });
 
-        Ok(Self {
+        Self {
             device,
             queue,
             pipeline,
+            res,
             bind_group,
-            uniform_buf,
             accum_buf,
             readback_buf,
             width,
@@ -378,12 +413,58 @@ impl GpuRenderer {
             frames: 0,
             reset: true,
             adapter_info,
-        })
+        }
     }
 
     /// Human-readable description of the GPU in use.
     pub fn adapter_info(&self) -> &str {
         &self.adapter_info
+    }
+
+    /// The device shared with the windowed frontend's surface.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The queue shared with the windowed frontend's surface.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// The accumulation buffer, read by the display pass.
+    pub fn accum_buf(&self) -> &wgpu::Buffer {
+        &self.accum_buf
+    }
+
+    /// Current render resolution.
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    /// Rebuild the accumulation and readback buffers at a new resolution.
+    /// The scene buffers and pipeline are reused; only the bind group is
+    /// recreated (it references the new accumulation buffer).
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 || (width, height) == (self.width, self.height) {
+            return;
+        }
+        let n_pixels = (width * height) as u64;
+        self.accum_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("accum"),
+            size: n_pixels * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.readback_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: n_pixels * 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.bind_group = self.res.bind_group(&self.device, &self.accum_buf);
+        self.width = width;
+        self.height = height;
+        self.reset_accumulation();
     }
 
     /// Reset the accumulation (camera moved or resolution changed).
@@ -419,7 +500,7 @@ impl GpuRenderer {
             frame: self.frames,
             reset: if self.reset { 1 } else { 0 },
         };
-        self.queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        self.queue.write_buffer(&self.res.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bdpt-encoder"),
@@ -469,6 +550,21 @@ impl GpuRenderer {
             height: self.height as usize,
             pixels,
         }
+    }
+}
+
+/// Device descriptor shared by the standalone and windowed frontends.
+///
+/// The BDPT shader binds 6 storage buffers (5 scene + 1 accum); downlevel
+/// defaults only allow 4. Request the standard WebGPU limits, which allow 8.
+pub(crate) fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("bdpt-device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        trace: wgpu::Trace::Off,
     }
 }
 
