@@ -150,8 +150,9 @@ struct App {
     cam: Cam,
     window: Option<Arc<Window>>,
     surface: Option<wgpu::Surface<'static>>,
-    /// Kept for `get_default_config` on resize (it needs the adapter).
-    adapter: Option<wgpu::Adapter>,
+    /// The one-time surface configuration. Its format is the single
+    /// source of truth for the display pipeline and is never re-queried
+    /// (see `configure_surface`).
     config: Option<wgpu::SurfaceConfiguration>,
     renderer: Option<GpuRenderer>,
     display: Option<Display>,
@@ -166,7 +167,6 @@ impl App {
             cam,
             window: None,
             surface: None,
-            adapter: None,
             config: None,
             renderer: None,
             display: None,
@@ -177,31 +177,41 @@ impl App {
 
     /// (Re)configure the surface for the current window size and rebuild
     /// the resolution-dependent GPU resources.
+    ///
+    /// The format comes from the stored configuration instead of a fresh
+    /// `get_default_config` call: that returns the first entry of the
+    /// adapter's capability list, which is not stable across queries on
+    /// all platforms (on X11/Vulkan it has been observed to flip between
+    /// Rgba8UnormSrgb and Bgra8UnormSrgb once the window is mapped).
+    /// Configuring the surface with a format the display pipeline was not
+    /// built for is a validation error, so the format is fixed for the
+    /// lifetime of the surface.
     fn configure_surface(&mut self) {
         let Some(window) = self.window.as_ref() else { return };
         let Some(surface) = self.surface.as_ref() else { return };
-        let Some(adapter) = self.adapter.as_ref() else { return };
         let Some(renderer) = self.renderer.as_ref() else { return };
+        let Some(config) = self.config.as_mut() else { return };
 
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
 
-        let mut config = surface
-            .get_default_config(adapter, width, height)
-            .expect("surface not supported by adapter");
-        config.present_mode = wgpu::PresentMode::AutoVsync;
-        surface.configure(renderer.device(), &config);
-        self.config = Some(config);
+        // Always reconfigure: this is also the recovery path for an
+        // `Outdated` swapchain, which needs it even at unchanged size.
+        config.width = width;
+        config.height = height;
+        surface.configure(renderer.device(), config);
 
-        // Rebuild the accumulation buffer at the new resolution and
-        // rebind the display pass to it.
-        let renderer = self.renderer.as_mut().unwrap();
-        renderer.resize(width, height);
-        let display = self.display.as_mut().unwrap();
-        display.rebind(renderer.device(), renderer);
-        display.write_uniforms(renderer.queue(), width, height, self.filter_enabled);
-        self.frames_accumulated = 0;
+        // Unchanged resolution (e.g. a spurious Resized event): the
+        // accumulation buffer is still valid, keep the samples.
+        if (width, height) != renderer.size() {
+            let renderer = self.renderer.as_mut().unwrap();
+            renderer.resize(width, height);
+            let display = self.display.as_mut().unwrap();
+            display.rebind(renderer.device(), renderer);
+            display.write_uniforms(renderer.queue(), width, height, self.filter_enabled);
+            self.frames_accumulated = 0;
+        }
         window.request_redraw();
     }
 
@@ -329,7 +339,6 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.surface = Some(surface);
-        self.adapter = Some(adapter);
         self.config = Some(config);
         self.renderer = Some(renderer);
         self.display = Some(display);
