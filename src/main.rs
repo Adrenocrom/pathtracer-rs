@@ -26,7 +26,10 @@ const MAX_DEPTH_FHD: usize = 4;
 
 /// Build the scene with multiple objects for interesting lighting.
 fn build_scene() -> SceneData {
-    let emision = Vec3::new(100.0, 100.0, 100.0);
+    let emision = Vec3::new(1000.0, 1000.0, 1000.0);
+    let room_size = 2.5;
+    let room_height = 2.0;
+
     let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
     let red = MaterialData::diffuse(Vec3::new(0.75, 0.25, 0.25));
     let green = MaterialData::diffuse(Vec3::new(0.25, 0.75, 0.25));
@@ -36,19 +39,19 @@ fn build_scene() -> SceneData {
 
     // Floor and ceiling
     scene.add_plane(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), white);
-    scene.add_plane(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, -1.0, 0.0), white);
+    scene.add_plane(Vec3::new(0.0, room_height, 0.0), Vec3::new(0.0, -1.0, 0.0), white);
 
     // Back wall
-    scene.add_plane(Vec3::new(0.0, 2.0, -2.5), Vec3::new(0.0, 0.0, 1.0), white);
+    scene.add_plane(Vec3::new(0.0, 0.0, -room_size), Vec3::new(0.0, 0.0, 1.0), white);
 
     // Left wall (red)
-    scene.add_plane(Vec3::new(-2.5, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0), red);
+    scene.add_plane(Vec3::new(-room_size, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), red);
 
     // Right wall (green)
-    scene.add_plane(Vec3::new(2.5, 1.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), green);
+    scene.add_plane(Vec3::new(room_size, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), green);
 
     // Front
-    scene.add_plane(Vec3::new(0.0, 2.0, 2.5), Vec3::new(0.0, 0.0, -1.0), white);
+    scene.add_plane(Vec3::new(0.0, 0.0, room_size), Vec3::new(0.0, 0.0, -1.0), white);
 
     // Central spheres
     scene.add_sphere(Vec3::new(-0.9, 0.4, -0.9), 0.4, white);
@@ -65,14 +68,27 @@ fn build_scene() -> SceneData {
     scene.add_cube(Vec3::new(0.45, 0.9, 0.8), 0.6, white);
     scene.add_cube(Vec3::new(1.09, 0.9, 0.8), 0.6, white);
 
-    // Hanging light (small emissive sphere)
-    scene.add_sphere(Vec3::new(0.2, 1.8, 0.0), 0.05, light_mat);
+    //// Hanging light (small emissive sphere)
+    //scene.add_sphere(Vec3::new(0.2, 0.1, 0.0), 0.2, light_mat);
+    //scene.add_light(LightData::from_sphere(
+    //    Vec3::new(0.2, 0.1, 0.0), 0.2, emision,
+    //));
 
-    // Area lights must mirror the emissive geometry so BDPT can connect
-    // paths to real surfaces.
-    scene.add_light(LightData::from_sphere(
-        Vec3::new(0.2, 1.8, 0.0), 0.05, emision,
+    // Ceiling light panel (one-sided: emits along its normal, i.e. downward)
+    scene.add_quad(Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
+    scene.add_light(LightData::from_quad(
+            Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
     ));
+
+    //scene.add_quad(Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
+    //scene.add_light(LightData::from_quad(
+    //        Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
+    //));
+
+    //scene.add_quad(Vec3::new(15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
+    //scene.add_light(LightData::from_quad(
+    //        Vec3::new(15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
+    //));
 
     scene
 }
