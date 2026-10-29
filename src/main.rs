@@ -29,7 +29,7 @@ fn build_scene() -> SceneData {
     let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
     let red = MaterialData::diffuse(Vec3::new(0.75, 0.25, 0.25));
     let green = MaterialData::diffuse(Vec3::new(0.25, 0.75, 0.25));
-    let light_mat = MaterialData::emissive(Vec3::new(20.0, 20.0, 4.0));
+    let light_mat = MaterialData::emissive(Vec3::new(100.0, 100.0, 100.0));
 
     let mut scene = SceneData::new();
 
@@ -50,7 +50,7 @@ fn build_scene() -> SceneData {
     scene.add_plane(Vec3::new(0.0, 2.0, 2.5), Vec3::new(0.0, 0.0, -1.0), white);
 
     // Central spheres
-    scene.add_sphere(Vec3::new(-0.7, 0.4, -0.8), 0.4, white);
+    scene.add_sphere(Vec3::new(-0.9, 0.4, -0.9), 0.4, white);
     scene.add_sphere(Vec3::new(-0.3, 0.4, -0.2), 0.4, white);
 
     scene.add_cube(Vec3::new(1.0, 0.3, -0.8), 0.6, white);
@@ -65,12 +65,12 @@ fn build_scene() -> SceneData {
     scene.add_cube(Vec3::new(1.09, 0.9, 0.8), 0.6, white);
 
     // Hanging light (small emissive sphere)
-    scene.add_sphere(Vec3::new(-0.4, 1.8, -0.8), 0.1, light_mat);
+    scene.add_sphere(Vec3::new(0.2, 0.2, 0.0), 0.1, light_mat);
 
     // Area lights must mirror the emissive geometry so BDPT can connect
     // paths to real surfaces.
     scene.add_light(LightData::from_sphere(
-        Vec3::new(-0.4, 1.8, -0.8), 0.1, Vec3::new(10.0, 10.0, 4.0),
+        Vec3::new(0.2, 0.2, 0.0), 0.1, Vec3::new(100.0, 100.0, 100.0),
     ));
 
     scene

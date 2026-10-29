@@ -11,7 +11,7 @@ use crate::output::PixelBuffer;
 use crate::scene::SceneData;
 
 /// How many preview frames to average while the camera is stationary.
-pub const MAX_ACCUMULATED_FRAMES: usize = 128;
+pub const MAX_ACCUMULATED_FRAMES: usize = 2048;
 
 pub trait Renderer {
     /// Render one frame (one sample per pixel) into the internal buffer.

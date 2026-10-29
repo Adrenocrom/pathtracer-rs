@@ -9,6 +9,7 @@
 
 use crate::camera::Cam;
 use crate::gpu::GpuRenderer;
+use crate::renderer::MAX_ACCUMULATED_FRAMES;
 use crate::scene::SceneData;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -18,7 +19,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 /// How many preview frames to accumulate while the camera is stationary.
-const MAX_ACCUMULATED_FRAMES: u32 = 128;
+//const MAX_ACCUMULATED_FRAMES: u32 = 100000;
 /// Preview path depth (same as the terminal frontend).
 const MAX_DEPTH_PREVIEW: u32 = 4;
 
@@ -157,7 +158,7 @@ struct App {
     renderer: Option<GpuRenderer>,
     display: Option<Display>,
     filter_enabled: bool,
-    frames_accumulated: u32,
+    frames_accumulated: usize,
 }
 
 impl App {
