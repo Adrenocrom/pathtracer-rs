@@ -156,6 +156,8 @@ pub struct Quad {
 
 impl Quad {
     /// A `width` x `height` rectangle centered at `center`, facing `normal`.
+    /// Kept for API completeness (used by tests and future scenes).
+    #[allow(dead_code)]
     pub fn new(center: Vec3, normal: Vec3, width: f32, height: f32, mat: Material) -> Self {
         let normal = normal.normalize();
         // Pick a helper axis that is never parallel to the normal.
@@ -218,6 +220,8 @@ pub struct Cube {
 }
 
 impl Cube {
+    /// Kept for API completeness (used by tests and future scenes).
+    #[allow(dead_code)]
     pub fn new(center: Vec3, size: f32, mat: Material) -> Self {
         let half = size * 0.5;
         Self {

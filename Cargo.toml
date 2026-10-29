@@ -8,3 +8,10 @@ rand = "0.8"
 crossterm = "0.29.0"
 rayon = "1.12.0"
 image = "0.25"
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Used by the offline WGSL validation test (same version as wgpu's naga).
+naga = { version = "30", features = ["wgsl-in"] }
