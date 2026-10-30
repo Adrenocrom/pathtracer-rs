@@ -105,9 +105,17 @@ fn build_scene() -> SceneData {
         white,
     );
 
-    // Central spheres
+    // Central spheres: one diffuse at the left edge, and the glass sphere
+    // dead center — the caustic showcase (see the light below).
     scene.add_sphere(Vec3::new(-0.9, 0.4, -0.9), 0.4, white);
-    scene.add_sphere(Vec3::new(-0.3, 0.4, -0.2), 0.4, white);
+    // The glass sphere floats 0.2 above the floor instead of touching it:
+    // at exact contact, a ray refracted out of the bottom cap would start
+    // (after the EPS_NEAR ray offset) below the floor plane and miss it,
+    // punching a hole in the center of the caustic. The height also keeps
+    // the caustic center visible from the default camera: a sphere resting
+    // on the floor hides the floor point directly beneath it behind its
+    // own silhouette.
+    scene.add_sphere(Vec3::new(-0.4, 0.5, 0.1), 0.3, MaterialData::glass(1.5));
 
     scene.add_cube(Vec3::new(1.0, 0.3, -0.8), 0.6, white);
     scene.add_sphere(Vec3::new(1.0, 1.0, -0.8), 0.4, white);
@@ -120,10 +128,24 @@ fn build_scene() -> SceneData {
     scene.add_cube(Vec3::new(0.45, 0.9, 0.8), 0.6, white);
     scene.add_cube(Vec3::new(1.09, 0.9, 0.8), 0.6, white);
 
+    // Chrome sphere resting on the cube stack (its bottom touches the top
+    // face of the right upper cube at y = 1.2): reflects the red/green
+    // walls, the hanging light and the glass sphere — the mirror BSDF
+    // showcase.
+    scene.add_sphere(
+        Vec3::new(1.09, 1.45, 0.8),
+        0.25,
+        MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
+    );
+
     // Hanging light (small emissive sphere). `add_light` registers the
-    // emitter as geometry too, so both backends can hit it.
+    // emitter as geometry too, so both backends can hit it. It hangs
+    // directly above the glass sphere so its light refracts through the
+    // ball and focuses into the caustic on the floor below — the Phase 1
+    // payoff (paper.md §6.2): a light path the unidirectional tracer
+    // cannot find.
     scene.add_light(LightData::from_sphere(
-        Vec3::new(0.65, 0.1, 1.5),
+        Vec3::new(-0.4, 1.2, 0.1),
         0.2,
         emission,
     ));
@@ -551,5 +573,324 @@ mod tests {
         // The image must not be black: the scene contains bright lights.
         let sum: f32 = buffer.pixels.iter().map(|p| p.x).sum();
         assert!(sum > 0.0);
+    }
+
+    /// The caustic showcase (plan §2.7): the light must hang directly
+    /// above the glass sphere so its light refracts through the ball and
+    /// focuses onto the floor below, and both must be in frame from the
+    /// default camera. This pins the geometry the screenshot acceptance
+    /// criterion depends on — moving the light off-axis or the sphere
+    /// out of view silently kills the caustic.
+    #[test]
+    fn caustic_geometry_is_in_frame() {
+        let scene = build_scene();
+        let light = &scene.lights[0];
+        // The glass sphere: the only non-diffuse, non-emissive sphere
+        // with ior != 1.
+        let glass = scene
+            .spheres
+            .iter()
+            .find(|s| s.mat.bsdf == crate::geometry::Bsdf::Glass { ior: 1.5 })
+            .expect("demo scene must contain a glass sphere");
+        // The light hangs directly above the glass sphere (same x/z).
+        assert!(
+            (light.center.x - glass.center.x).abs() < 1e-6
+                && (light.center.z - glass.center.z).abs() < 1e-6,
+            "light {:?} not above glass sphere {:?}",
+            light.center,
+            glass.center
+        );
+        // ...and above it, with room for the refracted beam to reach the
+        // floor between them (the sphere must not touch the light).
+        assert!(
+            light.center.y > glass.center.y + glass.radius + light.radius,
+            "light too close to the glass sphere"
+        );
+        // The glass sphere floats above the floor (not touching it), so
+        // refracted rays leaving the bottom cap can still hit the floor
+        // after the EPS_NEAR offset.
+        assert!(
+            glass.center.y - glass.radius > 0.01,
+            "glass sphere touches the floor"
+        );
+
+        // Both must be in frame from the default camera. The camera looks
+        // at (0, 0.7, 0) from (0, 1, -1.5) with a 60° fov: a point is in
+        // frame when its angle from the forward axis is under the half
+        // fov (30°) in both the horizontal and vertical projection.
+        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+        let forward = (cam.lookat - cam.origin).normalize();
+        let world_up = Vec3::new(0.0, 1.0, 0.0);
+        let right = world_up.cross(forward).normalize();
+        let up = forward.cross(right).normalize();
+        let half_fov = (cam.fov_deg * 0.5).to_radians().cos();
+        for (name, p) in [("light", light.center), ("glass", glass.center)] {
+            let rel = p - cam.origin;
+            let f = rel.dot(forward);
+            assert!(f > 0.0, "{name} is behind the camera");
+            let cos_h = f / (rel.dot(right).abs().hypot(f));
+            let cos_v = f / (rel.dot(up).abs().hypot(f));
+            assert!(
+                cos_h >= half_fov && cos_v >= half_fov,
+                "{name} out of frame (cos_h {cos_h}, cos_v {cos_v}, need >= {half_fov})"
+            );
+        }
+
+        // The caustic disc on the floor below the sphere must be in frame
+        // too: the ball-lens focus f = R*n/(2(n-1)) = 0.45 from the
+        // sphere center, so the floor (0.5 below the center) catches the
+        // beam still converging — the bright disc sits within roughly the
+        // sphere's shadow radius. The sphere floats above the floor so the
+        // caustic center is not hidden behind the sphere's own silhouette
+        // from the camera.
+        let caustic = Vec3::new(glass.center.x, 0.0, glass.center.z);
+        let rel = caustic - cam.origin;
+        let f = rel.dot(forward);
+        assert!(f > 0.0, "caustic is behind the camera");
+        let cos_h = f / (rel.dot(right).abs().hypot(f));
+        let cos_v = f / (rel.dot(up).abs().hypot(f));
+        assert!(
+            cos_h >= half_fov && cos_v >= half_fov,
+            "caustic out of frame (cos_h {cos_h}, cos_v {cos_v}, need >= {half_fov})"
+        );
+
+        // The caustic center must be visible from the camera, not hidden
+        // behind the glass sphere's own silhouette: the distance from the
+        // sphere center to the camera→caustic segment must exceed the
+        // radius. (A sphere resting on the floor fails this — the floor
+        // point directly beneath it is behind the ball.)
+        let seg = caustic - cam.origin;
+        let to_center = glass.center - cam.origin;
+        let t = (to_center.dot(seg) / seg.dot(seg)).clamp(0.0, 1.0);
+        let closest = cam.origin + seg * t;
+        let dist = (glass.center - closest).length();
+        assert!(
+            dist > glass.radius,
+            "caustic center hidden behind the glass sphere (dist {dist} <= r {})",
+            glass.radius
+        );
+    }
+
+    /// Regenerate `screenshot.png` headlessly through the exact production
+    /// path (`render_fhd` → `save_as_png`), so the Phase 1 acceptance
+    /// artifact (the caustic visible in the screenshot) can be produced
+    /// without pressing `P` in the interactive UI. Also probes the raw
+    /// HDR buffer for the caustic: a bright spot on the floor near the
+    /// glass sphere, brighter than the surrounding floor.
+    ///
+    /// Ignored by default: it renders a full FHD image (minutes on the
+    /// CPU, seconds on the GPU). Run with
+    /// `cargo test -- --ignored regenerate_screenshot --nocapture`.
+    /// The `SCREENSHOT_SPP` env var overrides the sample count for quick
+    /// probe runs (e.g. `SCREENSHOT_SPP=16`).
+    #[test]
+    #[ignore]
+    fn regenerate_screenshot() {
+        let scene = build_scene();
+        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+
+        // Optional quick-probe override for the sample count.
+        let spp = std::env::var("SCREENSHOT_SPP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(SAMPLES_FHD);
+
+        // Prefer the GPU (the production path does too); fall back to the
+        // CPU band renderer when no adapter exists.
+        let shared_device = gpu::GpuRenderer::new(&scene, 8, 8).ok().map(|g| {
+            let d = g.device_clone();
+            let q = g.queue_clone();
+            (d, q)
+        });
+
+        let buffer = render_fhd_with_spp(&scene, &cam, false, shared_device, spp);
+
+        // --- Caustic probe: the floor around the glass sphere must show a
+        // bright focused spot. Project the expected caustic center (the
+        // floor point under the sphere) into the image and compare the
+        // mean HDR value in a small disc there against the mean over a
+        // surrounding floor annulus. The caustic must be brighter than
+        // the annulus by a clear margin — the focused light is several
+        // times the direct illumination there.
+        let glass = scene
+            .spheres
+            .iter()
+            .find(|s| s.mat.bsdf == crate::geometry::Bsdf::Glass { ior: 1.5 })
+            .expect("glass sphere");
+        let caustic_world = Vec3::new(glass.center.x, 0.0, glass.center.z);
+        let (cx, cy) = project_to_pixel(&cam, caustic_world, buffer.width, buffer.height);
+        // The reference: fully-lit floor 1.2 to the +x of the caustic,
+        // outside the sphere's shadow (umbra ~0.44, penumbra ~1.0 for
+        // this light/sphere geometry) and away from every object.
+        let reference_world = Vec3::new(glass.center.x + 1.2, 0.0, glass.center.z);
+        let (rx, ry) = project_to_pixel(&cam, reference_world, buffer.width, buffer.height);
+        let disc_mean = |px: usize, py: usize| -> f32 {
+            let mut sum = 0.0f32;
+            let mut n = 0usize;
+            for dy in -40i64..=40 {
+                for dx in -40i64..=40 {
+                    if dx * dx + dy * dy > 40 * 40 {
+                        continue;
+                    }
+                    let x = px as i64 + dx;
+                    let y = py as i64 + dy;
+                    if x < 0 || y < 0 || x >= buffer.width as i64 || y >= buffer.height as i64 {
+                        continue;
+                    }
+                    sum += buffer.get_pixel(x as usize, y as usize).x;
+                    n += 1;
+                }
+            }
+            sum / n.max(1) as f32
+        };
+        let center_mean = disc_mean(cx, cy);
+        let reference_mean = disc_mean(rx, ry);
+        // Diagnostic dump (the harness hides stdout).
+        std::fs::write(
+            "target/caustic_probe.txt",
+            format!(
+                "caustic ({cx},{cy}) mean {center_mean}\nreference ({rx},{ry}) mean {reference_mean}\nratio {}\n",
+                center_mean / reference_mean
+            ),
+        )
+        .ok();
+        // The focused light concentrates the light's power into a small
+        // disc: several times the direct illumination on nearby floor.
+        // 1.5x is a conservative floor for "clearly visible".
+        assert!(
+            center_mean > reference_mean * 1.5,
+            "no caustic visible: center {center_mean} vs reference {reference_mean}"
+        );
+
+        buffer
+            .save_as_png("screenshot.png")
+            .expect("failed to save screenshot.png");
+    }
+
+    /// Project a world point to image pixel coordinates (the inverse of
+    /// the camera ray generation: u in [0,1] left->right, v in [0,1]
+    /// top->bottom).
+    fn project_to_pixel(cam: &Cam, p: Vec3, width: usize, height: usize) -> (usize, usize) {
+        let aspect = width as f32 / height as f32;
+        let theta = cam.fov_deg.to_radians();
+        let h = (theta * 0.5).tan();
+        let w = aspect * h;
+        let forward = (cam.lookat - cam.origin).normalize();
+        let world_up = Vec3::new(0.0, 1.0, 0.0);
+        let right = world_up.cross(forward).normalize();
+        let up = forward.cross(right).normalize();
+        let rel = p - cam.origin;
+        let px = rel.dot(right) / rel.dot(forward);
+        let py = rel.dot(up) / rel.dot(forward);
+        let u = (px / w + 1.0) * 0.5;
+        let v = (1.0 - py / h) * 0.5;
+        (
+            (u * width as f32).clamp(0.0, width as f32 - 1.0) as usize,
+            (v * height as f32).clamp(0.0, height as f32 - 1.0) as usize,
+        )
+    }
+
+    /// `render_fhd` with an explicit sample count (used by the screenshot
+    /// test's quick-probe override; the production path always uses
+    /// `SAMPLES_FHD`).
+    fn render_fhd_with_spp(
+        scene: &SceneData,
+        cam: &Cam,
+        filter_enabled: bool,
+        shared_device: Option<(wgpu::Device, wgpu::Queue)>,
+        spp: u32,
+    ) -> PixelBuffer {
+        let fhd_w = FHD_WIDTH;
+        let fhd_h = FHD_HEIGHT;
+
+        if let Some((device, queue)) = shared_device {
+            let mut gpu = gpu::GpuRenderer::from_parts(
+                device,
+                queue,
+                scene,
+                fhd_w,
+                fhd_h,
+                String::from("shared device"),
+            );
+            const SPP_BATCH: u32 = 32;
+            let mut remaining = spp;
+            while remaining > 0 {
+                let batch = SPP_BATCH.min(remaining);
+                gpu.render_frame_spp(cam, MAX_DEPTH_FHD, batch);
+                remaining -= batch;
+            }
+            let mut buffer = gpu.read_pixels();
+            if filter_enabled {
+                crate::output::apply_filters(&mut buffer);
+            }
+            return buffer;
+        }
+
+        // CPU fallback: render in bands with a progress bar.
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        let aspect = fhd_w as f32 / fhd_h as f32;
+        let theta = cam.fov_deg.to_radians();
+        let h = (theta * 0.5).tan();
+        let w = aspect * h;
+
+        let forward = (cam.lookat - cam.origin).normalize();
+        let world_up = Vec3::new(0.0, 1.0, 0.0);
+        let right = world_up.cross(forward).normalize();
+        let up = forward.cross(right).normalize();
+
+        let band: u32 = 32;
+        let total_pixels = (fhd_w * fhd_h) as usize;
+        let mut pixels: Vec<Vec3> = Vec::with_capacity(total_pixels);
+
+        for y0 in (0..fhd_h).step_by(band as usize) {
+            let y_end = (y0 + band).min(fhd_h);
+            let rows: Vec<Vec<Vec3>> = (y0..y_end)
+                .into_par_iter()
+                .map(|y| {
+                    let mut rng = rand::thread_rng();
+                    (0..fhd_w)
+                        .into_iter()
+                        .map(|x| {
+                            let mut color = VEC_ZERO;
+                            for _ in 0..spp {
+                                let u_jitter = (x as f32 + rng.gen::<f32>()) / fhd_w as f32;
+                                let v_jitter = (y as f32 + rng.gen::<f32>()) / fhd_h as f32;
+                                let px = (u_jitter * 2.0 - 1.0) * w;
+                                let py = -(v_jitter * 2.0 - 1.0) * h;
+                                let dir = (right * px + up * py + forward).normalize();
+                                let ray = crate::geometry::Ray {
+                                    origin: cam.origin,
+                                    direction: dir,
+                                };
+                                color = color
+                                    + crate::bdpt::bdpt_trace(
+                                        &ray,
+                                        &*cpu_scene,
+                                        MAX_DEPTH_FHD as usize,
+                                        &lights,
+                                        &mut rng,
+                                    );
+                            }
+                            color / spp as f32
+                        })
+                        .collect()
+                })
+                .collect();
+            pixels.extend(rows.into_iter().flatten());
+
+            let rendered = (y_end * fhd_w) as usize;
+            print!("\r{}", PixelBuffer::render_progress(rendered, total_pixels));
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+
+        let mut buffer = PixelBuffer {
+            width: fhd_w as usize,
+            height: fhd_h as usize,
+            pixels,
+        };
+        if filter_enabled {
+            crate::output::apply_filters(&mut buffer);
+        }
+        buffer
     }
 }

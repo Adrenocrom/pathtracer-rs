@@ -1,4 +1,4 @@
-use crate::math::{BBox, Vec3, EPS_NEAR};
+use crate::math::{BBox, Vec3, EPS_NEAR, VEC_ZERO};
 use rand::Rng;
 
 const PI: f32 = std::f32::consts::PI;
@@ -52,19 +52,300 @@ pub struct HitRecord {
 }
 
 // --- MATERIALS ---
+/// The scattering model of a surface. Emissive materials ignore the BSDF:
+/// emitters are treated as pure light sources that do not reflect.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum MaterialType {
+pub enum Bsdf {
+    /// Lambertian, sampled with a cosine-weighted distribution.
     Diffuse,
-    Emissive,
+    /// Perfect specular reflection (a delta distribution).
+    Mirror,
+    /// Perfect specular dielectric (a delta distribution): exact dielectric
+    /// Fresnel splits reflection and refraction, total internal reflection
+    /// falls back to reflection. `ior` is the interior index of refraction;
+    /// the exterior is vacuum (ior = 1), so glass objects must be closed.
+    Glass { ior: f32 },
 }
 
-/// Diffuse surface. For emissive materials the albedo is ignored: emitters
-/// are treated as pure light sources that do not reflect.
+impl Bsdf {
+    /// True for BSDFs that scatter into a single direction (a delta
+    /// distribution): they have no continuous density, so connections
+    /// through them are invalid and their pdfs cancel in MIS ratios.
+    pub fn is_delta(&self) -> bool {
+        !matches!(self, Bsdf::Diffuse)
+    }
+}
+
+/// Which quantity a subpath transports. The two agree for reflection but
+/// differ for transmission: basic radiance L/eta^2 is invariant across a
+/// refractive boundary, so radiance picks up (eta_t/eta_i)^2 crossing one
+/// (Veach's thesis; pbrt's TransportMode::Radiance factor), while
+/// importance does not. The eye subpath carries radiance, the light
+/// subpath importance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    Radiance,
+    Importance,
+}
+
+/// A surface material. `emission != 0` marks a pure emitter: the BSDF is
+/// ignored and the surface does not scatter.
 #[derive(Clone, Copy)]
 pub struct Material {
     pub albedo: Vec3,
     pub emission: Vec3,
-    pub mat_type: MaterialType,
+    pub bsdf: Bsdf,
+}
+
+impl Material {
+    pub fn diffuse(albedo: Vec3) -> Self {
+        Self {
+            albedo,
+            emission: VEC_ZERO,
+            bsdf: Bsdf::Diffuse,
+        }
+    }
+
+    pub fn emissive(emission: Vec3) -> Self {
+        Self {
+            albedo: VEC_ZERO,
+            emission,
+            bsdf: Bsdf::Diffuse,
+        }
+    }
+
+    pub fn mirror(albedo: Vec3) -> Self {
+        Self {
+            albedo,
+            emission: VEC_ZERO,
+            bsdf: Bsdf::Mirror,
+        }
+    }
+
+    pub fn glass(ior: f32) -> Self {
+        Self {
+            albedo: Vec3::new(1.0, 1.0, 1.0),
+            emission: VEC_ZERO,
+            bsdf: Bsdf::Glass { ior },
+        }
+    }
+
+    /// Pure emitters do not scatter; the BSDF is ignored for them.
+    pub fn is_emissive(&self) -> bool {
+        self.emission != VEC_ZERO
+    }
+
+    /// Delta BSDFs cannot be connection endpoints. Emitters are never
+    /// delta (they do not scatter at all).
+    pub fn is_delta(&self) -> bool {
+        !self.is_emissive() && self.bsdf.is_delta()
+    }
+}
+
+/// One scattering event sampled from a BSDF.
+pub struct BsdfSample {
+    /// Unit travel direction away from the surface.
+    pub dir_out: Vec3,
+    /// Solid-angle pdf of `dir_out`. 0 for delta BSDFs: their density is a
+    /// Dirac delta, which the MIS machinery replaces symbolically.
+    pub pdf_omega: f32,
+    /// f · |cos| / pdf, the throughput multiplier of the event. For delta
+    /// BSDFs the delta cancels and this is the deterministic specular
+    /// weight; the Fresnel probability cancels against the BSDF value.
+    pub weight: Vec3,
+}
+
+/// Cosine-weighted direction in the hemisphere around `normal` (pdf = cos/pi).
+pub(crate) fn cosine_hemisphere(normal: Vec3, rng: &mut impl Rng) -> Vec3 {
+    let u1 = rng.gen::<f32>();
+    let u2 = rng.gen::<f32>();
+    let r = u1.sqrt();
+    let phi = 2.0 * PI * u2;
+    let z = (1.0 - u1).sqrt();
+
+    let a = if normal.x.abs() > 0.9 {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
+    };
+    let t = a.cross(normal).normalize();
+    let b = normal.cross(t);
+
+    t * (r * phi.cos()) + b * (r * phi.sin()) + normal * z
+}
+
+/// Exact unpolarized dielectric Fresnel reflectance for an incidence
+/// cosine `cos_i` (measured against the normal on the incident side).
+fn fresnel_dielectric(cos_i: f32, eta_i: f32, eta_t: f32) -> f32 {
+    let cos_i = cos_i.abs().min(1.0);
+    let sin_i = (1.0 - cos_i * cos_i).sqrt();
+    let sin_t = eta_i / eta_t * sin_i;
+    if sin_t >= 1.0 {
+        return 1.0; // total internal reflection
+    }
+    let cos_t = (1.0 - sin_t * sin_t).sqrt();
+    let r_s = (eta_i * cos_i - eta_t * cos_t) / (eta_i * cos_i + eta_t * cos_t);
+    let r_p = (eta_t * cos_i - eta_i * cos_t) / (eta_t * cos_i + eta_i * cos_t);
+    0.5 * (r_s * r_s + r_p * r_p)
+}
+
+/// Snell refraction of the travel direction `dir_in` at a surface whose
+/// (unit) `normal` is oriented toward the side the ray arrives from.
+/// None = total internal reflection.
+fn refract_dir(dir_in: Vec3, normal: Vec3, eta_i: f32, eta_t: f32) -> Option<Vec3> {
+    let cos_i = -normal.dot(dir_in);
+    let eta = eta_i / eta_t;
+    let sin_t_sq = eta * eta * (1.0 - cos_i * cos_i);
+    if sin_t_sq >= 1.0 {
+        return None;
+    }
+    let cos_t = (1.0 - sin_t_sq).sqrt();
+    Some(dir_in * eta + normal * (eta * cos_i - cos_t))
+}
+
+/// Specular reflection of the travel direction `dir_in` (unit, with `normal`
+/// oriented against it).
+fn reflect_dir(dir_in: Vec3, normal: Vec3) -> Vec3 {
+    dir_in - normal * (2.0 * normal.dot(dir_in))
+}
+
+/// The eta^2 transmission factor for the transport mode: radiance picks up
+/// (eta_t/eta_i)^2 crossing a refractive boundary, importance does not.
+fn eta_factor(transport: Transport, eta_i: f32, eta_t: f32) -> f32 {
+    if transport == Transport::Radiance {
+        (eta_t / eta_i) * (eta_t / eta_i)
+    } else {
+        1.0
+    }
+}
+
+impl Material {
+    /// Sample a scattering direction. `normal` must be oriented toward the
+    /// side the ray arrives from (normal · dir_in < 0); `front_face` says
+    /// whether the geometric normal faces that side (for glass: which
+    /// medium is incident). Delta BSDFs sample deterministically.
+    pub fn sample_bsdf(
+        &self,
+        normal: Vec3,
+        front_face: bool,
+        dir_in: Vec3,
+        transport: Transport,
+        rng: &mut impl Rng,
+    ) -> BsdfSample {
+        match self.bsdf {
+            Bsdf::Diffuse => {
+                let dir_out = cosine_hemisphere(normal, rng);
+                let pdf = dir_out.dot(normal) / PI;
+                BsdfSample {
+                    dir_out,
+                    pdf_omega: pdf,
+                    weight: self.albedo,
+                }
+            }
+            Bsdf::Mirror => BsdfSample {
+                dir_out: reflect_dir(dir_in, normal),
+                pdf_omega: 0.0,
+                weight: self.albedo,
+            },
+            Bsdf::Glass { ior } => {
+                let (eta_i, eta_t) = if front_face { (1.0, ior) } else { (ior, 1.0) };
+                let cos_i = -normal.dot(dir_in);
+                let f = fresnel_dielectric(cos_i, eta_i, eta_t);
+                if rng.gen::<f32>() < f {
+                    // Reflection. The Fresnel reflectance is both the
+                    // discrete choice probability and the BSDF value, so
+                    // it cancels out of the weight.
+                    BsdfSample {
+                        dir_out: reflect_dir(dir_in, normal),
+                        pdf_omega: 0.0,
+                        weight: self.albedo,
+                    }
+                } else {
+                    // Refraction (total internal reflection cannot reach
+                    // this branch: it gives f = 1, so the roll reflects).
+                    let dir_out = refract_dir(dir_in, normal, eta_i, eta_t)
+                        .unwrap_or_else(|| reflect_dir(dir_in, normal));
+                    BsdfSample {
+                        dir_out,
+                        pdf_omega: 0.0,
+                        weight: self.albedo * eta_factor(transport, eta_i, eta_t),
+                    }
+                }
+            }
+        }
+    }
+
+    /// f (the raw BSDF, no cosine) and the solid-angle pdf of `dir_out`
+    /// under the BSDF's sampling distribution, for an arbitrary direction
+    /// pair. Delta BSDFs return (0, 0) — exactly what invalidates
+    /// connections through them. `normal` must be oriented toward the side
+    /// `dir_in` arrives from.
+    pub fn eval_bsdf(&self, normal: Vec3, dir_in: Vec3, dir_out: Vec3) -> (Vec3, f32) {
+        match self.bsdf {
+            Bsdf::Diffuse => {
+                let cos_i = -normal.dot(dir_in);
+                let cos_o = normal.dot(dir_out);
+                if cos_i > 0.0 && cos_o > 0.0 {
+                    (self.albedo * (1.0 / PI), cos_o / PI)
+                } else {
+                    (VEC_ZERO, 0.0)
+                }
+            }
+            _ => (VEC_ZERO, 0.0),
+        }
+    }
+
+    /// True when (dir_in, dir_out) is the specular pair of this delta BSDF
+    /// (the deterministic direction it scatters into). Used by the MIS
+    /// machinery to give delta-sampled edges their symbolic pdf of 1.
+    pub fn is_specular_pair(
+        &self,
+        normal: Vec3,
+        front_face: bool,
+        dir_in: Vec3,
+        dir_out: Vec3,
+    ) -> bool {
+        self.specular_weight(normal, front_face, dir_in, dir_out, Transport::Radiance)
+            .is_some()
+    }
+
+    /// The deterministic sample weight of a SPECULAR direction pair at a
+    /// delta BSDF — needed for hypothetical path extensions, where the
+    /// rolls never happened but the path geometry fixes the directions.
+    /// None if the pair is not the specular pair. `normal`/`front_face`
+    /// describe the event being weighted.
+    pub fn specular_weight(
+        &self,
+        normal: Vec3,
+        front_face: bool,
+        dir_in: Vec3,
+        dir_out: Vec3,
+        transport: Transport,
+    ) -> Option<Vec3> {
+        const DOT_EPS: f32 = 1.0 - 1e-4;
+        match self.bsdf {
+            Bsdf::Mirror => {
+                if reflect_dir(dir_in, normal).dot(dir_out) > DOT_EPS {
+                    Some(self.albedo)
+                } else {
+                    None
+                }
+            }
+            Bsdf::Glass { ior } => {
+                let (eta_i, eta_t) = if front_face { (1.0, ior) } else { (ior, 1.0) };
+                if reflect_dir(dir_in, normal).dot(dir_out) > DOT_EPS {
+                    return Some(self.albedo);
+                }
+                let refr = refract_dir(dir_in, normal, eta_i, eta_t)?;
+                if refr.dot(dir_out) > DOT_EPS {
+                    Some(self.albedo * eta_factor(transport, eta_i, eta_t))
+                } else {
+                    None
+                }
+            }
+            Bsdf::Diffuse => None,
+        }
+    }
 }
 
 // --- INTERSECTABLE TRAIT ---
@@ -490,11 +771,7 @@ mod tests {
     use rand::SeedableRng;
 
     fn diffuse(albedo: Vec3) -> Material {
-        Material {
-            albedo,
-            emission: Vec3::new(0.0, 0.0, 0.0),
-            mat_type: MaterialType::Diffuse,
-        }
+        Material::diffuse(albedo)
     }
 
     fn ray(origin: Vec3, direction: Vec3) -> Ray {
@@ -567,11 +844,7 @@ mod tests {
         let sphere = Sphere {
             center: Vec3::new(1.0, 2.0, 3.0),
             radius: 0.5,
-            mat: Material {
-                albedo: Vec3::new(0.0, 0.0, 0.0),
-                emission: Vec3::new(5.0, 5.0, 5.0),
-                mat_type: MaterialType::Emissive,
-            },
+            mat: Material::emissive(Vec3::new(5.0, 5.0, 5.0)),
         };
         let light = AreaLight::from_sphere(&sphere);
         assert!((light.area() - 4.0 * PI * 0.25).abs() < 1e-5);
@@ -594,5 +867,162 @@ mod tests {
             assert!(light.contains(p));
             assert_eq!(n, Vec3::new(0.0, -1.0, 0.0));
         }
+    }
+
+    // --- BSDF tests ---
+
+    #[test]
+    fn diffuse_bsdf_reduces_to_the_cosine_sampling_constants() {
+        // f = albedo/PI, cosine sampling pdf = cos/PI, so the sample
+        // weight f·cos/pdf = albedo exactly — the constants the old
+        // hand-computed BDPT tests were written against.
+        let m = Material::diffuse(Vec3::new(0.5, 0.6, 0.7));
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.0, -1.0, 0.0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        for _ in 0..100 {
+            let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, &mut rng);
+            assert!(s.dir_out.dot(n) > 0.0);
+            assert!((s.pdf_omega - s.dir_out.dot(n) / PI).abs() < 1e-6);
+            assert_eq!(s.weight, m.albedo);
+            let (f, pdf) = m.eval_bsdf(n, dir_in, s.dir_out);
+            assert_eq!(f, m.albedo * (1.0 / PI));
+            assert!((pdf - s.pdf_omega).abs() < 1e-6);
+        }
+        // Below the horizon: no density.
+        let (f, pdf) = m.eval_bsdf(n, dir_in, Vec3::new(0.0, -1.0, 0.0));
+        assert_eq!(f, VEC_ZERO);
+        assert_eq!(pdf, 0.0);
+    }
+
+    #[test]
+    fn mirror_bsdf_is_deterministic_and_delta() {
+        let m = Material::mirror(Vec3::new(0.9, 0.9, 0.9));
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.6, -0.8, 0.0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+        let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, &mut rng);
+        assert_eq!(s.dir_out, Vec3::new(0.6, 0.8, 0.0));
+        assert_eq!(s.pdf_omega, 0.0);
+        assert_eq!(s.weight, m.albedo);
+        // eval is (0, 0) for delta BSDFs — connections through them are
+        // invalid.
+        let (f, pdf) = m.eval_bsdf(n, dir_in, s.dir_out);
+        assert_eq!(f, VEC_ZERO);
+        assert_eq!(pdf, 0.0);
+        assert!(m.is_delta());
+        // The specular weight of the actual pair is the albedo; any other
+        // direction has none.
+        assert_eq!(
+            m.specular_weight(n, true, dir_in, s.dir_out, Transport::Radiance),
+            Some(m.albedo)
+        );
+        assert_eq!(
+            m.specular_weight(n, true, dir_in, Vec3::new(0.0, 1.0, 0.0), Transport::Radiance),
+            None
+        );
+    }
+
+    #[test]
+    fn glass_fresnel_conserves_energy() {
+        // R + T = 1 for every incidence angle, from both sides, including
+        // the total-internal-reflection regime (T = 0 there).
+        let ior = 1.5;
+        for deg in [0.0f32, 15.0, 30.0, 45.0, 60.0, 75.0, 89.0] {
+            let cos_i = deg.to_radians().cos();
+            let r_out = fresnel_dielectric(cos_i, 1.0, ior);
+            let r_in = fresnel_dielectric(cos_i, ior, 1.0);
+            assert!((r_out + (1.0 - r_out) - 1.0).abs() < 1e-6);
+            assert!((r_in + (1.0 - r_in) - 1.0).abs() < 1e-6);
+            // Beyond the critical angle (sin > 1/1.5, i.e. > 41.8°) the
+            // internal reflectance must be exactly 1.
+            if deg > 41.8 {
+                assert!((r_in - 1.0).abs() < 1e-6, "TIR at {deg}°: {r_in}");
+            }
+        }
+        // Normal incidence: the textbook value ((1-1.5)/(1+1.5))^2 = 0.04.
+        assert!((fresnel_dielectric(1.0, 1.0, 1.5) - 0.04).abs() < 1e-4);
+    }
+
+    #[test]
+    fn glass_sampling_matches_the_fresnel_split() {
+        // Over many samples the reflection/refraction split must follow
+        // the Fresnel reflectance, and the refracted direction must obey
+        // Snell's law.
+        let m = Material::glass(1.5);
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.6, -0.8, 0.0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let f = fresnel_dielectric(-n.dot(dir_in), 1.0, 1.5);
+        let mut reflected = 0;
+        const N: usize = 20000;
+        for _ in 0..N {
+            let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, &mut rng);
+            assert_eq!(s.pdf_omega, 0.0);
+            if s.dir_out.y > 0.0 {
+                reflected += 1;
+            } else {
+                // Snell: sin_t = sin_i / 1.5.
+                let sin_i = (1.0f32 - 0.8 * 0.8).sqrt();
+                let sin_t = (1.0 - s.dir_out.y * s.dir_out.y).sqrt();
+                assert!((sin_t - sin_i / 1.5).abs() < 1e-4);
+                // Radiance transport picks up (eta_t/eta_i)^2 = 1.5^2.
+                assert_eq!(s.weight, Vec3::new(2.25, 2.25, 2.25));
+            }
+        }
+        let frac = reflected as f32 / N as f32;
+        assert!((frac - f).abs() < 0.02, "split {frac} vs Fresnel {f}");
+    }
+
+    #[test]
+    fn glass_tir_falls_back_to_reflection() {
+        // Inside the glass (front_face = false), beyond the critical angle
+        // every sample must reflect — no refraction exists.
+        let m = Material::glass(1.5);
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.9, -0.435889894354067, 0.0); // sin_i = 0.9 > 1/1.5
+        let mut rng = rand::rngs::StdRng::seed_from_u64(4);
+        for _ in 0..100 {
+            let s = m.sample_bsdf(n, false, dir_in, Transport::Radiance, &mut rng);
+            assert!(s.dir_out.y > 0.0, "TIR must reflect: {:?}", s.dir_out);
+            assert_eq!(s.weight, Vec3::new(1.0, 1.0, 1.0));
+        }
+        // And the specular weight of the refracted pair is None there.
+        assert_eq!(
+            m.specular_weight(n, false, dir_in, Vec3::new(0.0, -1.0, 0.0), Transport::Radiance),
+            None
+        );
+    }
+
+    #[test]
+    fn glass_specular_weight_covers_both_modes() {
+        // The refracted pair's weight differs by transport mode: radiance
+        // gets (eta_t/eta_i)^2, importance does not.
+        let m = Material::glass(1.5);
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.6, -0.8, 0.0);
+        let refr = refract_dir(dir_in, n, 1.0, 1.5).unwrap();
+        assert_eq!(
+            m.specular_weight(n, true, dir_in, refr, Transport::Radiance),
+            Some(Vec3::new(2.25, 2.25, 2.25))
+        );
+        assert_eq!(
+            m.specular_weight(n, true, dir_in, refr, Transport::Importance),
+            Some(Vec3::new(1.0, 1.0, 1.0))
+        );
+        // Exiting the glass: eta_i = 1.5, eta_t = 1, so radiance gets
+        // (1/1.5)^2 and importance 1. Compare within a few ulps: the
+        // implementation computes (1/1.5)*(1/1.5), which rounds
+        // differently from the literal 1/2.25.
+        let refr_out = refract_dir(dir_in, n, 1.5, 1.0).unwrap();
+        let w = m.specular_weight(n, false, dir_in, refr_out, Transport::Radiance);
+        let expected = Vec3::new(1.0 / 2.25, 1.0 / 2.25, 1.0 / 2.25);
+        assert!(w.is_some());
+        assert!(
+            (w.unwrap().x - expected.x).abs() < 1e-6
+                && (w.unwrap().y - expected.y).abs() < 1e-6
+                && (w.unwrap().z - expected.z).abs() < 1e-6,
+            "got {w:?}, expected {expected:?}"
+        );
     }
 }

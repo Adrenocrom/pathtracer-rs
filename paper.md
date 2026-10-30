@@ -97,6 +97,8 @@ Instead of just "connecting" them at the end, BDPT considers every vertex on the
 
 This approach ensures that even if a light path is very "difficult" to find from the camera's perspective, it can still be captured by the bidirectional search.
 
+**Realized in the demo scene:** the hanging sphere light shines through a glass sphere (ior 1.5) and focuses into a caustic on the floor — the `light → glass → floor → camera` path that the unidirectional tracer finds only by luck (its eye walk must sample the exact refraction direction), but that BDPT's light subpath samples naturally by refracting from the light and connecting to an eye vertex on the floor. At equal sample counts, BDPT's variance on the caustic pixel is roughly two orders of magnitude lower than the unidirectional estimator's (see the `caustic_differential` test in `src/bdpt.rs`).
+
 ### 6.4 Russian Roulette
 To manage the depth of recursion without introducing bias into the final image, **Russian Roulette** is employed. In a path tracing context, as a ray travels deeper into a scene, its contribution to the final image may diminish. Instead of using a fixed maximum depth (which can lead to biased results if paths are cut off prematurely), Russian Roulette randomly determines whether a path should continue based on its current energy.
 

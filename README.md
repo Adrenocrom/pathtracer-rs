@@ -2,9 +2,9 @@
 
 A high-performance, interactive path tracer rendered directly in the terminal using Rust. This project demonstrates the intersection of physically based rendering (PBR) and low-resolution terminal output.
 
-![Example render of the demo scene: a Cornell-box style room lit by a hanging sphere light, with red and green side walls, diffuse spheres and stacked white cubes.](example.png)
+![Example render of the demo scene: a Cornell-box style room with red and green side walls, a glass sphere under the hanging light focusing its light into a bright caustic on the floor, a chrome sphere on the cube stack, and diffuse spheres and cubes.](example.png)
 
-*The demo scene rendered with bidirectional path tracing — indirect color bleeding from the red and green walls, soft shadows from the hanging sphere light, and global illumination in the cube stack.*
+*The demo scene rendered with bidirectional path tracing — a caustic focused through the glass sphere (a light path unidirectional tracing cannot find), reflections in the chrome sphere, indirect color bleeding from the red and green walls, and global illumination in the cube stack.*
 
 ## 🚀 Features
 
@@ -54,8 +54,8 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 - **Terminal Handling:** `crossterm` for raw mode, alternate screen, and ANSI 24-bit color sequences.
 - **Windowing:** `winit` 0.30 (`ApplicationHandler`) with a wgpu 30 surface; the display pass reads the accumulation buffer directly (no readback).
 - **Image Processing:** `image` crate for PNG export.
-- **Light Transport:** Bidirectional path tracing with cosine-weighted diffuse sampling, area-light sampling, and MIS power-heuristic weights. Every path edge sampled from either subpath has area pdf `G/π`, which keeps the MIS weights simple and exact.
-- **Scene:** A Cornell-box style room — red and green side walls, diffuse spheres, a stack of white cubes, and a hanging emissive sphere light that is also sampleable as an area light.
+- **Light Transport:** Bidirectional path tracing with BSDF-aware sampling (Lambertian diffuse, perfect mirror, and dielectric glass with exact Fresnel and Snell refraction), area-light sampling, and MIS power-heuristic weights computed by Veach's incremental-ratio walk over the actual per-edge pdfs. Delta (specular) BSDFs contribute a symbolic pdf that cancels between strategies, and connections through them are excluded from the MIS normalization — specular transport is handled purely by subpath sampling, which is what lets BDPT find caustics that unidirectional path tracing cannot.
+- **Scene:** A Cornell-box style room — red and green side walls, a diffuse sphere, a stack of white cubes with a chrome sphere on top, and a hanging emissive sphere light above a glass sphere that focuses its light into a caustic on the floor.
 - **Complexity:** Implements a full orthonormal camera basis and a bidirectional path-tracing loop with vertex connection.
 
 ## 📦 Getting Started

@@ -6,17 +6,17 @@
 //! of truth for the scene guarantees both backends trace identical geometry.
 
 use crate::geometry::{
-    AreaLight, Cube, Intersectable, Material, MaterialType, Plane, Quad, Sphere,
+    AreaLight, Bsdf, Cube, Intersectable, Material, Plane, Quad, Sphere,
 };
 use crate::math::Vec3;
 
-/// Diffuse surface. For emissive materials the albedo is ignored: emitters
-/// are treated as pure light sources that do not reflect.
+/// A surface material in flat, GPU-friendly form. `emission != 0` marks a
+/// pure emitter: the BSDF is ignored and the surface does not scatter.
 #[derive(Clone, Copy)]
 pub struct MaterialData {
     pub albedo: Vec3,
     pub emission: Vec3,
-    pub mat_type: MaterialType,
+    pub bsdf: Bsdf,
 }
 
 impl MaterialData {
@@ -24,7 +24,7 @@ impl MaterialData {
         Self {
             albedo,
             emission: Vec3::new(0.0, 0.0, 0.0),
-            mat_type: MaterialType::Diffuse,
+            bsdf: Bsdf::Diffuse,
         }
     }
 
@@ -32,7 +32,44 @@ impl MaterialData {
         Self {
             albedo: Vec3::new(0.0, 0.0, 0.0),
             emission,
-            mat_type: MaterialType::Emissive,
+            bsdf: Bsdf::Diffuse,
+        }
+    }
+
+    pub fn mirror(albedo: Vec3) -> Self {
+        Self {
+            albedo,
+            emission: Vec3::new(0.0, 0.0, 0.0),
+            bsdf: Bsdf::Mirror,
+        }
+    }
+
+    pub fn glass(ior: f32) -> Self {
+        Self {
+            albedo: Vec3::new(1.0, 1.0, 1.0),
+            emission: Vec3::new(0.0, 0.0, 0.0),
+            bsdf: Bsdf::Glass { ior },
+        }
+    }
+
+    /// Pure emitters do not scatter; the BSDF is ignored for them.
+    pub fn is_emissive(&self) -> bool {
+        self.emission != Vec3::new(0.0, 0.0, 0.0)
+    }
+
+    /// Delta BSDFs cannot be connection endpoints. Kept as API surface
+    /// (the flat-form mirror of `Material::is_delta`, which bdpt.rs uses);
+    /// the GPU shader encodes the same test inline via `is_delta_type`.
+    #[allow(dead_code)]
+    pub fn is_delta(&self) -> bool {
+        !self.is_emissive() && self.bsdf.is_delta()
+    }
+
+    fn to_material(self) -> Material {
+        Material {
+            albedo: self.albedo,
+            emission: self.emission,
+            bsdf: self.bsdf,
         }
     }
 }
@@ -292,11 +329,7 @@ impl SceneData {
             objects.push(Box::new(Sphere {
                 center: s.center,
                 radius: s.radius,
-                mat: Material {
-                    albedo: s.mat.albedo,
-                    emission: s.mat.emission,
-                    mat_type: s.mat.mat_type,
-                },
+                mat: s.mat.to_material(),
             }));
         }
         for q in &self.quads {
@@ -307,33 +340,21 @@ impl SceneData {
                 bitangent: q.bitangent,
                 half_w: q.half_w,
                 half_h: q.half_h,
-                mat: Material {
-                    albedo: q.mat.albedo,
-                    emission: q.mat.emission,
-                    mat_type: q.mat.mat_type,
-                },
+                mat: q.mat.to_material(),
             }));
         }
         for c in &self.cubes {
             objects.push(Box::new(Cube {
                 min: c.min,
                 max: c.max,
-                mat: Material {
-                    albedo: c.mat.albedo,
-                    emission: c.mat.emission,
-                    mat_type: c.mat.mat_type,
-                },
+                mat: c.mat.to_material(),
             }));
         }
         for p in &self.planes {
             objects.push(Box::new(Plane {
                 point: p.point,
                 normal: p.normal,
-                mat: Material {
-                    albedo: p.mat.albedo,
-                    emission: p.mat.emission,
-                    mat_type: p.mat.mat_type,
-                },
+                mat: p.mat.to_material(),
             }));
         }
         // Emitter geometry is already part of `spheres`/`quads` —
@@ -348,11 +369,7 @@ impl SceneData {
             AreaLight::from_sphere(&Sphere {
                 center: l.center,
                 radius: l.radius,
-                mat: Material {
-                    albedo: Vec3::new(0.0, 0.0, 0.0),
-                    emission: l.emission,
-                    mat_type: MaterialType::Emissive,
-                },
+                mat: Material::emissive(l.emission),
             })
         } else {
             AreaLight::from_quad(&Quad {
@@ -362,11 +379,7 @@ impl SceneData {
                 bitangent: l.bitangent,
                 half_w: l.half_w,
                 half_h: l.half_h,
-                mat: Material {
-                    albedo: Vec3::new(0.0, 0.0, 0.0),
-                    emission: l.emission,
-                    mat_type: MaterialType::Emissive,
-                },
+                mat: Material::emissive(l.emission),
             })
         }
     }
@@ -518,7 +531,7 @@ mod tests {
         ));
         // Registered exactly once as geometry (no duplicate registration).
         assert_eq!(scene.spheres.len(), 1);
-        assert_eq!(scene.spheres[0].mat.mat_type, MaterialType::Emissive);
+        assert!(scene.spheres[0].mat.is_emissive());
         assert_eq!(scene.spheres[0].mat.emission, Vec3::new(5.0, 5.0, 5.0));
         // ...and the CPU BVH hits it with the emissive material.
         let (cpu_scene, lights) = scene.build_cpu_scene();
@@ -530,7 +543,7 @@ mod tests {
         let hit = cpu_scene
             .intersect(&ray)
             .expect("light must be intersectable");
-        assert_eq!(hit.mat.mat_type, MaterialType::Emissive);
+        assert!(hit.mat.is_emissive());
 
         // Same for quad lights.
         let mut scene = SceneData::new();
@@ -542,6 +555,6 @@ mod tests {
             Vec3::new(5.0, 5.0, 5.0),
         ));
         assert_eq!(scene.quads.len(), 1);
-        assert_eq!(scene.quads[0].mat.mat_type, MaterialType::Emissive);
+        assert!(scene.quads[0].mat.is_emissive());
     }
 }

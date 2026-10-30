@@ -48,8 +48,8 @@ struct GpuSphere {
     _pad0: f32,
     emission: [f32; 3],
     mat_type: u32,
+    ior: f32,
     _pad1: [f32; 3],
-    _pad2: f32,
 }
 
 #[repr(C)]
@@ -67,8 +67,8 @@ struct GpuQuad {
     _pad2: f32,
     emission: [f32; 3],
     mat_type: u32,
+    ior: f32,
     _pad3: [f32; 3],
-    _pad4: f32,
 }
 
 #[repr(C)]
@@ -82,8 +82,8 @@ struct GpuCube {
     _pad2: f32,
     emission: [f32; 3],
     mat_type: u32,
+    ior: f32,
     _pad3: [f32; 3],
-    _pad4: f32,
 }
 
 #[repr(C)]
@@ -97,8 +97,8 @@ struct GpuPlane {
     _pad2: f32,
     emission: [f32; 3],
     mat_type: u32,
+    ior: f32,
     _pad3: [f32; 3],
-    _pad4: f32,
 }
 
 #[repr(C)]
@@ -151,6 +151,8 @@ impl GpuLight {
 
 const MAT_DIFFUSE: u32 = 0;
 const MAT_EMISSIVE: u32 = 1;
+const MAT_MIRROR: u32 = 2;
+const MAT_GLASS: u32 = 3;
 
 /// Compile-time layout checks: the Rust structs must match the WGSL
 /// structs byte-for-byte. WGSL aligns vec3<f32> to 16 bytes, so every
@@ -164,10 +166,24 @@ const _: () = {
     assert!(std::mem::size_of::<Uniforms>() == 96);
 };
 
-fn mat_type_u32(t: crate::geometry::MaterialType) -> u32 {
-    match t {
-        crate::geometry::MaterialType::Diffuse => MAT_DIFFUSE,
-        crate::geometry::MaterialType::Emissive => MAT_EMISSIVE,
+fn mat_type_u32(m: &crate::scene::MaterialData) -> u32 {
+    if m.is_emissive() {
+        MAT_EMISSIVE
+    } else {
+        match m.bsdf {
+            crate::geometry::Bsdf::Diffuse => MAT_DIFFUSE,
+            crate::geometry::Bsdf::Mirror => MAT_MIRROR,
+            crate::geometry::Bsdf::Glass { .. } => MAT_GLASS,
+        }
+    }
+}
+
+/// The ior of a glass material (1.0 for everything else, so the shader can
+/// read the field unconditionally).
+fn mat_ior(m: &crate::scene::MaterialData) -> f32 {
+    match m.bsdf {
+        crate::geometry::Bsdf::Glass { ior } => ior,
+        _ => 1.0,
     }
 }
 
@@ -294,9 +310,9 @@ impl GpuRenderer {
                 albedo: vec3s(s.mat.albedo),
                 _pad0: 0.0,
                 emission: vec3s(s.mat.emission),
-                mat_type: mat_type_u32(s.mat.mat_type),
+                mat_type: mat_type_u32(&s.mat),
+                ior: mat_ior(&s.mat),
                 _pad1: [0.0; 3],
-                _pad2: 0.0,
             })
             .collect();
         let quads: Vec<GpuQuad> = scene
@@ -314,9 +330,9 @@ impl GpuRenderer {
                 albedo: vec3s(q.mat.albedo),
                 _pad2: 0.0,
                 emission: vec3s(q.mat.emission),
-                mat_type: mat_type_u32(q.mat.mat_type),
+                mat_type: mat_type_u32(&q.mat),
+                ior: mat_ior(&q.mat),
                 _pad3: [0.0; 3],
-                _pad4: 0.0,
             })
             .collect();
         let cubes: Vec<GpuCube> = scene
@@ -330,9 +346,9 @@ impl GpuRenderer {
                 albedo: vec3s(c.mat.albedo),
                 _pad2: 0.0,
                 emission: vec3s(c.mat.emission),
-                mat_type: mat_type_u32(c.mat.mat_type),
+                mat_type: mat_type_u32(&c.mat),
+                ior: mat_ior(&c.mat),
                 _pad3: [0.0; 3],
-                _pad4: 0.0,
             })
             .collect();
         let planes: Vec<GpuPlane> = scene
@@ -346,9 +362,9 @@ impl GpuRenderer {
                 albedo: vec3s(p.mat.albedo),
                 _pad2: 0.0,
                 emission: vec3s(p.mat.emission),
-                mat_type: mat_type_u32(p.mat.mat_type),
+                mat_type: mat_type_u32(&p.mat),
+                ior: mat_ior(&p.mat),
                 _pad3: [0.0; 3],
-                _pad4: 0.0,
             })
             .collect();
         let lights: Vec<GpuLight> = scene.lights.iter().map(GpuLight::from_light_data).collect();
@@ -941,10 +957,13 @@ mod tests {
                 0.6,
                 crate::scene::MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
             );
+            // Mirror sphere (was diffuse): the oracle must exercise the
+            // Phase 1 BSDF paths (delta sampling, the symbolic-pdf MIS
+            // rule), not just the diffuse reduction.
             s.add_sphere(
                 crate::math::Vec3::new(1.0, 1.0, -0.8),
                 0.4,
-                crate::scene::MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
+                crate::scene::MaterialData::mirror(crate::math::Vec3::new(0.9, 0.9, 0.9)),
             );
             s.add_cube(
                 crate::math::Vec3::new(0.3, 0.3, 0.8),
@@ -971,10 +990,19 @@ mod tests {
                 0.6,
                 crate::scene::MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
             );
+            // Glass sphere under the light: the oracle must exercise the
+            // Phase 1 glass paths (Fresnel split, Snell refraction, the
+            // eta^2 transport factor, caustic connections), not just the
+            // diffuse reduction.
+            s.add_sphere(
+                crate::math::Vec3::new(-0.4, 0.42, -0.8),
+                0.4,
+                crate::scene::MaterialData::glass(1.5),
+            );
             // `add_light` registers the emitter as geometry too.
             s.add_light(crate::scene::LightData::from_sphere(
-                crate::math::Vec3::new(-0.4, 0.05, -0.8),
-                0.1,
+                crate::math::Vec3::new(-0.4, 1.2, -0.8),
+                0.2,
                 crate::math::Vec3::new(10.0, 10.0, 4.0),
             ));
             s
@@ -982,7 +1010,11 @@ mod tests {
 
         const W: u32 = 32;
         const H: u32 = 32;
-        const FRAMES: u32 = 64;
+        // Glass caustics are high-variance; 256 frames (512 spp on the
+        // GPU, 256 on the CPU) keep the channel means stable enough for
+        // the 15% tolerance to isolate systematic porting errors from
+        // Monte-Carlo noise.
+        const FRAMES: u32 = 256;
 
         // GPU: accumulate FRAMES frames, read back once.
         let mut gpu = super::GpuRenderer::new(&scene, W, H).expect("GPU required for this test");
