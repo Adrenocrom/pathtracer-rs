@@ -26,7 +26,7 @@ const MAX_DEPTH_FHD: usize = 4;
 
 /// Build the scene with multiple objects for interesting lighting.
 fn build_scene() -> SceneData {
-    let emision = Vec3::new(1000.0, 1000.0, 1000.0);
+    let emision = Vec3::new(10.0, 10.0, 10.0);
     let room_size = 2.5;
     let room_height = 2.0;
 
@@ -68,17 +68,17 @@ fn build_scene() -> SceneData {
     scene.add_cube(Vec3::new(0.45, 0.9, 0.8), 0.6, white);
     scene.add_cube(Vec3::new(1.09, 0.9, 0.8), 0.6, white);
 
-    //// Hanging light (small emissive sphere)
-    //scene.add_sphere(Vec3::new(0.2, 0.1, 0.0), 0.2, light_mat);
-    //scene.add_light(LightData::from_sphere(
-    //    Vec3::new(0.2, 0.1, 0.0), 0.2, emision,
-    //));
-
-    // Ceiling light panel (one-sided: emits along its normal, i.e. downward)
-    scene.add_quad(Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
-    scene.add_light(LightData::from_quad(
-            Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
+    // Hanging light (small emissive sphere)
+    scene.add_sphere(Vec3::new(0.65, 0.1, 1.5), 0.2, light_mat);
+    scene.add_light(LightData::from_sphere(
+        Vec3::new(0.65, 0.1, 1.5), 0.2, emision,
     ));
+
+    //// Ceiling light panel (one-sided: emits along its normal, i.e. downward)
+    //scene.add_quad(Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
+    //scene.add_light(LightData::from_quad(
+    //        Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
+    //));
 
     //scene.add_quad(Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
     //scene.add_light(LightData::from_quad(
@@ -119,7 +119,7 @@ mod tests {
     fn preview_render_produces_finite_pixels() {
         let scene = build_scene();
         let mut renderer = renderer::CpuRenderer::new(&scene, 16, 16, 4);
-        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.5, 0.0), 90.0);
+        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
         renderer.render_frame(&cam, 4);
         let buffer = renderer.read_pixels();
         assert_eq!(buffer.pixels.len(), 16 * 16);
@@ -134,9 +134,9 @@ mod tests {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Windowed frontend: winit window + wgpu surface, GPU-only.
-    if std::env::args().any(|a| a == "--window") {
+    if std::env::args().any(|a| a != "--terminal") {
         let scene = build_scene();
-        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.5, 0.0), 90.0);
+        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
         match window::run_window(scene, cam) {
             Ok(()) => return Ok(()),
             Err(e) => {
@@ -172,7 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("Renderer: {}", renderer.name());
 
-    let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.5, 0.0), 90.0);
+    let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
     let mut needs_render = true;
     let mut filter_enabled = false;
     let mut showing_help = false;
