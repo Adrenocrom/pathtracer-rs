@@ -16,8 +16,12 @@ struct Uniforms {
     height: f32,
     max_depth: u32,
     n_lights: u32,
-    frame: u32,
+    samples: u32,        // samples already accumulated in `accum`
     reset: u32,
+    spp: u32,            // samples traced per pixel in this dispatch
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 struct GpuSphere {
@@ -511,22 +515,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= width || gid.y >= height) { return; }
 
     let pixel = gid.y * width + gid.x;
-    let seed = pixel * 719393u + uniforms.frame * 1013904223u + 1u;
+    let seed = pixel * 719393u + uniforms.samples * 1013904223u + 1u;
     var state = seed;
 
-    // Jittered ray through the pixel, same convention as camera.rs:
-    // u in [0,1] left->right, v in [0,1] top->bottom, py negated.
-    let u = (f32(gid.x) + pcg(&state)) / uniforms.width;
-    let v = (f32(gid.y) + pcg(&state)) / uniforms.height;
-    let px = (u * 2.0 - 1.0) * uniforms.fov_h;
-    let py = -(v * 2.0 - 1.0) * uniforms.fov_v;
-    let dir = normalize3(uniforms.cam_right * px + uniforms.cam_up * py + uniforms.cam_forward);
+    var color = vec3<f32>(0.0);
+    for (var s = 0u; s < uniforms.spp; s = s + 1u) {
+        // Jittered ray through the pixel, same convention as camera.rs:
+        // u in [0,1] left->right, v in [0,1] top->bottom, py negated.
+        let u = (f32(gid.x) + pcg(&state)) / uniforms.width;
+        let v = (f32(gid.y) + pcg(&state)) / uniforms.height;
+        let px = (u * 2.0 - 1.0) * uniforms.fov_h;
+        let py = -(v * 2.0 - 1.0) * uniforms.fov_v;
+        let dir = normalize3(uniforms.cam_right * px + uniforms.cam_up * py + uniforms.cam_forward);
+        color += bdpt_trace(uniforms.cam_origin, dir, &state);
+    }
+    color = color / f32(uniforms.spp);
 
-    let color = bdpt_trace(uniforms.cam_origin, dir, &state);
-
-    // Temporal accumulation: running average, reset when the camera moves.
+    // Temporal accumulation: running average weighted by sample counts, so
+    // mixing batch sizes (e.g. 1 spp preview + 8 spp batches) stays unbiased.
     let prev = accum[pixel];
-    let n = f32(uniforms.frame);
-    let blended = select(color, prev.xyz * (n / (n + 1.0)) + color * (1.0 / (n + 1.0)), uniforms.reset == 0u);
+    let n = f32(uniforms.samples);
+    let blended = select(color, (prev.xyz * n + color * f32(uniforms.spp)) / (n + f32(uniforms.spp)), uniforms.reset == 0u);
     accum[pixel] = vec4<f32>(blended, 1.0);
 }

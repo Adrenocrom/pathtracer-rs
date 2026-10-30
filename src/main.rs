@@ -310,9 +310,14 @@ fn render_fhd(scene: &SceneData, cam: &Cam, filter_enabled: bool) -> PixelBuffer
     const FHD_H: usize = 1080;
 
     if let Ok(mut gpu) = gpu::GpuRenderer::new(scene, FHD_W as u32, FHD_H as u32) {
-        // Accumulate SAMPLES_FHD frames on the GPU, then read back once.
-        for _ in 0..SAMPLES_FHD {
-            gpu.render_frame(cam, MAX_DEPTH_FHD as u32);
+        // Accumulate SAMPLES_FHD samples on the GPU in batched dispatches
+        // (one submit per batch instead of one per sample), then read back.
+        const SPP_BATCH: u32 = 32;
+        let mut remaining = SAMPLES_FHD as u32;
+        while remaining > 0 {
+            let spp = SPP_BATCH.min(remaining);
+            gpu.render_frame_spp(cam, MAX_DEPTH_FHD as u32, spp);
+            remaining -= spp;
         }
         let mut buffer = gpu.read_pixels();
         if filter_enabled {

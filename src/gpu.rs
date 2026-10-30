@@ -24,8 +24,14 @@ struct Uniforms {
     height: f32,
     max_depth: u32,
     n_lights: u32,
-    frame: u32,
+    /// Number of samples already accumulated in `accum` (0 = reset).
+    samples: u32,
     reset: u32,
+    /// Samples traced per pixel in this dispatch.
+    spp: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 /// One sphere in GPU form (matches `GpuSphere` in shaders/bdpt.wgsl).
@@ -155,7 +161,7 @@ const _: () = {
     assert!(std::mem::size_of::<GpuCube>() == 80);
     assert!(std::mem::size_of::<GpuPlane>() == 80);
     assert!(std::mem::size_of::<GpuLight>() == 112);
-    assert!(std::mem::size_of::<Uniforms>() == 80);
+    assert!(std::mem::size_of::<Uniforms>() == 96);
 };
 
 fn mat_type_u32(t: crate::geometry::MaterialType) -> u32 {
@@ -184,8 +190,8 @@ pub struct GpuRenderer {
     width: u32,
     height: u32,
     n_lights: u32,
-    /// Number of frames accumulated in the current accumulation epoch.
-    frames: u32,
+    /// Number of samples accumulated in the current accumulation epoch.
+    samples: u32,
     /// True when the accumulation buffer must be overwritten this frame.
     reset: bool,
     adapter_info: String,
@@ -410,7 +416,7 @@ impl GpuRenderer {
             width,
             height,
             n_lights: scene.lights.len() as u32,
-            frames: 0,
+            samples: 0,
             reset: true,
             adapter_info,
         }
@@ -470,12 +476,19 @@ impl GpuRenderer {
     /// Reset the accumulation (camera moved or resolution changed).
     pub fn reset_accumulation(&mut self) {
         self.reset = true;
-        self.frames = 0;
+        self.samples = 0;
     }
 
     /// Render one frame (one sample per pixel) and accumulate it on the GPU.
     /// Does not block on the GPU; call `read_pixels` when pixels are needed.
     pub fn render_frame(&mut self, cam: &crate::camera::Cam, max_depth: u32) {
+        self.render_frame_spp(cam, max_depth, 2);
+    }
+
+    /// Render one frame with `spp` samples per pixel (traced in a single
+    /// dispatch) and accumulate it on the GPU. Does not block on the GPU;
+    /// call `read_pixels` when pixels are needed.
+    pub fn render_frame_spp(&mut self, cam: &crate::camera::Cam, max_depth: u32, spp: u32) {
         let aspect = self.width as f32 / self.height as f32;
         let theta = cam.fov_deg.to_radians();
         let fov_v = (theta * 0.5).tan();
@@ -497,8 +510,12 @@ impl GpuRenderer {
             height: self.height as f32,
             max_depth,
             n_lights: self.n_lights,
-            frame: self.frames,
+            samples: self.samples,
             reset: if self.reset { 1 } else { 0 },
+            spp: spp.max(1),
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         self.queue.write_buffer(&self.res.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
@@ -518,7 +535,7 @@ impl GpuRenderer {
         }
         self.queue.submit(Some(encoder.finish()));
 
-        self.frames += 1;
+        self.samples += spp.max(1);
         self.reset = false;
     }
 
