@@ -8,19 +8,29 @@ pub struct PixelBuffer {
     pub pixels: Vec<Vec3>,
 }
 
+/// Extended Reinhard tone mapping with gamma correction (2.2 sRGB).
+///
+/// The plain operator `c/(1+c)` never reaches 1.0, so bright emitters
+/// (the light sphere is 10 in linear HDR) render as dull gray. The
+/// extended form maps the white point `W` to exactly 1.0:
+/// `c(1 + c/W²)/(1 + c)`, so highlights roll off to pure white instead
+/// of plateauing below it.
+const TONE_MAP_WHITE_POINT: f32 = 10.0;
+
 impl PixelBuffer {
     /// Get a single pixel by coordinates.
     pub fn get_pixel(&self, x: usize, y: usize) -> Vec3 {
         self.pixels[y * self.width + x]
     }
 
-    /// Reinhard tone mapping with gamma correction (2.2 sRGB).
+    /// Extended Reinhard tone mapping with gamma correction (2.2 sRGB).
     fn tone_map(p: Vec3) -> Vec3 {
-        // Reinhard local operator
+        // Extended Reinhard local operator with white point W.
+        let w = TONE_MAP_WHITE_POINT;
         let mapped = Vec3::new(
-            p.x / (1.0 + p.x),
-            p.y / (1.0 + p.y),
-            p.z / (1.0 + p.z),
+            p.x * (1.0 + p.x / (w * w)) / (1.0 + p.x),
+            p.y * (1.0 + p.y / (w * w)) / (1.0 + p.y),
+            p.z * (1.0 + p.z / (w * w)) / (1.0 + p.z),
         );
         // Gamma correction for sRGB display
         Vec3::new(
@@ -212,12 +222,33 @@ mod tests {
 
     #[test]
     fn tone_map_is_monotonic_and_bounded() {
-        for v in [0.0f32, 0.01, 0.1, 0.5, 1.0, 2.0, 10.0, 100.0] {
+        // Below the white point the operator stays in [0, 1].
+        for v in [0.0f32, 0.01, 0.1, 0.5, 1.0, 2.0, 10.0] {
             let t = PixelBuffer::tone_map(Vec3::new(v, v, v));
-            assert!(t.x >= 0.0 && t.x <= 1.0);
+            assert!(t.x >= 0.0 && t.x <= 1.0, "value {v} maps to {t:?}");
         }
+        // Above the white point it blows out past 1.0 (by design; the
+        // display path clamps) but stays finite.
+        let over = PixelBuffer::tone_map(Vec3::new(100.0, 100.0, 100.0));
+        assert!(over.x > 1.0 && over.x.is_finite());
+        // Monotonic across the whole range.
         let a = PixelBuffer::tone_map(Vec3::new(0.2, 0.2, 0.2));
         let b = PixelBuffer::tone_map(Vec3::new(0.4, 0.4, 0.4));
         assert!(a.x < b.x);
+    }
+
+    /// The extended operator must map the white point to (nearly) 1.0
+    /// after gamma — the plain operator plateaus at ~0.32 there, which is
+    /// why bright emitters looked dull.
+    #[test]
+    fn tone_map_reaches_white_at_the_white_point() {
+        let w = TONE_MAP_WHITE_POINT;
+        let t = PixelBuffer::tone_map(Vec3::new(w, w, w));
+        assert!(t.x > 0.99, "white point maps to {t:?}");
+        // Above the white point the operator keeps rising past 1.0 (it is
+        // designed to blow out to white); the display path clamps. The
+        // mapped value must stay finite and above the white-point value.
+        let over = PixelBuffer::tone_map(Vec3::new(w * 10.0, w * 10.0, w * 10.0));
+        assert!(over.x > t.x && over.x.is_finite(), "over-white mapping: {over:?}");
     }
 }

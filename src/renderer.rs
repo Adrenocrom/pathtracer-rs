@@ -13,6 +13,13 @@ use crate::scene::SceneData;
 /// How many preview frames to average while the camera is stationary.
 pub const MAX_ACCUMULATED_FRAMES: usize = 128;
 
+/// Full-quality export (the `P` key in both frontends): 1920×1080 at
+/// 1024 samples per pixel.
+pub const FHD_WIDTH: u32 = 1920;
+pub const FHD_HEIGHT: u32 = 1080;
+pub const SAMPLES_FHD: u32 = 1024;
+pub const MAX_DEPTH_FHD: u32 = 8;
+
 pub trait Renderer {
     /// Render one frame (one sample per pixel) into the internal buffer.
     fn render_frame(&mut self, cam: &Cam, max_depth: usize);
@@ -22,6 +29,11 @@ pub trait Renderer {
 
     /// Signal that the camera moved: restart temporal accumulation.
     fn reset_accumulation(&mut self);
+
+    /// Rebuild internal buffers at a new resolution. The default is a
+    /// no-op: backends that allocate per-pixel state (the GPU accumulation
+    /// buffer) override it, the CPU renderer rebuilds itself instead.
+    fn resize(&mut self, _width: u32, _height: u32) {}
 
     /// Human-readable backend name for the status line.
     fn name(&self) -> String;
@@ -86,6 +98,14 @@ impl Renderer for CpuRenderer {
     fn reset_accumulation(&mut self) {
         self.accum = None;
         self.frames = 0;
+    }
+
+    /// The CPU renderer has no per-pixel GPU state; resizing just changes
+    /// the target resolution and drops the stale accumulation.
+    fn resize(&mut self, width: u32, height: u32) {
+        self.width = width as usize;
+        self.height = height as usize;
+        self.reset_accumulation();
     }
 
     fn name(&self) -> String {

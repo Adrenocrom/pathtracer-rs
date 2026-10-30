@@ -1,6 +1,7 @@
 mod bdpt;
 mod bvh;
 mod camera;
+mod font;
 mod geometry;
 mod gpu;
 mod math;
@@ -12,7 +13,9 @@ mod window;
 use crate::camera::Cam;
 use crate::math::{Vec3, VEC_ZERO};
 use crate::output::PixelBuffer;
-use crate::renderer::{Renderer, MAX_ACCUMULATED_FRAMES};
+use crate::renderer::{
+    Renderer, FHD_HEIGHT, FHD_WIDTH, MAX_ACCUMULATED_FRAMES, MAX_DEPTH_FHD, SAMPLES_FHD,
+};
 use crate::scene::{LightData, MaterialData, SceneData};
 use rand::Rng;
 use rayon::prelude::*;
@@ -25,12 +28,10 @@ const SAMPLES_PREVIEW: usize = 1;
 /// paths (which carry most of the energy) are never killed, and deep ones
 /// survive in proportion to their contribution.
 const MAX_DEPTH_PREVIEW: usize = 8;
-const SAMPLES_FHD: usize = 1024;
-const MAX_DEPTH_FHD: usize = 8;
 
 /// Build the scene with multiple objects for interesting lighting.
 fn build_scene() -> SceneData {
-    let emision = Vec3::new(10.0, 10.0, 10.0);
+    let emission = Vec3::new(10.0, 10.0, 10.0);
     let room_size = 2.5;
     let room_height = 2.0;
 
@@ -40,21 +41,27 @@ fn build_scene() -> SceneData {
 
     let mut scene = SceneData::new();
 
+    // The room: finite quads, not infinite planes. Planes get a ±1e6
+    // bounding box, which makes the BVH useless (the root box spans the
+    // whole world and no wall is ever culled). Quads have tight boxes.
+    let floor_w = room_size * 2.0;
+    let wall_h = room_height;
+
     // Floor and ceiling
-    scene.add_plane(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), white);
-    scene.add_plane(Vec3::new(0.0, room_height, 0.0), Vec3::new(0.0, -1.0, 0.0), white);
+    scene.add_wall(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), floor_w, floor_w, white);
+    scene.add_wall(Vec3::new(0.0, room_height, 0.0), Vec3::new(0.0, -1.0, 0.0), floor_w, floor_w, white);
 
     // Back wall
-    scene.add_plane(Vec3::new(0.0, 0.0, -room_size), Vec3::new(0.0, 0.0, 1.0), white);
+    scene.add_wall(Vec3::new(0.0, 0.0, -room_size), Vec3::new(0.0, 0.0, 1.0), floor_w, wall_h, white);
 
     // Left wall (red)
-    scene.add_plane(Vec3::new(-room_size, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), red);
+    scene.add_wall(Vec3::new(-room_size, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), floor_w, wall_h, red);
 
     // Right wall (green)
-    scene.add_plane(Vec3::new(room_size, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), green);
+    scene.add_wall(Vec3::new(room_size, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), floor_w, wall_h, green);
 
-    // Front
-    scene.add_plane(Vec3::new(0.0, 0.0, room_size), Vec3::new(0.0, 0.0, -1.0), white);
+    // Front wall
+    scene.add_wall(Vec3::new(0.0, 0.0, room_size), Vec3::new(0.0, 0.0, -1.0), floor_w, wall_h, white);
 
     // Central spheres
     scene.add_sphere(Vec3::new(-0.9, 0.4, -0.9), 0.4, white);
@@ -74,7 +81,7 @@ fn build_scene() -> SceneData {
     // Hanging light (small emissive sphere). `add_light` registers the
     // emitter as geometry too, so both backends can hit it.
     scene.add_light(LightData::from_sphere(
-        Vec3::new(0.65, 0.1, 1.5), 0.2, emision,
+        Vec3::new(0.65, 0.1, 1.5), 0.2, emission,
     ));
 
     // Ceiling light panel (one-sided: emits along its normal, i.e.
@@ -134,8 +141,15 @@ mod tests {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Windowed frontend: winit window + wgpu surface, GPU-only.
-    if std::env::args().any(|a| a != "--terminal") {
+    // `args()` yields argv[0] (the binary path) first, so the flags start
+    // at index 1. `--terminal` forces the terminal UI; `--window` forces
+    // the windowed one; with no flags the windowed frontend is preferred
+    // and falls back to the terminal when unavailable.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let force_terminal = args.iter().any(|a| a == "--terminal");
+    let force_window = args.iter().any(|a| a == "--window");
+
+    if !force_terminal || force_window {
         let scene = build_scene();
         let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
         match window::run_window(scene, cam) {
@@ -155,15 +169,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (w as usize, h as usize)
     };
 
-    let mut width = term_w;
-    let mut height = term_h * 2;
+    let width = term_w;
+    let height = term_h * 2;
 
     let scene = build_scene();
 
     // Prefer the GPU backend; fall back to the CPU when no adapter exists.
+    // The device is created once and reused across resizes and FHD
+    // renders (a fresh `GpuRenderer::new` would re-create the instance,
+    // adapter, device and re-upload the whole scene every time). Only the
+    // cheap `Arc` handles are kept for the FHD export; the boxed renderer
+    // itself drives the loop.
+    let mut shared_device: Option<(wgpu::Device, wgpu::Queue)> = None;
     let mut renderer: Box<dyn Renderer> = match gpu::GpuRenderer::new(&scene, width as u32, height as u32) {
         Ok(gpu) => {
             eprintln!("GPU backend: {}", gpu.adapter_info());
+            shared_device = Some((gpu.device_clone(), gpu.queue_clone()));
             Box::new(gpu)
         }
         Err(e) => {
@@ -210,7 +231,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     showing_help = false;
                     needs_render = true;
                 }
-                crossterm::event::Event::Key(key) => match key.code {
+                // Windows crossterm emits Press *and* Release for every
+                // key; without this guard each keypress would act twice.
+                crossterm::event::Event::Key(key)
+                    if key.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    match key.code {
                     crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
                     crossterm::event::KeyCode::Char('f') => {
                         filter_enabled = !filter_enabled;
@@ -239,10 +265,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         stdout.flush()?;
 
                         // Render the FHD image with a dedicated renderer at
-                        // 1920x1080. On the GPU this is a single dispatch per
-                        // sample batch; on the CPU it renders in bands with a
-                        // progress bar.
-                        let fhd_buffer = render_fhd(&scene, &cam, filter_enabled);
+                        // 1920x1080, sharing the preview renderer's device
+                        // (no new adapter, no scene re-upload). On the GPU
+                        // this is a single dispatch per sample batch; on
+                        // the CPU it renders in bands with a progress bar.
+                        let fhd_buffer =
+                            render_fhd(&scene, &cam, filter_enabled, shared_device.clone());
 
                         match fhd_buffer.save_as_png("screenshot.png") {
                             Ok(()) => write!(stdout, "Saved to screenshot.png!").unwrap(),
@@ -278,18 +306,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         needs_render = true;
                     },
                     _ => {}
-                },
+                }},
                 crossterm::event::Event::Resize(w, h) => {
                     // Terminal resized: clear stale characters from the
                     // previous (possibly larger) frame and rebuild buffers.
                     crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
-                    width = w as usize;
-                    height = h as usize * 2;
-                    // Rebuild the renderer at the new resolution.
-                    renderer = match gpu::GpuRenderer::new(&scene, width as u32, height as u32) {
-                        Ok(gpu) => Box::new(gpu),
-                        Err(_) => Box::new(renderer::CpuRenderer::new(&scene, width, height, SAMPLES_PREVIEW)),
-                    };
+                    // Reuse the existing renderer (device, pipeline, scene
+                    // buffers) at the new resolution instead of creating a
+                    // whole new GPU renderer.
+                    renderer.resize(w as u32, h as u32 * 2);
                     frames_accumulated = 0;
                     needs_render = true;
                 },
@@ -303,21 +328,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Render the FHD screenshot. Tries the GPU first (single dispatch per
-/// sample batch, no progress bar needed), falls back to the CPU band
-/// renderer with a progress bar.
-fn render_fhd(scene: &SceneData, cam: &Cam, filter_enabled: bool) -> PixelBuffer {
-    const FHD_W: usize = 1920;
-    const FHD_H: usize = 1080;
+/// Render the FHD screenshot. Uses the shared GPU device when one exists
+/// (single dispatch per sample batch, no progress bar needed); otherwise
+/// falls back to the CPU band renderer with a progress bar.
+///
+/// `shared_device` is the preview renderer's device/queue: reusing them
+/// avoids re-creating the adapter and re-uploading the scene per export.
+fn render_fhd(
+    scene: &SceneData,
+    cam: &Cam,
+    filter_enabled: bool,
+    shared_device: Option<(wgpu::Device, wgpu::Queue)>,
+) -> PixelBuffer {
+    let fhd_w = FHD_WIDTH;
+    let fhd_h = FHD_HEIGHT;
 
-    if let Ok(mut gpu) = gpu::GpuRenderer::new(scene, FHD_W as u32, FHD_H as u32) {
+    if let Some((device, queue)) = shared_device {
+        let mut gpu = gpu::GpuRenderer::from_parts(
+            device,
+            queue,
+            scene,
+            fhd_w,
+            fhd_h,
+            String::from("shared device"),
+        );
         // Accumulate SAMPLES_FHD samples on the GPU in batched dispatches
         // (one submit per batch instead of one per sample), then read back.
         const SPP_BATCH: u32 = 32;
-        let mut remaining = SAMPLES_FHD as u32;
+        let mut remaining = SAMPLES_FHD;
         while remaining > 0 {
             let spp = SPP_BATCH.min(remaining);
-            gpu.render_frame_spp(cam, MAX_DEPTH_FHD as u32, spp);
+            gpu.render_frame_spp(cam, MAX_DEPTH_FHD, spp);
             remaining -= spp;
         }
         let mut buffer = gpu.read_pixels();
@@ -329,7 +370,7 @@ fn render_fhd(scene: &SceneData, cam: &Cam, filter_enabled: bool) -> PixelBuffer
 
     // CPU fallback: render in bands with a progress bar.
     let (cpu_scene, lights) = scene.build_cpu_scene();
-    let aspect = FHD_W as f32 / FHD_H as f32;
+    let aspect = fhd_w as f32 / fhd_h as f32;
     let theta = cam.fov_deg.to_radians();
     let h = (theta * 0.5).tan();
     let w = aspect * h;
@@ -339,28 +380,28 @@ fn render_fhd(scene: &SceneData, cam: &Cam, filter_enabled: bool) -> PixelBuffer
     let right = world_up.cross(forward).normalize();
     let up = forward.cross(right).normalize();
 
-    let band = 32;
-    let total_pixels = FHD_W * FHD_H;
+    let band: u32 = 32;
+    let total_pixels = (fhd_w * fhd_h) as usize;
     let mut pixels: Vec<Vec3> = Vec::with_capacity(total_pixels);
 
-    for y0 in (0..FHD_H).step_by(band) {
-        let y_end = (y0 + band).min(FHD_H);
+    for y0 in (0..fhd_h).step_by(band as usize) {
+        let y_end = (y0 + band).min(fhd_h);
         let rows: Vec<Vec<Vec3>> = (y0..y_end)
             .into_par_iter()
             .map(|y| {
                 let mut rng = rand::thread_rng();
-                (0..FHD_W)
+                (0..fhd_w)
                     .into_iter()
                     .map(|x| {
                         let mut color = VEC_ZERO;
                         for _ in 0..SAMPLES_FHD {
-                            let u_jitter = (x as f32 + rng.gen::<f32>()) / FHD_W as f32;
-                            let v_jitter = (y as f32 + rng.gen::<f32>()) / FHD_H as f32;
+                            let u_jitter = (x as f32 + rng.gen::<f32>()) / fhd_w as f32;
+                            let v_jitter = (y as f32 + rng.gen::<f32>()) / fhd_h as f32;
                             let px = (u_jitter * 2.0 - 1.0) * w;
                             let py = -(v_jitter * 2.0 - 1.0) * h;
                             let dir = (right * px + up * py + forward).normalize();
                             let ray = crate::geometry::Ray { origin: cam.origin, direction: dir };
-                            color = color + crate::bdpt::bdpt_trace(&ray, &*cpu_scene, MAX_DEPTH_FHD, &lights, &mut rng);
+                            color = color + crate::bdpt::bdpt_trace(&ray, &*cpu_scene, MAX_DEPTH_FHD as usize, &lights, &mut rng);
                         }
                         color / SAMPLES_FHD as f32
                     })
@@ -369,7 +410,7 @@ fn render_fhd(scene: &SceneData, cam: &Cam, filter_enabled: bool) -> PixelBuffer
             .collect();
         pixels.extend(rows.into_iter().flatten());
 
-        let rendered = y_end * FHD_W;
+        let rendered = (y_end * fhd_w) as usize;
         print!("\r{}", PixelBuffer::render_progress(rendered, total_pixels));
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
@@ -377,8 +418,8 @@ fn render_fhd(scene: &SceneData, cam: &Cam, filter_enabled: bool) -> PixelBuffer
     println!("{}", PixelBuffer::render_progress(total_pixels, total_pixels));
 
     let mut buffer = PixelBuffer {
-        width: FHD_W,
-        height: FHD_H,
+        width: fhd_w as usize,
+        height: fhd_h as usize,
         pixels,
     };
     if filter_enabled {

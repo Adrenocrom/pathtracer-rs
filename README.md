@@ -10,28 +10,41 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 
 - **Bidirectional Path Tracing:** Camera and light subpaths are traced simultaneously and connected at every vertex pair, with multiple-importance sampling (power heuristic, β = 2) to combine all connection strategies without bias.
 - **Two Frontends:**
-    - **Terminal:** Interactive preview rendered using terminal half-blocks (`▀`) to double vertical resolution.
-    - **Windowed (`--window`):** A native winit window with a wgpu surface. The HDR accumulation buffer is post-processed (denoise + tone map + gamma) entirely in a fragment shader, so pixels never round-trip through the CPU while the camera is stationary.
+    - **Terminal (`--terminal`):** Interactive preview rendered using terminal half-blocks (`▀`) to double vertical resolution.
+    - **Windowed (default, or `--window`):** A native winit window with a wgpu surface. The HDR accumulation buffer is post-processed (denoise + tone map + gamma) entirely in a fragment shader, so pixels never round-trip through the CPU while the camera is stationary. The window title shows accumulated samples and fps; `H` overlays the controls.
 - **Temporal Accumulation:** Progressive rendering that averages up to 128 frames while the camera remains stationary, cleaning up noise over time.
-- **Interactive Exploration:** Full WASD controls for navigating the scene in 3D space.
+- **Interactive Exploration:** WASD-style navigation — forward/back, yaw, strafe and pitch (window frontend; the terminal frontend supports forward and yaw).
 - **Advanced Post-Processing:**
     - **Bilateral Filtering:** Edge-preserving denoising on the linear HDR buffer to remove path-tracing grain while keeping silhouettes crisp.
-    - **Reinhard Tone Mapping:** Preserves detail in high-intensity emissive areas.
+    - **Extended Reinhard Tone Mapping:** Maps the scene white point to display white (`c(1+c/W²)/(1+c)`), so highlights roll off to pure white instead of plateauing below it.
     - **Gamma Correction:** Linear-to-sRGB conversion (γ = 2.2) for natural lighting.
-- **High-Quality Export:** Trigger a full FHD (1920×1080) render at 1024 samples per pixel with up to 8 bounces, saved as a PNG with a progress bar.
-- **BVH Acceleration:** Scene geometry is organized in a bounding volume hierarchy (median split along the widest axis, with a subtree early-exit test) for fast ray intersection.
+- **High-Quality Export:** Trigger a full FHD (1920×1080) render at 1024 samples per pixel with up to 8 bounces, saved as a PNG with a progress bar (terminal) or in background batches (window).
+- **BVH Acceleration:** Scene geometry is organized in a bounding volume hierarchy (median split along the widest axis, with a subtree early-exit test) for fast ray intersection. The room walls are finite quads, not infinite planes, so their bounding boxes are tight and the BVH can actually cull.
 
 ## 🎮 Controls
 
+### Window frontend
+
 | Key | Action |
 | :--- | :--- |
-| `W` | Move Forward |
-| `S` | Move Backward |
-| `A` | Rotate Left (Yaw) |
-| `D` | Rotate Right (Yaw) |
+| `W` / `S` | Move Forward / Backward |
+| `A` / `D` | Turn Left / Right (Yaw) |
+| `Q` / `E` | Strafe Left / Right |
+| `↑` / `↓` | Pitch Up / Down |
 | `F` | Toggle Denoiser |
-| `H` | Show Help (terminal only) |
-| `P` | Render High-Quality FHD Screenshot (`screenshot.png`) (terminal only) |
+| `P` | Render High-Quality FHD Screenshot (`screenshot.png`) |
+| `H` | Toggle Help Overlay |
+| `Esc` | Quit |
+
+### Terminal frontend
+
+| Key | Action |
+| :--- | :--- |
+| `W` / `S` | Move Forward / Backward |
+| `A` / `D` | Turn Left / Right (Yaw) |
+| `F` | Toggle Denoiser |
+| `P` | Render High-Quality FHD Screenshot (`screenshot.png`) |
+| `H` | Show Help |
 | `Q` / `Esc` | Quit |
 
 ## 🛠️ Technical Details
@@ -54,11 +67,14 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 
 ### Running the project
 ```bash
-# Build and run in release mode for maximum performance
+# Build and run in release mode for maximum performance.
+# The windowed frontend is preferred; it falls back to the terminal UI
+# when no window system or GPU is available.
 cargo run --release
 
-# Native window frontend (GPU only)
-cargo run --release -- --window
+# Force a specific frontend
+cargo run --release -- --window     # native window (GPU only)
+cargo run --release -- --terminal   # terminal UI (GPU or CPU)
 ```
 
 ### Running the tests
@@ -68,4 +84,4 @@ cargo test
 The test suite covers the MIS weights (hand-computed values and sum-to-one), light-transport sanity checks (direct hits, shadows, energy bounds), geometry intersection, the bilateral denoiser, temporal accumulation, and offline WGSL validation of both shaders.
 
 ## 📈 Rendering Pipeline
-`Ray Generation` $\rightarrow$ `Intersection Testing (BVH)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output / wgpu Surface`
+`Ray Generation` $\rightarrow$ `Intersection Testing (BVH)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Extended Reinhard Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output / wgpu Surface`

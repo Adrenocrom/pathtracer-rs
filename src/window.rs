@@ -9,7 +9,9 @@
 
 use crate::camera::Cam;
 use crate::gpu::GpuRenderer;
-use crate::renderer::MAX_ACCUMULATED_FRAMES;
+use crate::renderer::{
+    MAX_ACCUMULATED_FRAMES, MAX_DEPTH_FHD, SAMPLES_FHD, FHD_HEIGHT, FHD_WIDTH,
+};
 use crate::scene::SceneData;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,16 +21,18 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-/// How many preview frames to accumulate while the camera is stationary.
-//const MAX_ACCUMULATED_FRAMES: u32 = 100000;
 /// Preview path depth (same as the terminal frontend). Russian roulette
 /// terminates paths by throughput, so the cap can sit at the maximum.
 const MAX_DEPTH_PREVIEW: u32 = 8;
 
 /// Camera speed in world units per second (W/S).
 const MOVE_SPEED: f32 = 1.0;
-/// Camera rotation speed in radians per second (A/D).
+/// Camera strafe speed in world units per second (Q/E).
+const STRAFE_SPEED: f32 = 1.0;
+/// Camera yaw speed in radians per second (A/D).
 const ROT_SPEED: f32 = 1.0;
+/// Camera pitch speed in radians per second (arrow up/down).
+const PITCH_SPEED: f32 = 1.0;
 
 /// The keys the window frontend reacts to. The discriminants are used as
 /// indices into the `Keys` state array, so they must stay contiguous.
@@ -38,6 +42,10 @@ enum Key {
     A,
     S,
     D,
+    Q,
+    E,
+    Up,
+    Down,
     COUNT,
 }
 
@@ -49,6 +57,10 @@ impl Key {
             KeyCode::KeyA => Some(Key::A),
             KeyCode::KeyS => Some(Key::S),
             KeyCode::KeyD => Some(Key::D),
+            KeyCode::KeyQ => Some(Key::Q),
+            KeyCode::KeyE => Some(Key::E),
+            KeyCode::ArrowUp => Some(Key::Up),
+            KeyCode::ArrowDown => Some(Key::Down),
             _ => None,
         }
     }
@@ -81,14 +93,38 @@ struct Display {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
+    /// The overlay text texture (status line / help panel). Re-created
+    /// whenever the text changes; 1×1 transparent when no overlay is shown.
+    overlay_tex: wgpu::Texture,
+    overlay_view: wgpu::TextureView,
     /// True when the surface format is linear (not sRGB): the shader must
     /// apply gamma 2.2 itself in that case.
     apply_gamma: bool,
 }
 
+/// Uniform bytes for the display pass. Must match `DisplayUniforms` in
+/// shaders/display.wgsl (7 u32 fields, padded to 8 for 16-byte alignment).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DisplayUniformsBytes {
+    width: u32,
+    height: u32,
+    denoise: u32,
+    apply_gamma: u32,
+    overlay: u32,
+    overlay_w: u32,
+    overlay_h: u32,
+    _pad0: u32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<DisplayUniformsBytes>() == 32);
+};
+
 impl Display {
     fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         renderer: &GpuRenderer,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
@@ -117,17 +153,31 @@ impl Display {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("display-uniforms"),
-            size: 16,
+            size: std::mem::size_of::<DisplayUniformsBytes>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let bind_group = Self::bind_group(device, &bgl, &uniform_buf, renderer);
+        // Start with a 1×1 fully transparent overlay texture.
+        let (overlay_tex, overlay_view) =
+            Self::create_overlay_texture(device, queue, 1, 1, &[0, 0, 0, 0]);
+
+        let bind_group = Self::bind_group(device, &bgl, &uniform_buf, renderer, &overlay_view);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("display-pipeline-layout"),
@@ -164,8 +214,49 @@ impl Display {
             pipeline,
             bind_group,
             uniform_buf,
+            overlay_tex,
+            overlay_view,
             apply_gamma: !surface_format.is_srgb(),
         }
+    }
+
+    /// Create the overlay texture and upload `data` (RGBA8, row-major).
+    fn create_overlay_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("overlay"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        if data.len() == (width * height * 4) as usize {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
+        (tex, view)
     }
 
     fn bind_group(
@@ -173,6 +264,7 @@ impl Display {
         bgl: &wgpu::BindGroupLayout,
         uniform_buf: &wgpu::Buffer,
         renderer: &GpuRenderer,
+        overlay_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("display-bind-group"),
@@ -180,6 +272,7 @@ impl Display {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: renderer.accum_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(overlay_view) },
             ],
         })
     }
@@ -187,13 +280,48 @@ impl Display {
     /// Rebind the accumulation buffer after a resize.
     fn rebind(&mut self, device: &wgpu::Device, renderer: &GpuRenderer) {
         let bgl = self.pipeline.get_bind_group_layout(0);
-        self.bind_group = Self::bind_group(device, &bgl, &self.uniform_buf, renderer);
+        self.bind_group = Self::bind_group(device, &bgl, &self.uniform_buf, renderer, &self.overlay_view);
     }
 
-    fn write_uniforms(&self, queue: &wgpu::Queue, width: u32, height: u32, filter: bool) {
-        let bytes: [u8; 16] =
-            bytemuck::cast([width, height, filter as u32, self.apply_gamma as u32]);
-        queue.write_buffer(&self.uniform_buf, 0, &bytes);
+    /// Upload new overlay text. `lines` are drawn white-on-transparent; the
+    /// shader composites them over the rendered image. The bind group is
+    /// rebuilt because it references the old texture view.
+    fn set_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &GpuRenderer,
+        lines: &[&str],
+    ) {
+        let mut canvas = crate::font::TextCanvas::new(lines.len());
+        let (w, h) = canvas.draw(lines);
+        let (tex, view) = Self::create_overlay_texture(device, queue, w, h, &canvas.data);
+        self.overlay_tex = tex;
+        self.overlay_view = view;
+        let bgl = self.pipeline.get_bind_group_layout(0);
+        self.bind_group =
+            Self::bind_group(device, &bgl, &self.uniform_buf, renderer, &self.overlay_view);
+    }
+
+    fn write_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        filter: bool,
+        overlay_visible: bool,
+    ) {
+        let bytes = DisplayUniformsBytes {
+            width,
+            height,
+            denoise: filter as u32,
+            apply_gamma: self.apply_gamma as u32,
+            overlay: overlay_visible as u32,
+            overlay_w: self.overlay_tex.width(),
+            overlay_h: self.overlay_tex.height(),
+            _pad0: 0,
+        };
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&bytes));
     }
 }
 
@@ -215,7 +343,33 @@ struct App {
     keys: Keys,
     /// Timestamp of the previous frame, for delta-time scaling.
     last_frame: Option<Instant>,
+    /// Frames per second, smoothed with an exponential moving average so
+    /// the title does not flicker.
+    fps: f32,
+    /// True while the help overlay is on screen (any key dismisses it).
+    showing_help: bool,
+    /// Screenshot in flight: the FHD renderer accumulates in the
+    /// background while the preview keeps running.
+    screenshot: Option<Screenshot>,
 }
+
+/// A full-quality export in progress. The FHD renderer shares the
+/// preview's device; batches are dispatched from `render()` so the window
+/// stays responsive instead of blocking for the whole export. The camera
+/// is snapshotted at `P`-press time so moving during the export cannot
+/// smear the image.
+struct Screenshot {
+    gpu: GpuRenderer,
+    /// Camera frozen at the moment the export started.
+    cam: Cam,
+    /// Samples still to trace.
+    remaining: u32,
+    /// Batches dispatched so far, for the status line.
+    batches: u32,
+}
+
+/// Samples traced per FHD dispatch batch (one submit per batch).
+const SPP_BATCH: u32 = 32;
 
 impl App {
     fn new(scene: SceneData, cam: Cam) -> Self {
@@ -231,20 +385,14 @@ impl App {
             frames_accumulated: 0,
             keys: Keys::new(),
             last_frame: None,
+            fps: 0.0,
+            showing_help: false,
+            screenshot: None,
         }
     }
 
     /// (Re)configure the surface for the current window size and rebuild
     /// the resolution-dependent GPU resources.
-    ///
-    /// The format comes from the stored configuration instead of a fresh
-    /// `get_default_config` call: that returns the first entry of the
-    /// adapter's capability list, which is not stable across queries on
-    /// all platforms (on X11/Vulkan it has been observed to flip between
-    /// Rgba8UnormSrgb and Bgra8UnormSrgb once the window is mapped).
-    /// Configuring the surface with a format the display pipeline was not
-    /// built for is a validation error, so the format is fixed for the
-    /// lifetime of the surface.
     fn configure_surface(&mut self) {
         let Some(window) = self.window.as_ref() else { return };
         let Some(surface) = self.surface.as_ref() else { return };
@@ -268,10 +416,49 @@ impl App {
             renderer.resize(width, height);
             let display = self.display.as_mut().unwrap();
             display.rebind(renderer.device(), renderer);
-            display.write_uniforms(renderer.queue(), width, height, self.filter_enabled);
+            display.write_uniforms(
+                renderer.queue(),
+                width,
+                height,
+                self.filter_enabled,
+                self.showing_help,
+            );
             self.frames_accumulated = 0;
         }
         window.request_redraw();
+    }
+
+    /// Rebuild the overlay texture from the current state: the help panel
+    /// while `showing_help`, otherwise nothing (the status readout lives
+    /// in the window title, which needs no texture).
+    fn update_overlay(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else { return };
+        let Some(display) = self.display.as_mut() else { return };
+        if self.showing_help {
+            display.set_overlay(
+                renderer.device(),
+                renderer.queue(),
+                renderer,
+                &[
+                    "PATHTRACER-RS CONTROLS",
+                    "",
+                    "W/S     MOVE FORWARD/BACK",
+                    "A/D     TURN LEFT/RIGHT",
+                    "Q/E     STRAFE LEFT/RIGHT",
+                    "UP/DOWN PITCH",
+                    "F       TOGGLE DENOISER",
+                    "P       EXPORT FHD PNG",
+                    "H       TOGGLE THIS HELP",
+                    "ESC     QUIT",
+                ],
+            );
+        } else {
+            // 1×1 transparent texture: the shader skips it via the
+            // overlay flag in the uniforms.
+            display.set_overlay(renderer.device(), renderer.queue(), renderer, &[]);
+        }
+        let (w, h) = renderer.size();
+        display.write_uniforms(renderer.queue(), w, h, self.filter_enabled, self.showing_help);
     }
 
     /// One iteration: trace one sample per pixel (if still accumulating),
@@ -290,6 +477,15 @@ impl App {
             .map(|t| now.duration_since(t).as_secs_f32())
             .unwrap_or(0.0);
         self.last_frame = Some(now);
+        // Smoothed FPS for the status line (EMA; avoids flicker).
+        if dt > 0.0 {
+            let instant_fps = 1.0 / dt;
+            self.fps = if self.fps == 0.0 {
+                instant_fps
+            } else {
+                self.fps * 0.9 + instant_fps * 0.1
+            };
+        }
 
         // Continuous movement from held keys: any combination of W/A/S/D
         // can be active at once (e.g. W+D = forward + turn).
@@ -310,16 +506,70 @@ impl App {
             self.cam.rotate(-ROT_SPEED * dt);
             moved = true;
         }
+        if self.keys.is_down(Key::Q) {
+            self.cam.strafe(-STRAFE_SPEED * dt);
+            moved = true;
+        }
+        if self.keys.is_down(Key::E) {
+            self.cam.strafe(STRAFE_SPEED * dt);
+            moved = true;
+        }
+        if self.keys.is_down(Key::Up) {
+            self.cam.pitch(PITCH_SPEED * dt);
+            moved = true;
+        }
+        if self.keys.is_down(Key::Down) {
+            self.cam.pitch(-PITCH_SPEED * dt);
+            moved = true;
+        }
         if moved {
             // Camera moved: the accumulated image is stale, start over.
             renderer.reset_accumulation();
             self.frames_accumulated = 0;
         }
 
+        // Screenshot in flight: dispatch one batch per frame so the
+        // window keeps presenting while the export accumulates. The
+        // camera is the one frozen at `P`-press time.
+        if let Some(shot) = self.screenshot.as_mut() {
+            let spp = SPP_BATCH.min(shot.remaining);
+            shot.gpu.render_frame_spp(&shot.cam, MAX_DEPTH_FHD, spp);
+            shot.remaining -= spp;
+            shot.batches += 1;
+            if shot.remaining == 0 {
+                // Done: read back, tone-map, save. `take()` moves the
+                // renderer out so its buffers can be read before drop.
+                let mut shot = self.screenshot.take().unwrap();
+                let mut buffer = shot.gpu.read_pixels();
+                if self.filter_enabled {
+                    crate::output::apply_filters(&mut buffer);
+                }
+                match buffer.save_as_png("screenshot.png") {
+                    Ok(()) => eprintln!("saved screenshot.png"),
+                    Err(e) => eprintln!("failed to save screenshot: {e}"),
+                }
+            }
+        }
+
         // Progressive accumulation while the camera is stationary.
         if self.frames_accumulated < MAX_ACCUMULATED_FRAMES {
             renderer.render_frame(&self.cam, MAX_DEPTH_PREVIEW);
             self.frames_accumulated += 1;
+        }
+
+        // Status line in the window title: backend, accumulated samples
+        // and fps. (The title is the cheapest place for a status readout
+        // that needs no font rendering pipeline.)
+        {
+            let spp = renderer.samples_accumulated();
+            let shot = match &self.screenshot {
+                Some(s) => format!(" | exporting {}%", (s.batches * SPP_BATCH * 100 / SAMPLES_FHD).min(100)),
+                None => String::new(),
+            };
+            window.set_title(&format!(
+                "pathtracer-rs — {} spp | {:.0} fps{}",
+                spp, self.fps, shot
+            ));
         }
 
         let frame = match surface.get_current_texture() {
@@ -415,8 +665,14 @@ impl ApplicationHandler for App {
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(renderer.device(), &config);
 
-        let display = Display::new(renderer.device(), &renderer, config.format);
-        display.write_uniforms(renderer.queue(), size.width.max(1), size.height.max(1), false);
+        let display = Display::new(renderer.device(), renderer.queue(), &renderer, config.format);
+        display.write_uniforms(
+            renderer.queue(),
+            size.width.max(1),
+            size.height.max(1),
+            false,
+            false,
+        );
 
         self.window = Some(window);
         self.surface = Some(surface);
@@ -453,21 +709,72 @@ impl ApplicationHandler for App {
                 // (`repeat` is false), not on OS key-repeat.
                 if state == ElementState::Pressed && !repeat {
                     match code {
-                        KeyCode::Escape | KeyCode::KeyQ => event_loop.exit(),
+                        KeyCode::Escape => event_loop.exit(),
                         KeyCode::KeyF => {
                             self.filter_enabled = !self.filter_enabled;
                             if let Some(renderer) = self.renderer.as_ref() {
                                 if let Some(display) = self.display.as_ref() {
                                     let (w, h) = renderer.size();
-                                    display.write_uniforms(renderer.queue(), w, h, self.filter_enabled);
+                                    display.write_uniforms(
+                                        renderer.queue(),
+                                        w,
+                                        h,
+                                        self.filter_enabled,
+                                        self.showing_help,
+                                    );
                                 }
                             }
                             if let Some(window) = self.window.as_ref() {
                                 window.request_redraw();
                             }
                         }
+                        KeyCode::KeyH => {
+                            // Toggle the help overlay; any key dismisses it
+                            // (handled below via `showing_help`).
+                            self.showing_help = !self.showing_help;
+                            self.update_overlay();
+                            if let Some(window) = self.window.as_ref() {
+                                window.request_redraw();
+                            }
+                        }
+                        KeyCode::KeyP => {
+                            // Start a full-quality export. It accumulates
+                            // in batches from `render()` so the window
+                            // stays responsive; the result is saved to
+                            // screenshot.png when the last batch lands.
+                            // The camera is frozen now so moving during
+                            // the export cannot smear the image.
+                            if self.screenshot.is_none() {
+                                if let Some(renderer) = self.renderer.as_ref() {
+                                    self.screenshot = Some(Screenshot {
+                                        gpu: GpuRenderer::from_parts(
+                                            renderer.device_clone(),
+                                            renderer.queue_clone(),
+                                            &self.scene,
+                                            FHD_WIDTH,
+                                            FHD_HEIGHT,
+                                            renderer.adapter_info().to_string(),
+                                        ),
+                                        cam: self.cam,
+                                        remaining: SAMPLES_FHD,
+                                        batches: 0,
+                                    });
+                                }
+                            }
+                        }
                         _ => {}
                     }
+                }
+
+                // Any key dismisses the help overlay (except the H that
+                // just toggled it on, handled above).
+                if self.showing_help
+                    && state == ElementState::Pressed
+                    && !repeat
+                    && code != KeyCode::KeyH
+                {
+                    self.showing_help = false;
+                    self.update_overlay();
                 }
             }
             _ => {}

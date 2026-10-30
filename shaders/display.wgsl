@@ -15,10 +15,17 @@ struct DisplayUniforms {
     height: u32,
     denoise: u32,
     apply_gamma: u32,
+    // Overlay: 0 = hidden, 1 = visible. The overlay texture is bound at
+    // binding 2; its size comes from overlay_w/overlay_h.
+    overlay: u32,
+    overlay_w: u32,
+    overlay_h: u32,
+    _pad0: u32,
 };
 
 @group(0) @binding(0) var<uniform> du: DisplayUniforms;
 @group(0) @binding(1) var<storage, read> accum: array<vec4<f32>>;
+@group(0) @binding(2) var overlay_tex: texture_2d<f32>;
 
 const SIGMA_R: f32 = 0.15;
 
@@ -55,6 +62,15 @@ fn reinhard(c: vec3<f32>) -> vec3<f32> {
     return c / (vec3<f32>(1.0) + c);
 }
 
+// Extended Reinhard with white point W (matches src/output.rs): maps W to
+// exactly 1.0 so bright emitters roll off to pure white instead of
+// plateauing below it.
+const TONE_MAP_WHITE_POINT: f32 = 10.0;
+fn reinhard_extended(c: vec3<f32>) -> vec3<f32> {
+    let w = TONE_MAP_WHITE_POINT;
+    return c * (vec3<f32>(1.0) + c / (w * w)) / (vec3<f32>(1.0) + c);
+}
+
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
     // One oversized triangle covering the whole viewport.
@@ -77,9 +93,21 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
         color = bilateral(px, py);
     }
 
-    var mapped = reinhard(color);
+    var mapped = reinhard_extended(color);
     if (du.apply_gamma == 1u) {
         mapped = pow(mapped, vec3<f32>(1.0 / 2.2));
     }
+
+    // Composite the overlay (status line / help panel) on top. The
+    // texture is white text on transparent; its alpha is the coverage.
+    // The blend happens after tone mapping + gamma so the text is crisp
+    // regardless of the underlying image brightness.
+    if (du.overlay == 1u) {
+        if (px < du.overlay_w && py < du.overlay_h) {
+            let o = textureLoad(overlay_tex, vec2<i32>(i32(px), i32(py)), 0);
+            mapped = mix(mapped, o.xyz, o.a);
+        }
+    }
+
     return vec4<f32>(clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

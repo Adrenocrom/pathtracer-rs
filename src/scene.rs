@@ -191,8 +191,49 @@ impl SceneData {
         });
     }
 
+    /// Add an infinite plane. Kept for tests and future scenes; the demo
+    /// room uses `add_wall` (finite quads) so the BVH can cull.
+    #[allow(dead_code)]
     pub fn add_plane(&mut self, point: Vec3, normal: Vec3, mat: MaterialData) {
         self.planes.push(PlaneData { point, normal, mat });
+    }
+
+    /// Add a finite rectangular wall (a quad) instead of an infinite
+    /// plane. Planes get a ±1e6 bounding box, so a room built from them
+    /// makes the BVH useless: the root box is huge and no wall is ever
+    /// culled. A quad has a tight box, so the BVH can actually cull.
+    ///
+    /// The quad is centered at `point` with the given outward `normal`
+    /// and spans `width` × `height` along the tangent frame. The tangent
+    /// frame is derived from the normal exactly like `Quad::new`, so the
+    /// CPU and GPU backends see identical geometry.
+    pub fn add_wall(
+        &mut self,
+        point: Vec3,
+        normal: Vec3,
+        width: f32,
+        height: f32,
+        mat: MaterialData,
+    ) {
+        let normal = normal.normalize();
+        // Same helper-axis rule as `geometry::Quad::new` so the tangent
+        // frame matches exactly.
+        let a = if normal.x.abs() > 0.9 {
+            Vec3::new(0.0, 1.0, 0.0)
+        } else {
+            Vec3::new(1.0, 0.0, 0.0)
+        };
+        let tangent = a.cross(normal).normalize();
+        let bitangent = normal.cross(tangent);
+        self.quads.push(QuadData {
+            center: point,
+            normal,
+            tangent,
+            bitangent,
+            half_w: width * 0.5,
+            half_h: height * 0.5,
+            mat,
+        });
     }
 
     /// Register an emitter. The light is stored in two places, by design:
@@ -330,6 +371,48 @@ mod tests {
             direction: Vec3::new(0.0, 1.0, 0.0),
         };
         assert!(cpu_scene.intersect(&ray).is_some());
+    }
+
+    /// A wall added via `add_wall` must be a quad with a tight bounding
+    /// box, not an infinite plane with a ±1e6 box: that is the whole
+    /// point of the helper (BVH culling).
+    #[test]
+    fn add_wall_is_a_finite_quad_with_tight_bbox() {
+        let mut scene = SceneData::new();
+        // A 5×2 wall facing +z. The tangent frame derived from the normal
+        // puts half_w along -y and half_h along +x (see `Quad::new`'s
+        // helper-axis rule), so the bbox is 2 wide (x), 5 tall (y) and
+        // flat in z.
+        scene.add_wall(
+            Vec3::new(0.0, 0.0, -2.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            5.0,
+            2.0,
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        assert_eq!(scene.planes.len(), 0);
+        assert_eq!(scene.quads.len(), 1);
+        let q = &scene.quads[0];
+        assert_eq!(q.half_w, 2.5);
+        assert_eq!(q.half_h, 1.0);
+        // The quad's bbox must be tight: no ±1e6 extents.
+        let (cpu_scene, _) = scene.build_cpu_scene();
+        let bbox = cpu_scene.bounding_box();
+        assert!(bbox.max.x - bbox.min.x <= 2.0 + 1e-4, "x extent: {:?}", bbox);
+        assert!(bbox.max.y - bbox.min.y <= 5.0 + 1e-4, "y extent: {:?}", bbox);
+        assert!(bbox.max.z - bbox.min.z <= 1e-4, "z extent: {:?}", bbox);
+        // A ray through the wall's center hits it...
+        let hit = crate::geometry::Ray {
+            origin: Vec3::new(0.0, 1.0, 0.0),
+            direction: Vec3::new(0.0, 0.0, -1.0),
+        };
+        assert!(cpu_scene.intersect(&hit).is_some());
+        // ...and a ray outside its extent misses (a plane would hit).
+        let above = crate::geometry::Ray {
+            origin: Vec3::new(0.0, 3.0, 0.0),
+            direction: Vec3::new(0.0, 0.0, -1.0),
+        };
+        assert!(cpu_scene.intersect(&above).is_none());
     }
 
     /// A light added *only* via `add_light` must be real geometry: the GPU

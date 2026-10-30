@@ -437,6 +437,18 @@ impl GpuRenderer {
         &self.queue
     }
 
+    /// Cloned handles to the device and queue (both are `Arc`-backed in
+    /// wgpu, so cloning is cheap and shares the same underlying GPU
+    /// context). Used to build a second renderer — e.g. the FHD export —
+    /// without re-creating the adapter and re-uploading the scene.
+    pub fn device_clone(&self) -> wgpu::Device {
+        self.device.clone()
+    }
+
+    pub fn queue_clone(&self) -> wgpu::Queue {
+        self.queue.clone()
+    }
+
     /// The accumulation buffer, read by the display pass.
     pub fn accum_buf(&self) -> &wgpu::Buffer {
         &self.accum_buf
@@ -445,6 +457,11 @@ impl GpuRenderer {
     /// Current render resolution.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Samples accumulated in the current epoch (for the status line).
+    pub fn samples_accumulated(&self) -> u32 {
+        self.samples
     }
 
     /// Rebuild the accumulation and readback buffers at a new resolution.
@@ -479,8 +496,9 @@ impl GpuRenderer {
         self.samples = 0;
     }
 
-    /// Render one frame (one sample per pixel) and accumulate it on the GPU.
-    /// Does not block on the GPU; call `read_pixels` when pixels are needed.
+    /// Render one frame (two samples per pixel) and accumulate it on the
+    /// GPU. Does not block on the GPU; call `read_pixels` when pixels are
+    /// needed.
     pub fn render_frame(&mut self, cam: &crate::camera::Cam, max_depth: u32) {
         self.render_frame_spp(cam, max_depth, 2);
     }
@@ -622,6 +640,14 @@ impl crate::renderer::Renderer for GpuRenderer {
         self.reset_accumulation();
     }
 
+    /// Rebuild the accumulation/readback buffers at a new resolution,
+    /// reusing the device, pipeline and scene buffers. Creating a whole
+    /// new `GpuRenderer` per resize would re-upload the scene and rebuild
+    /// the pipeline every time.
+    fn resize(&mut self, width: u32, height: u32) {
+        self.resize(width, height);
+    }
+
     fn name(&self) -> String {
         format!("GPU ({})", self.adapter_info())
     }
@@ -654,8 +680,8 @@ mod tests {
     /// checks the pixels are finite.
     #[test]
     fn gpu_renderer_smoke() {
-        std::fs::write("smoke_started.txt", "started").ok();
         // Capture any panic message to a file (test harness hides stdout).
+        // Written under target/ so the working tree stays clean.
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
@@ -669,11 +695,11 @@ mod tests {
                 .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
                 .unwrap_or_else(|| "unknown".to_string());
-            std::fs::write("gpu_smoke_error.txt", format!("panic at {loc}: {msg}")).ok();
+            std::fs::write("target/gpu_smoke_error.txt", format!("panic at {loc}: {msg}")).ok();
             default_hook(info);
         }));
         // Clear stale error files so we only see fresh failures.
-        let _ = std::fs::remove_file("gpu_smoke_error.txt");
+        let _ = std::fs::remove_file("target/gpu_smoke_error.txt");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gpu_renderer_smoke_inner();
         }));
@@ -703,7 +729,6 @@ mod tests {
             Err(e) => {
                 // No adapter at all: acceptable, the CPU fallback handles it.
                 eprintln!("no GPU adapter in test env: {e}");
-                std::fs::write("gpu_smoke_error.txt", format!("no adapter: {e}")).ok();
                 return;
             }
         };
@@ -732,6 +757,7 @@ mod tests {
     /// Ignored by default: it needs a real GPU. Run with
     /// `cargo test -- --ignored gpu_matches_cpu`.
     #[test]
+    #[ignore]
     fn gpu_matches_cpu() {
         // Capture any panic message to a file (test harness hides stdout).
         let default_hook = std::panic::take_hook();
@@ -747,11 +773,11 @@ mod tests {
                 .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
                 .unwrap_or_else(|| "unknown".to_string());
-            std::fs::write("gpu_oracle_error.txt", format!("panic at {loc}: {msg}")).ok();
+            std::fs::write("target/gpu_oracle_error.txt", format!("panic at {loc}: {msg}")).ok();
             default_hook(info);
         }));
         // Clear stale error files so we only see fresh failures.
-        let _ = std::fs::remove_file("gpu_oracle_error.txt");
+        let _ = std::fs::remove_file("target/gpu_oracle_error.txt");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             gpu_matches_cpu_inner();
         }));
