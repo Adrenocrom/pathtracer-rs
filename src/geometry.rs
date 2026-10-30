@@ -142,6 +142,43 @@ impl Intersectable for Plane {
 }
 
 // --- QUAD ---
+/// Tangent frame for a `width` x `height` rectangle facing `normal`.
+///
+/// For axis-aligned normals the extents are world-axis sized: `width`
+/// spans the horizontal axis (x for normals along z or y, z for normals
+/// along x) and `height` spans the vertical axis (y, or z for normals
+/// along y). Sizing the extents along an arbitrary helper-axis tangent
+/// frame instead *rotates* walls: a "5 wide, 2 tall" wall facing +z came
+/// out 2 wide and 5 tall, because the helper axis for a +z normal is
+/// vertical.
+///
+/// Non-axis-aligned normals have no world-axis mapping; they fall back
+/// to a helper axis perpendicular to the normal, with `width` along the
+/// tangent and `height` along the bitangent.
+///
+/// Returns `(tangent, bitangent, half_w, half_h)`.
+pub(crate) fn quad_frame(normal: Vec3, width: f32, height: f32) -> (Vec3, Vec3, f32, f32) {
+    // An axis normal is exactly unit length along its axis after
+    // normalization, so a near-1 threshold separates it from diagonals.
+    const AXIS: f32 = 1.0 - 1e-3;
+    if normal.y.abs() > AXIS {
+        // Floor/ceiling: width along x, height along z.
+        (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), width * 0.5, height * 0.5)
+    } else if normal.x.abs() > AXIS {
+        // Side walls: width along z, height along y.
+        (Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 1.0, 0.0), width * 0.5, height * 0.5)
+    } else if normal.z.abs() > AXIS {
+        // Back/front walls: width along x, height along y.
+        (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), width * 0.5, height * 0.5)
+    } else {
+        // Diagonal normal: |normal.x| <= 1 - 1e-3, so the x axis is
+        // never parallel to it and works as the helper axis.
+        let tangent = Vec3::new(1.0, 0.0, 0.0).cross(normal).normalize();
+        let bitangent = normal.cross(tangent);
+        (tangent, bitangent, width * 0.5, height * 0.5)
+    }
+}
+
 /// A finite rectangle, used for light panels.
 #[derive(Clone)]
 pub struct Quad {
@@ -160,23 +197,8 @@ impl Quad {
     #[allow(dead_code)]
     pub fn new(center: Vec3, normal: Vec3, width: f32, height: f32, mat: Material) -> Self {
         let normal = normal.normalize();
-        // Pick a helper axis that is never parallel to the normal.
-        let a = if normal.x.abs() > 0.9 {
-            Vec3::new(0.0, 1.0, 0.0)
-        } else {
-            Vec3::new(1.0, 0.0, 0.0)
-        };
-        let tangent = a.cross(normal).normalize();
-        let bitangent = normal.cross(tangent);
-        Self {
-            center,
-            normal,
-            tangent,
-            bitangent,
-            half_w: width * 0.5,
-            half_h: height * 0.5,
-            mat,
-        }
+        let (tangent, bitangent, half_w, half_h) = quad_frame(normal, width, height);
+        Self { center, normal, tangent, bitangent, half_w, half_h, mat }
     }
 }
 

@@ -63,19 +63,14 @@ impl LightData {
     }
 
     /// Quad light constructor. Not used by the demo scene (its ceiling quad
-    /// light is disabled), but part of the scene API.
+    /// light is disabled), but part of the scene API. Uses the same
+    /// world-axis tangent frame as `add_wall`/`add_quad` so the light
+    /// geometry matches a wall of the same arguments.
     #[allow(dead_code)]
     pub fn from_quad(center: Vec3, normal: Vec3, width: f32, height: f32, emission: Vec3) -> Self {
         let normal = normal.normalize();
-        // Same helper-axis rule as `geometry::Quad::new` so the tangent frame
-        // matches exactly.
-        let a = if normal.x.abs() > 0.9 {
-            Vec3::new(0.0, 1.0, 0.0)
-        } else {
-            Vec3::new(1.0, 0.0, 0.0)
-        };
-        let tangent = a.cross(normal).normalize();
-        let bitangent = normal.cross(tangent);
+        let (tangent, bitangent, half_w, half_h) =
+            crate::geometry::quad_frame(normal, width, height);
         Self {
             shape: 1,
             center,
@@ -83,8 +78,8 @@ impl LightData {
             normal,
             tangent,
             bitangent,
-            half_w: width * 0.5,
-            half_h: height * 0.5,
+            half_w,
+            half_h,
             emission,
         }
     }
@@ -164,20 +159,15 @@ impl SceneData {
     #[allow(dead_code)]
     pub fn add_quad(&mut self, center: Vec3, normal: Vec3, width: f32, height: f32, mat: MaterialData) {
         let normal = normal.normalize();
-        let a = if normal.x.abs() > 0.9 {
-            Vec3::new(0.0, 1.0, 0.0)
-        } else {
-            Vec3::new(1.0, 0.0, 0.0)
-        };
-        let tangent = a.cross(normal).normalize();
-        let bitangent = normal.cross(tangent);
+        let (tangent, bitangent, half_w, half_h) =
+            crate::geometry::quad_frame(normal, width, height);
         self.quads.push(QuadData {
             center,
             normal,
             tangent,
             bitangent,
-            half_w: width * 0.5,
-            half_h: height * 0.5,
+            half_w,
+            half_h,
             mat,
         });
     }
@@ -203,10 +193,16 @@ impl SceneData {
     /// makes the BVH useless: the root box is huge and no wall is ever
     /// culled. A quad has a tight box, so the BVH can actually cull.
     ///
-    /// The quad is centered at `point` with the given outward `normal`
-    /// and spans `width` × `height` along the tangent frame. The tangent
-    /// frame is derived from the normal exactly like `Quad::new`, so the
-    /// CPU and GPU backends see identical geometry.
+    /// The quad is centered at `point` with the given outward `normal`.
+    /// For axis-aligned normals the extents are world-axis sized:
+    /// `width` spans the horizontal axis (x for floor/ceiling/back/front
+    /// walls, z for side walls) and `height` spans the vertical axis (y,
+    /// or z for floor/ceiling). The caller centers side walls at
+    /// mid-height — the quad is centered on `point`, so a wall centered
+    /// at floor level would cover only the bottom half of the room.
+    ///
+    /// The tangent frame is derived exactly like `geometry::Quad::new`,
+    /// so the CPU and GPU backends see identical geometry.
     pub fn add_wall(
         &mut self,
         point: Vec3,
@@ -216,22 +212,17 @@ impl SceneData {
         mat: MaterialData,
     ) {
         let normal = normal.normalize();
-        // Same helper-axis rule as `geometry::Quad::new` so the tangent
+        // Same world-axis rule as `geometry::Quad::new` so the tangent
         // frame matches exactly.
-        let a = if normal.x.abs() > 0.9 {
-            Vec3::new(0.0, 1.0, 0.0)
-        } else {
-            Vec3::new(1.0, 0.0, 0.0)
-        };
-        let tangent = a.cross(normal).normalize();
-        let bitangent = normal.cross(tangent);
+        let (tangent, bitangent, half_w, half_h) =
+            crate::geometry::quad_frame(normal, width, height);
         self.quads.push(QuadData {
             center: point,
             normal,
             tangent,
             bitangent,
-            half_w: width * 0.5,
-            half_h: height * 0.5,
+            half_w,
+            half_h,
             mat,
         });
     }
@@ -375,14 +366,14 @@ mod tests {
 
     /// A wall added via `add_wall` must be a quad with a tight bounding
     /// box, not an infinite plane with a ±1e6 box: that is the whole
-    /// point of the helper (BVH culling).
+    /// point of the helper (BVH culling). It must also map `width` to
+    /// the horizontal world axis and `height` to the vertical one — the
+    /// original helper-axis tangent frame rotated walls (a 5-wide,
+    /// 2-tall wall facing +z came out 2 wide and 5 tall).
     #[test]
     fn add_wall_is_a_finite_quad_with_tight_bbox() {
         let mut scene = SceneData::new();
-        // A 5×2 wall facing +z. The tangent frame derived from the normal
-        // puts half_w along -y and half_h along +x (see `Quad::new`'s
-        // helper-axis rule), so the bbox is 2 wide (x), 5 tall (y) and
-        // flat in z.
+        // A 5×2 wall facing +z: width spans x, height spans y.
         scene.add_wall(
             Vec3::new(0.0, 0.0, -2.5),
             Vec3::new(0.0, 0.0, 1.0),
@@ -398,21 +389,48 @@ mod tests {
         // The quad's bbox must be tight: no ±1e6 extents.
         let (cpu_scene, _) = scene.build_cpu_scene();
         let bbox = cpu_scene.bounding_box();
-        assert!(bbox.max.x - bbox.min.x <= 2.0 + 1e-4, "x extent: {:?}", bbox);
-        assert!(bbox.max.y - bbox.min.y <= 5.0 + 1e-4, "y extent: {:?}", bbox);
+        assert!(bbox.max.x - bbox.min.x <= 5.0 + 1e-4, "x extent: {:?}", bbox);
+        assert!(bbox.max.y - bbox.min.y <= 2.0 + 1e-4, "y extent: {:?}", bbox);
         assert!(bbox.max.z - bbox.min.z <= 1e-4, "z extent: {:?}", bbox);
         // A ray through the wall's center hits it...
         let hit = crate::geometry::Ray {
-            origin: Vec3::new(0.0, 1.0, 0.0),
+            origin: Vec3::new(0.0, 0.0, 0.0),
             direction: Vec3::new(0.0, 0.0, -1.0),
         };
         assert!(cpu_scene.intersect(&hit).is_some());
-        // ...and a ray outside its extent misses (a plane would hit).
+        // ...and rays outside its extents miss (a plane would hit).
         let above = crate::geometry::Ray {
             origin: Vec3::new(0.0, 3.0, 0.0),
             direction: Vec3::new(0.0, 0.0, -1.0),
         };
         assert!(cpu_scene.intersect(&above).is_none());
+        let beside = crate::geometry::Ray {
+            origin: Vec3::new(3.0, 0.0, 0.0),
+            direction: Vec3::new(0.0, 0.0, -1.0),
+        };
+        assert!(cpu_scene.intersect(&beside).is_none());
+    }
+
+    /// A side wall (normal along x) must span z horizontally and y
+    /// vertically — the axis mapping differs from the back/front walls.
+    #[test]
+    fn add_wall_side_wall_spans_z_and_y() {
+        let mut scene = SceneData::new();
+        scene.add_wall(
+            Vec3::new(-2.5, 1.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            5.0,
+            2.0,
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        let q = &scene.quads[0];
+        assert_eq!(q.half_w, 2.5);
+        assert_eq!(q.half_h, 1.0);
+        let (cpu_scene, _) = scene.build_cpu_scene();
+        let bbox = cpu_scene.bounding_box();
+        assert!(bbox.max.z - bbox.min.z <= 5.0 + 1e-4, "z extent: {:?}", bbox);
+        assert!(bbox.max.y - bbox.min.y <= 2.0 + 1e-4, "y extent: {:?}", bbox);
+        assert!(bbox.max.x - bbox.min.x <= 1e-4, "x extent: {:?}", bbox);
     }
 
     /// A light added *only* via `add_light` must be real geometry: the GPU

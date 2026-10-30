@@ -44,24 +44,30 @@ fn build_scene() -> SceneData {
     // The room: finite quads, not infinite planes. Planes get a ±1e6
     // bounding box, which makes the BVH useless (the root box spans the
     // whole world and no wall is ever culled). Quads have tight boxes.
+    //
+    // `add_wall` reads `width`/`height` as world-axis extents (width
+    // horizontal, height vertical) and centers the quad on `point`, so
+    // the four side walls are centered at mid-height — a wall centered
+    // at floor level would cover only the bottom half of the room.
     let floor_w = room_size * 2.0;
     let wall_h = room_height;
+    let mid_y = room_height * 0.5;
 
-    // Floor and ceiling
+    // Floor and ceiling (width spans x, height spans z)
     scene.add_wall(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), floor_w, floor_w, white);
     scene.add_wall(Vec3::new(0.0, room_height, 0.0), Vec3::new(0.0, -1.0, 0.0), floor_w, floor_w, white);
 
-    // Back wall
-    scene.add_wall(Vec3::new(0.0, 0.0, -room_size), Vec3::new(0.0, 0.0, 1.0), floor_w, wall_h, white);
+    // Back wall (width spans x, height spans y)
+    scene.add_wall(Vec3::new(0.0, mid_y, -room_size), Vec3::new(0.0, 0.0, 1.0), floor_w, wall_h, white);
 
-    // Left wall (red)
-    scene.add_wall(Vec3::new(-room_size, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), floor_w, wall_h, red);
+    // Left wall (red) (width spans z, height spans y)
+    scene.add_wall(Vec3::new(-room_size, mid_y, 0.0), Vec3::new(1.0, 0.0, 0.0), floor_w, wall_h, red);
 
     // Right wall (green)
-    scene.add_wall(Vec3::new(room_size, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), floor_w, wall_h, green);
+    scene.add_wall(Vec3::new(room_size, mid_y, 0.0), Vec3::new(-1.0, 0.0, 0.0), floor_w, wall_h, green);
 
     // Front wall
-    scene.add_wall(Vec3::new(0.0, 0.0, room_size), Vec3::new(0.0, 0.0, -1.0), floor_w, wall_h, white);
+    scene.add_wall(Vec3::new(0.0, mid_y, room_size), Vec3::new(0.0, 0.0, -1.0), floor_w, wall_h, white);
 
     // Central spheres
     scene.add_sphere(Vec3::new(-0.9, 0.4, -0.9), 0.4, white);
@@ -87,15 +93,15 @@ fn build_scene() -> SceneData {
     // Ceiling light panel (one-sided: emits along its normal, i.e.
     // downward). `add_light` registers the quad as geometry too.
     //scene.add_light(LightData::from_quad(
-    //        Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
+    //        Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     //));
 
     //scene.add_light(LightData::from_quad(
-    //        Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
+    //        Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     //));
 
     //scene.add_light(LightData::from_quad(
-    //        Vec3::new(15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
+    //        Vec3::new(15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     //));
 
     scene
@@ -121,6 +127,51 @@ mod tests {
         };
         assert!(cpu_scene.intersect(&ray).is_some());
         assert_eq!(lights.len(), 1);
+    }
+
+    /// The room must be closed: the six walls actually cover the full
+    /// extents of the box (x, z ∈ [-2.5, 2.5], y ∈ [0, 2]). The wall
+    /// sizing bug left two escape routes — the back/front walls were
+    /// rotated (2 wide instead of 5) and the side walls were centered at
+    /// floor level (covering only y ∈ [-1, 1]) — so rays through those
+    /// regions returned the background instead of a wall.
+    #[test]
+    fn room_is_closed_on_all_six_sides() {
+        let scene = build_scene();
+        let (cpu_scene, _) = scene.build_cpu_scene();
+        let center = Vec3::new(0.0, 1.0, 0.0);
+
+        // Every axis ray from the room center must hit a wall.
+        for dir in [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+        ] {
+            let ray = crate::geometry::Ray { origin: center, direction: dir };
+            assert!(
+                cpu_scene.intersect(&ray).is_some(),
+                "ray {dir:?} escaped the room"
+            );
+        }
+
+        // Through the old rotated-back-wall gap: x = 2 is outside the
+        // old 2-wide back wall but inside the correct 5-wide one.
+        let beside_back = crate::geometry::Ray {
+            origin: Vec3::new(2.0, 1.0, 0.0),
+            direction: Vec3::new(0.0, 0.0, -1.0),
+        };
+        assert!(cpu_scene.intersect(&beside_back).is_some(), "back wall too narrow");
+
+        // Through the old half-height side-wall gap: y ≈ 1.9 at the wall
+        // was above the old y ∈ [-1, 1] coverage.
+        let above_side = crate::geometry::Ray {
+            origin: Vec3::new(0.0, 1.8, 0.0),
+            direction: Vec3::new(1.0, 0.05, 0.0).normalize(),
+        };
+        assert!(cpu_scene.intersect(&above_side).is_some(), "side wall too short");
     }
 
     #[test]
