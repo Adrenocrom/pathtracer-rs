@@ -12,6 +12,7 @@ use crate::gpu::GpuRenderer;
 use crate::renderer::MAX_ACCUMULATED_FRAMES;
 use crate::scene::SceneData;
 use std::sync::Arc;
+use std::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -22,6 +23,56 @@ use winit::window::{Window, WindowId};
 //const MAX_ACCUMULATED_FRAMES: u32 = 100000;
 /// Preview path depth (same as the terminal frontend).
 const MAX_DEPTH_PREVIEW: u32 = 4;
+
+/// Camera speed in world units per second (W/S).
+const MOVE_SPEED: f32 = 1.0;
+/// Camera rotation speed in radians per second (A/D).
+const ROT_SPEED: f32 = 1.0;
+
+/// The keys the window frontend reacts to. The discriminants are used as
+/// indices into the `Keys` state array, so they must stay contiguous.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Key {
+    W = 0,
+    A,
+    S,
+    D,
+    COUNT,
+}
+
+impl Key {
+    /// Map a physical key code to a tracked key, if any.
+    fn from_code(code: KeyCode) -> Option<Self> {
+        match code {
+            KeyCode::KeyW => Some(Key::W),
+            KeyCode::KeyA => Some(Key::A),
+            KeyCode::KeyS => Some(Key::S),
+            KeyCode::KeyD => Some(Key::D),
+            _ => None,
+        }
+    }
+}
+
+/// Held-key state: one bool per tracked key, allowing any number of keys
+/// to be pressed simultaneously (e.g. W+D = forward + turn).
+#[derive(Clone, Copy)]
+struct Keys {
+    pressed: [bool; Key::COUNT as usize],
+}
+
+impl Keys {
+    fn new() -> Self {
+        Self { pressed: [false; Key::COUNT as usize] }
+    }
+
+    fn set(&mut self, key: Key, state: ElementState) {
+        self.pressed[key as usize] = state == ElementState::Pressed;
+    }
+
+    fn is_down(&self, key: Key) -> bool {
+        self.pressed[key as usize]
+    }
+}
 
 /// The display pass: reads the accumulation buffer and post-processes it
 /// onto the swapchain (shaders/display.wgsl).
@@ -159,6 +210,10 @@ struct App {
     display: Option<Display>,
     filter_enabled: bool,
     frames_accumulated: usize,
+    /// Held-key state (press + release), updated by keyboard events.
+    keys: Keys,
+    /// Timestamp of the previous frame, for delta-time scaling.
+    last_frame: Option<Instant>,
 }
 
 impl App {
@@ -173,6 +228,8 @@ impl App {
             display: None,
             filter_enabled: false,
             frames_accumulated: 0,
+            keys: Keys::new(),
+            last_frame: None,
         }
     }
 
@@ -224,6 +281,40 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else { return };
         let Some(display) = self.display.as_ref() else { return };
 
+        // Delta time since the previous frame, so movement speed is
+        // independent of the display refresh rate.
+        let now = Instant::now();
+        let dt = self
+            .last_frame
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .unwrap_or(0.0);
+        self.last_frame = Some(now);
+
+        // Continuous movement from held keys: any combination of W/A/S/D
+        // can be active at once (e.g. W+D = forward + turn).
+        let mut moved = false;
+        if self.keys.is_down(Key::W) {
+            self.cam.move_forward(MOVE_SPEED * dt);
+            moved = true;
+        }
+        if self.keys.is_down(Key::S) {
+            self.cam.move_forward(-MOVE_SPEED * dt);
+            moved = true;
+        }
+        if self.keys.is_down(Key::A) {
+            self.cam.rotate(ROT_SPEED * dt);
+            moved = true;
+        }
+        if self.keys.is_down(Key::D) {
+            self.cam.rotate(-ROT_SPEED * dt);
+            moved = true;
+        }
+        if moved {
+            // Camera moved: the accumulated image is stale, start over.
+            renderer.reset_accumulation();
+            self.frames_accumulated = 0;
+        }
+
         // Progressive accumulation while the camera is stationary.
         if self.frames_accumulated < MAX_ACCUMULATED_FRAMES {
             renderer.render_frame(&self.cam, MAX_DEPTH_PREVIEW);
@@ -270,18 +361,6 @@ impl App {
 
         // Keep the loop running at display rate even when converged.
         window.request_redraw();
-    }
-
-    /// Shared key handling: returns true when the camera moved.
-    fn handle_key(&mut self, code: KeyCode) -> bool {
-        match code {
-            KeyCode::KeyW => self.cam.move_forward(0.1),
-            KeyCode::KeyS => self.cam.move_forward(-0.1),
-            KeyCode::KeyA => self.cam.rotate(0.05),
-            KeyCode::KeyD => self.cam.rotate(-0.05),
-            _ => return false,
-        }
-        true
     }
 }
 
@@ -356,36 +435,40 @@ impl ApplicationHandler for App {
                 event:
                     KeyEvent {
                         physical_key: PhysicalKey::Code(code),
-                        state: ElementState::Pressed,
+                        state,
+                        repeat,
                         ..
                     },
                 ..
-            } => match code {
-                KeyCode::Escape | KeyCode::KeyQ => event_loop.exit(),
-                KeyCode::KeyF => {
-                    self.filter_enabled = !self.filter_enabled;
-                    if let Some(renderer) = self.renderer.as_ref() {
-                        if let Some(display) = self.display.as_ref() {
-                            let (w, h) = renderer.size();
-                            display.write_uniforms(renderer.queue(), w, h, self.filter_enabled);
+            } => {
+                // Held-key tracking: press and release both update the
+                // state array; the actual motion is applied per frame in
+                // `render()`, so multiple keys can be held at once.
+                if let Some(key) = Key::from_code(code) {
+                    self.keys.set(key, state);
+                }
+
+                // Discrete actions fire on the initial press only
+                // (`repeat` is false), not on OS key-repeat.
+                if state == ElementState::Pressed && !repeat {
+                    match code {
+                        KeyCode::Escape | KeyCode::KeyQ => event_loop.exit(),
+                        KeyCode::KeyF => {
+                            self.filter_enabled = !self.filter_enabled;
+                            if let Some(renderer) = self.renderer.as_ref() {
+                                if let Some(display) = self.display.as_ref() {
+                                    let (w, h) = renderer.size();
+                                    display.write_uniforms(renderer.queue(), w, h, self.filter_enabled);
+                                }
+                            }
+                            if let Some(window) = self.window.as_ref() {
+                                window.request_redraw();
+                            }
                         }
-                    }
-                    if let Some(window) = self.window.as_ref() {
-                        window.request_redraw();
+                        _ => {}
                     }
                 }
-                _ => {
-                    if self.handle_key(code) {
-                        if let Some(renderer) = self.renderer.as_mut() {
-                            renderer.reset_accumulation();
-                        }
-                        self.frames_accumulated = 0;
-                        if let Some(window) = self.window.as_ref() {
-                            window.request_redraw();
-                        }
-                    }
-                }
-            },
+            }
             _ => {}
         }
     }
