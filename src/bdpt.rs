@@ -158,15 +158,17 @@ fn mis_weight(
     // Power heuristic (beta = 2), normalized by the largest ratio to keep
     // the squares in a safe floating-point range.
     let mut r_max = 0.0f64;
-    for m in 1..=k {
-        r_max = r_max.max(r[m]);
+    for &ratio in &r[1..=k] {
+        r_max = r_max.max(ratio);
     }
-    if !(r_max > 0.0) {
+    // `partial_cmp` rather than `<= 0.0`: an incomparable (NaN) ratio
+    // must take the weight-1 exit as well.
+    if r_max.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return 1.0;
     }
     let mut sum = 0.0f64;
-    for m in 1..=k {
-        let q = r[m] / r_max;
+    for &ratio in &r[1..=k] {
+        let q = ratio / r_max;
         sum += q * q;
     }
     let q = r[s] / r_max;
@@ -186,17 +188,19 @@ fn rr_survival(beta: Vec3, ext: usize) -> f32 {
     beta.x.max(beta.y).max(beta.z).clamp(RR_MIN, 1.0)
 }
 
-/// Fill the Russian-roulette prefix products the MIS weights need.
+/// Russian-roulette prefix products the MIS weights need: `qe[m]` is
+/// Qe(m) and `ql[j]` is Ql(j) (see `mis_weight`).
+struct RrProducts {
+    qe: [f64; MAX_PATH_VERTICES + 1],
+    ql: [f64; MAX_PATH_VERTICES + 1],
+}
+
+/// Compute the Russian-roulette prefix products the MIS weights need.
 ///
 /// The path is the eye prefix x_1..x_{n_eye} followed by the light vertices
 /// y_{n_light-1}..y_0 (k = n_eye + n_light vertices after the camera). The
 /// direct-hit strategy passes the whole eye subpath (`n_light == 0`) plus
 /// the light-subpath throughput at the hit point.
-///
-/// `qe[m]` = Qe(m): product of the survival probabilities of the rolls the
-/// *eye* subpath makes at x_1..x_{m-1}, for m = 1..=k.
-/// `ql[j]` = Ql(j): product of the rolls the *light* subpath makes at
-/// y_0..y_{j-1}, for j = 0..=k-2.
 ///
 /// Both sweeps recompute the compensated throughputs the rolls were made
 /// from — those are deterministic functions of the path prefix — so the
@@ -213,15 +217,18 @@ fn rr_prefix_products(
     n_eye: usize,
     n_light: usize,
     alpha_light0: Vec3,
-    qe: &mut [f64],
-    ql: &mut [f64],
-) {
+) -> RrProducts {
     debug_assert!(n_eye + n_light == k);
     debug_assert!(n_eye >= 1);
 
+    let mut out = RrProducts {
+        qe: [0.0; MAX_PATH_VERTICES + 1],
+        ql: [0.0; MAX_PATH_VERTICES + 1],
+    };
+
     // Eye-side sweep: the roll at x_l governs the extension to x_{l+1}.
     let mut alpha = Vec3::new(1.0, 1.0, 1.0);
-    qe[1] = 1.0;
+    out.qe[1] = 1.0;
     for l in 1..k {
         let alb = if l <= n_eye {
             eye[l - 1].albedo
@@ -230,14 +237,14 @@ fn rr_prefix_products(
         };
         let beta = alpha * alb;
         let q = rr_survival(beta, l);
-        qe[l + 1] = qe[l] * q as f64;
+        out.qe[l + 1] = out.qe[l] * q as f64;
         alpha = beta * (1.0 / q);
     }
 
     // Light-side sweep: the roll at y_j governs the extension to y_{j+1}.
     // The first step has no BSDF at the emitter, hence the PI factor.
     let mut alpha_l = alpha_light0;
-    ql[0] = 1.0;
+    out.ql[0] = 1.0;
     for j in 0..k.saturating_sub(2) {
         let factor = if j == 0 {
             Vec3::new(PI, PI, PI)
@@ -248,9 +255,11 @@ fn rr_prefix_products(
         };
         let beta = alpha_l * factor;
         let q = rr_survival(beta, j + 1);
-        ql[j + 1] = ql[j] * q as f64;
+        out.ql[j + 1] = out.ql[j] * q as f64;
         alpha_l = beta * (1.0 / q);
     }
+
+    out
 }
 
 /// Trace one camera ray with BDPT. Returns the estimated radiance.
@@ -395,19 +404,9 @@ pub fn bdpt_trace(
                 // The hypothetical light subpath of the other strategies
                 // starts at this hit point with the emitter's throughput
                 // (emission * n * A, the inverse light-sampling pdf).
-                let mut qe = [0.0f64; MAX_PATH_VERTICES + 1];
-                let mut ql = [0.0f64; MAX_PATH_VERTICES + 1];
-                rr_prefix_products(
-                    &eye,
-                    &light_path,
-                    k,
-                    k,
-                    0,
-                    light.emission * inv_pdf as f32,
-                    &mut qe,
-                    &mut ql,
-                );
-                mis_weight(&edges[..k - 1], &qe, &ql, k, inv_pdf, k)
+                let rr =
+                    rr_prefix_products(&eye, &light_path, k, k, 0, light.emission * inv_pdf as f32);
+                mis_weight(&edges[..k - 1], &rr.qe, &rr.ql, k, inv_pdf, k)
             }
             None => 1.0,
         };
@@ -460,19 +459,9 @@ pub fn bdpt_trace(
                 edges[m - 2] = light_path[k - m + 1].edge_g as f64;
             }
 
-            let mut qe = [0.0f64; MAX_PATH_VERTICES + 1];
-            let mut ql = [0.0f64; MAX_PATH_VERTICES + 1];
-            rr_prefix_products(
-                &eye,
-                &light_path,
-                k,
-                i + 1,
-                j + 1,
-                light_path[0].throughput,
-                &mut qe,
-                &mut ql,
-            );
-            let w = mis_weight(&edges[..k - 1], &qe, &ql, k, inv_light_pdf, i + 1);
+            let rr =
+                rr_prefix_products(&eye, &light_path, k, i + 1, j + 1, light_path[0].throughput);
+            let w = mis_weight(&edges[..k - 1], &rr.qe, &rr.ql, k, inv_light_pdf, i + 1);
             total = total + contrib * w;
         }
     }
@@ -592,34 +581,27 @@ mod tests {
         y0.throughput = Vec3::new(0.1, 0.1, 0.1);
         let light_path = vec![y0, vertex()];
 
-        let mut qe = [0.0f64; MAX_PATH_VERTICES + 1];
-        let mut ql = [0.0f64; MAX_PATH_VERTICES + 1];
-        rr_prefix_products(
-            &eye,
-            &light_path,
-            5,
-            3,
-            2,
-            Vec3::new(0.1, 0.1, 0.1),
-            &mut qe,
-            &mut ql,
-        );
+        let rr = rr_prefix_products(&eye, &light_path, 5, 3, 2, Vec3::new(0.1, 0.1, 0.1));
 
         // Eye sweep: ext 1, 2 unconditional; ext 3: beta = 0.5^3 = 0.125;
         // ext 4: alpha = 0.125/0.125 = 1, beta = 1 * albedo(y_1) = 0.5.
-        assert!((qe[1] - 1.0).abs() < 1e-12);
-        assert!((qe[2] - 1.0).abs() < 1e-12);
-        assert!((qe[3] - 1.0).abs() < 1e-12);
-        assert!((qe[4] - 0.125).abs() < 1e-6, "qe[4] = {}", qe[4]);
-        assert!((qe[5] - 0.0625).abs() < 1e-6, "qe[5] = {}", qe[5]);
+        assert!((rr.qe[1] - 1.0).abs() < 1e-12);
+        assert!((rr.qe[2] - 1.0).abs() < 1e-12);
+        assert!((rr.qe[3] - 1.0).abs() < 1e-12);
+        assert!((rr.qe[4] - 0.125).abs() < 1e-6, "qe[4] = {}", rr.qe[4]);
+        assert!((rr.qe[5] - 0.0625).abs() < 1e-6, "qe[5] = {}", rr.qe[5]);
 
         // Light sweep: ext 1 (PI factor, q = 1), ext 2 (albedo(y_1), q = 1),
         // ext 3: factor = albedo(x_3), beta = 0.1 * PI * 0.5 * 0.5.
-        assert!((ql[0] - 1.0).abs() < 1e-12);
-        assert!((ql[1] - 1.0).abs() < 1e-12);
-        assert!((ql[2] - 1.0).abs() < 1e-12);
+        assert!((rr.ql[0] - 1.0).abs() < 1e-12);
+        assert!((rr.ql[1] - 1.0).abs() < 1e-12);
+        assert!((rr.ql[2] - 1.0).abs() < 1e-12);
         let expected = 0.1 * PI * 0.5 * 0.5;
-        assert!((ql[3] - expected as f64).abs() < 1e-6, "ql[3] = {}", ql[3]);
+        assert!(
+            (rr.ql[3] - expected as f64).abs() < 1e-6,
+            "ql[3] = {}",
+            rr.ql[3]
+        );
     }
 
     #[test]

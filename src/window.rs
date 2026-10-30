@@ -44,7 +44,7 @@ enum Key {
     E,
     Up,
     Down,
-    COUNT,
+    Count,
 }
 
 impl Key {
@@ -68,13 +68,13 @@ impl Key {
 /// to be pressed simultaneously (e.g. W+D = forward + turn).
 #[derive(Clone, Copy)]
 struct Keys {
-    pressed: [bool; Key::COUNT as usize],
+    pressed: [bool; Key::Count as usize],
 }
 
 impl Keys {
     fn new() -> Self {
         Self {
-            pressed: [false; Key::COUNT as usize],
+            pressed: [false; Key::Count as usize],
         }
     }
 

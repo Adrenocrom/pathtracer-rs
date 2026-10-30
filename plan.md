@@ -38,10 +38,15 @@ Remaining, in the order I would do it:
 
 1. `cargo fmt` as its own commit (the tree is not rustfmt-clean; e.g. the
    big `match` in `main.rs`). Separate commit so later diffs stay reviewable.
-2. `cargo clippy --all-targets -- -D warnings`, fix what it finds.
+2. [Done] `cargo clippy --all-targets -- -D warnings`, fix what it finds.
    Expect mostly mechanical fixes; keep the `#[allow(dead_code)]`
    scene-API items (`add_quad`, `add_plane`, `LightData::from_quad`) —
-   they are deliberate API surface.
+   they are deliberate API surface. (Fixed 2026-10-30: needless-range
+   loops and negated comparison in `mis_weight`, `rr_prefix_products`
+   restructured to return a struct instead of taking 8 arguments,
+   `as_chunks` in `gpu.rs`, `Display` impl instead of inherent
+   `to_string` in `output.rs`, `Key::Count`, test module moved to the
+   end of `main.rs`, `identity_op`/`unnecessary_cast` in tests.)
 3. Add `.github/workflows/ci.yml`: stable toolchain, then
    `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
    `cargo test`. Notes:

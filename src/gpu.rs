@@ -665,7 +665,9 @@ impl GpuRenderer {
         self.readback_buf.unmap();
 
         let pixels: Vec<Vec3> = floats
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| Vec3::new(c[0], c[1], c[2]))
             .collect();
         PixelBuffer {

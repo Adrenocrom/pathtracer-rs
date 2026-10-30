@@ -145,99 +145,6 @@ fn build_scene() -> SceneData {
     scene
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scene_builds_and_is_sampleable() {
-        let scene = build_scene();
-        assert_eq!(scene.lights.len(), 1);
-        for light in &scene.lights {
-            assert!(light.area() > 0.0);
-            assert!(light.emission.x > 0.0 || light.emission.y > 0.0 || light.emission.z > 0.0);
-        }
-        // A ray from the camera position must hit the scene.
-        let (cpu_scene, lights) = scene.build_cpu_scene();
-        let ray = crate::geometry::Ray {
-            origin: Vec3::new(0.0, 1.0, -1.5),
-            direction: Vec3::new(0.0, 0.0, 1.0),
-        };
-        assert!(cpu_scene.intersect(&ray).is_some());
-        assert_eq!(lights.len(), 1);
-    }
-
-    /// The room must be closed: the six walls actually cover the full
-    /// extents of the box (x, z ∈ [-2.5, 2.5], y ∈ [0, 2]). The wall
-    /// sizing bug left two escape routes — the back/front walls were
-    /// rotated (2 wide instead of 5) and the side walls were centered at
-    /// floor level (covering only y ∈ [-1, 1]) — so rays through those
-    /// regions returned the background instead of a wall.
-    #[test]
-    fn room_is_closed_on_all_six_sides() {
-        let scene = build_scene();
-        let (cpu_scene, _) = scene.build_cpu_scene();
-        let center = Vec3::new(0.0, 1.0, 0.0);
-
-        // Every axis ray from the room center must hit a wall.
-        for dir in [
-            Vec3::new(1.0, 0.0, 0.0),
-            Vec3::new(-1.0, 0.0, 0.0),
-            Vec3::new(0.0, 1.0, 0.0),
-            Vec3::new(0.0, -1.0, 0.0),
-            Vec3::new(0.0, 0.0, 1.0),
-            Vec3::new(0.0, 0.0, -1.0),
-        ] {
-            let ray = crate::geometry::Ray {
-                origin: center,
-                direction: dir,
-            };
-            assert!(
-                cpu_scene.intersect(&ray).is_some(),
-                "ray {dir:?} escaped the room"
-            );
-        }
-
-        // Through the old rotated-back-wall gap: x = 2 is outside the
-        // old 2-wide back wall but inside the correct 5-wide one.
-        let beside_back = crate::geometry::Ray {
-            origin: Vec3::new(2.0, 1.0, 0.0),
-            direction: Vec3::new(0.0, 0.0, -1.0),
-        };
-        assert!(
-            cpu_scene.intersect(&beside_back).is_some(),
-            "back wall too narrow"
-        );
-
-        // Through the old half-height side-wall gap: y ≈ 1.9 at the wall
-        // was above the old y ∈ [-1, 1] coverage.
-        let above_side = crate::geometry::Ray {
-            origin: Vec3::new(0.0, 1.8, 0.0),
-            direction: Vec3::new(1.0, 0.05, 0.0).normalize(),
-        };
-        assert!(
-            cpu_scene.intersect(&above_side).is_some(),
-            "side wall too short"
-        );
-    }
-
-    #[test]
-    fn preview_render_produces_finite_pixels() {
-        let scene = build_scene();
-        let mut renderer = renderer::CpuRenderer::new(&scene, 16, 16, 4);
-        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
-        renderer.render_frame(&cam, 4);
-        let buffer = renderer.read_pixels();
-        assert_eq!(buffer.pixels.len(), 16 * 16);
-        for p in &buffer.pixels {
-            assert!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
-        }
-        // The image must not be black: the scene contains bright lights.
-        let sum: f32 = buffer.pixels.iter().map(|p| p.x).sum();
-        assert!(sum > 0.0);
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `args()` yields argv[0] (the binary path) first, so the flags start
     // at index 1. `--terminal` forces the terminal UI; `--window` forces
@@ -552,4 +459,97 @@ fn render_fhd(
         crate::output::apply_filters(&mut buffer);
     }
     buffer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scene_builds_and_is_sampleable() {
+        let scene = build_scene();
+        assert_eq!(scene.lights.len(), 1);
+        for light in &scene.lights {
+            assert!(light.area() > 0.0);
+            assert!(light.emission.x > 0.0 || light.emission.y > 0.0 || light.emission.z > 0.0);
+        }
+        // A ray from the camera position must hit the scene.
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        let ray = crate::geometry::Ray {
+            origin: Vec3::new(0.0, 1.0, -1.5),
+            direction: Vec3::new(0.0, 0.0, 1.0),
+        };
+        assert!(cpu_scene.intersect(&ray).is_some());
+        assert_eq!(lights.len(), 1);
+    }
+
+    /// The room must be closed: the six walls actually cover the full
+    /// extents of the box (x, z ∈ [-2.5, 2.5], y ∈ [0, 2]). The wall
+    /// sizing bug left two escape routes — the back/front walls were
+    /// rotated (2 wide instead of 5) and the side walls were centered at
+    /// floor level (covering only y ∈ [-1, 1]) — so rays through those
+    /// regions returned the background instead of a wall.
+    #[test]
+    fn room_is_closed_on_all_six_sides() {
+        let scene = build_scene();
+        let (cpu_scene, _) = scene.build_cpu_scene();
+        let center = Vec3::new(0.0, 1.0, 0.0);
+
+        // Every axis ray from the room center must hit a wall.
+        for dir in [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+        ] {
+            let ray = crate::geometry::Ray {
+                origin: center,
+                direction: dir,
+            };
+            assert!(
+                cpu_scene.intersect(&ray).is_some(),
+                "ray {dir:?} escaped the room"
+            );
+        }
+
+        // Through the old rotated-back-wall gap: x = 2 is outside the
+        // old 2-wide back wall but inside the correct 5-wide one.
+        let beside_back = crate::geometry::Ray {
+            origin: Vec3::new(2.0, 1.0, 0.0),
+            direction: Vec3::new(0.0, 0.0, -1.0),
+        };
+        assert!(
+            cpu_scene.intersect(&beside_back).is_some(),
+            "back wall too narrow"
+        );
+
+        // Through the old half-height side-wall gap: y ≈ 1.9 at the wall
+        // was above the old y ∈ [-1, 1] coverage.
+        let above_side = crate::geometry::Ray {
+            origin: Vec3::new(0.0, 1.8, 0.0),
+            direction: Vec3::new(1.0, 0.05, 0.0).normalize(),
+        };
+        assert!(
+            cpu_scene.intersect(&above_side).is_some(),
+            "side wall too short"
+        );
+    }
+
+    #[test]
+    fn preview_render_produces_finite_pixels() {
+        let scene = build_scene();
+        let mut renderer = renderer::CpuRenderer::new(&scene, 16, 16, 4);
+        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+        renderer.render_frame(&cam, 4);
+        let buffer = renderer.read_pixels();
+        assert_eq!(buffer.pixels.len(), 16 * 16);
+        for p in &buffer.pixels {
+            assert!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+        }
+        // The image must not be black: the scene contains bright lights.
+        let sum: f32 = buffer.pixels.iter().map(|p| p.x).sum();
+        assert!(sum > 0.0);
+    }
 }

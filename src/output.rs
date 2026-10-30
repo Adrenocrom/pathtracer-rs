@@ -1,5 +1,6 @@
 use crate::math::{Vec3, VEC_ZERO};
 use image::{Rgb, RgbImage};
+use std::fmt;
 
 /// A buffer of pixels ready for output.
 pub struct PixelBuffer {
@@ -61,8 +62,26 @@ impl PixelBuffer {
         img.save(path)
     }
 
-    /// Convert the buffer to a string for terminal display using true-color ANSI codes.
-    pub fn to_string(&self) -> String {
+    /// Render progress bar string.
+    pub fn render_progress(current: usize, total: usize) -> String {
+        let pct = current as f64 / total as f64;
+        let filled = (pct * 30.0) as usize;
+        let empty = 30 - filled;
+        format!(
+            "\rProgress: [{}{}] {:.1}% ({}/{})",
+            "█".repeat(filled),
+            "░".repeat(empty),
+            pct * 100.0,
+            current,
+            total
+        )
+    }
+}
+
+/// Terminal display: the buffer as true-color ANSI escape codes, two
+/// pixel rows per character cell via the half-block glyph (▀).
+impl fmt::Display for PixelBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut output = String::new();
         for y in (0..self.height).step_by(2) {
             for x in 0..self.width {
@@ -98,22 +117,7 @@ impl PixelBuffer {
         if output.ends_with("\r\n") {
             output.truncate(output.len() - 2);
         }
-        output
-    }
-
-    /// Render progress bar string.
-    pub fn render_progress(current: usize, total: usize) -> String {
-        let pct = current as f64 / total as f64;
-        let filled = (pct * 30.0) as usize;
-        let empty = 30 - filled;
-        format!(
-            "\rProgress: [{}{}] {:.1}% ({}/{})",
-            "█".repeat(filled),
-            "░".repeat(empty),
-            pct * 100.0,
-            current,
-            total
-        )
+        f.write_str(&output)
     }
 }
 
@@ -213,10 +217,10 @@ mod tests {
         let out = bilateral(&pixels, width, height, 1, 0.15);
 
         // Bright pixel right at the boundary stays bright...
-        let bright_edge = out[1 * width + 3];
+        let bright_edge = out[width + 3];
         assert!(bright_edge.x > 0.95, "edge blurred away: {bright_edge:?}");
         // ...and its dark neighbor stays dark.
-        let dark_edge = out[1 * width + 2];
+        let dark_edge = out[width + 2];
         assert!(dark_edge.x < 0.15, "edge leaked: {dark_edge:?}");
     }
 

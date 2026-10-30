@@ -369,8 +369,9 @@ mod tests {
         assert_eq!(w, 2 * ADVANCE);
         assert_eq!(h, 2 * (GLYPH_H + 1));
         assert_eq!(canvas.data.len(), (w * h * 4) as usize);
-        // The first pixel of 'A' (row 0, col 1) must be set.
-        let idx = (1) as usize * 4;
+        // The first pixel of 'A' (row 0, col 1) must be set: pixel 1
+        // starts at byte 4 (4 bytes per pixel); its alpha is at +3.
+        let idx = 4;
         assert_eq!(canvas.data[idx + 3], 255);
     }
 
