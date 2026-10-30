@@ -1,5 +1,5 @@
+use crate::geometry::{HitRecord, Intersectable};
 use crate::math::BBox;
-use crate::geometry::{Intersectable, HitRecord};
 
 // --- BVH NODE ---
 pub struct BVHNode {
@@ -28,16 +28,34 @@ impl BVHNode {
         let dz = total_bbox.max.z - total_bbox.min.z;
 
         if dx > dy && dx > dz {
-            objects.sort_by(|a, b| a.bounding_box().min.x.partial_cmp(&b.bounding_box().min.x).unwrap());
+            objects.sort_by(|a, b| {
+                a.bounding_box()
+                    .min
+                    .x
+                    .partial_cmp(&b.bounding_box().min.x)
+                    .unwrap()
+            });
         } else if dy > dz {
-            objects.sort_by(|a, b| a.bounding_box().min.y.partial_cmp(&b.bounding_box().min.y).unwrap());
+            objects.sort_by(|a, b| {
+                a.bounding_box()
+                    .min
+                    .y
+                    .partial_cmp(&b.bounding_box().min.y)
+                    .unwrap()
+            });
         } else {
-            objects.sort_by(|a, b| a.bounding_box().min.z.partial_cmp(&b.bounding_box().min.z).unwrap());
+            objects.sort_by(|a, b| {
+                a.bounding_box()
+                    .min
+                    .z
+                    .partial_cmp(&b.bounding_box().min.z)
+                    .unwrap()
+            });
         }
 
         let mid = objects.len() / 2;
         let right_objs = objects.split_off(mid);
-        
+
         let left = Self::build(objects)?;
         let right = Self::build(right_objs)?;
 
@@ -71,7 +89,13 @@ impl Intersectable for BVHNode {
         let right_hit = self.right.intersect(ray);
 
         match (left_hit, right_hit) {
-            (Some(l), Some(r)) => if l.t < r.t { Some(l) } else { Some(r) },
+            (Some(l), Some(r)) => {
+                if l.t < r.t {
+                    Some(l)
+                } else {
+                    Some(r)
+                }
+            }
             (Some(l), None) => Some(l),
             (None, Some(r)) => Some(r),
             (None, None) => None,

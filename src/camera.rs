@@ -81,8 +81,8 @@ impl Cam {
         // so positive angles look up: rotating `rel` by `+θ` around
         // `right` sends it toward `rel × right`, which points up when the
         // camera looks along -z with right = -x.
-        let rotated = rel * cos_a + rel.cross(right) * sin_a
-            + right * (right.dot(rel) * (1.0 - cos_a));
+        let rotated =
+            rel * cos_a + rel.cross(right) * sin_a + right * (right.dot(rel) * (1.0 - cos_a));
 
         // Clamp the elevation: keep the forward direction at least ~1°
         // away from straight up/down so `basis()` stays well-defined.
@@ -119,26 +119,36 @@ impl Cam {
         let (forward, right, up) = self.basis();
 
         // One RNG per thread for performance
-        let pixels: Vec<Vec3> = (0..height).into_par_iter().flat_map(|y| {
-            let mut rng = rand::thread_rng();
-            (0..width).into_iter().map(move |x| {
-                let mut color = VEC_ZERO;
+        let pixels: Vec<Vec3> = (0..height)
+            .into_par_iter()
+            .flat_map(|y| {
+                let mut rng = rand::thread_rng();
+                (0..width)
+                    .into_iter()
+                    .map(move |x| {
+                        let mut color = VEC_ZERO;
 
-                for _ in 0..samples {
-                    let u_jitter = (x as f32 + rng.gen::<f32>()) / width as f32;
-                    let v_jitter = (y as f32 + rng.gen::<f32>()) / height as f32;
+                        for _ in 0..samples {
+                            let u_jitter = (x as f32 + rng.gen::<f32>()) / width as f32;
+                            let v_jitter = (y as f32 + rng.gen::<f32>()) / height as f32;
 
-                    let px = (u_jitter * 2.0 - 1.0) * w;
-                    let py = -(v_jitter * 2.0 - 1.0) * h;
+                            let px = (u_jitter * 2.0 - 1.0) * w;
+                            let py = -(v_jitter * 2.0 - 1.0) * h;
 
-                    let dir = (right * px + up * py + forward).normalize();
+                            let dir = (right * px + up * py + forward).normalize();
 
-                    let ray = crate::geometry::Ray { origin: self.origin, direction: dir };
-                    color = color + crate::bdpt::bdpt_trace(&ray, scene, max_depth, lights, &mut rng);
-                }
-                color / samples as f32
-            }).collect::<Vec<_>>()
-        }).collect();
+                            let ray = crate::geometry::Ray {
+                                origin: self.origin,
+                                direction: dir,
+                            };
+                            color = color
+                                + crate::bdpt::bdpt_trace(&ray, scene, max_depth, lights, &mut rng);
+                        }
+                        color / samples as f32
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         crate::output::PixelBuffer {
             width,
@@ -159,13 +169,21 @@ mod tests {
         // at any other height drifted vertically while moving.
         let mut cam = Cam::new(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, 2.0, -1.0), 60.0);
         cam.move_forward(0.5);
-        assert!((cam.origin.y - 2.0).abs() < 1e-5, "camera sank: {:?}", cam.origin);
+        assert!(
+            (cam.origin.y - 2.0).abs() < 1e-5,
+            "camera sank: {:?}",
+            cam.origin
+        );
         assert!((cam.origin.z + 0.5).abs() < 1e-5);
 
         // Walk-style: pitched up and moving forward must stay level.
         let mut cam = Cam::new(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 2.0, 0.0), 60.0);
         cam.move_forward(1.0);
-        assert!((cam.origin.y - 1.0).abs() < 1e-5, "walk move climbed: {:?}", cam.origin);
+        assert!(
+            (cam.origin.y - 1.0).abs() < 1e-5,
+            "walk move climbed: {:?}",
+            cam.origin
+        );
     }
 
     #[test]
@@ -175,8 +193,15 @@ mod tests {
         // Strafing must keep height and view direction, and move sideways.
         assert!((cam.origin.y - 1.0).abs() < 1e-5);
         let rel = cam.lookat - cam.origin;
-        assert!((rel.z + 1.0).abs() < 1e-5, "view direction changed: {rel:?}");
-        assert!(cam.origin.x.abs() > 0.9, "did not move sideways: {:?}", cam.origin);
+        assert!(
+            (rel.z + 1.0).abs() < 1e-5,
+            "view direction changed: {rel:?}"
+        );
+        assert!(
+            cam.origin.x.abs() > 0.9,
+            "did not move sideways: {:?}",
+            cam.origin
+        );
     }
 
     #[test]

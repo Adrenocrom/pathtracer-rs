@@ -35,7 +35,11 @@ impl Ray {
             t_min = t_min.max(t0.min(t1));
         }
 
-        if t_min <= EPS_NEAR { None } else { Some(t_min) }
+        if t_min <= EPS_NEAR {
+            None
+        } else {
+            Some(t_min)
+        }
     }
 }
 
@@ -85,7 +89,9 @@ impl Intersectable for Sphere {
         let c = oc.dot(oc) - self.radius * self.radius;
         let discriminant = b * b - 4.0 * a * c;
 
-        if discriminant < 0.0 { return None; }
+        if discriminant < 0.0 {
+            return None;
+        }
 
         // Prefer the near root; fall back to the far root so the sphere is
         // still visible when the camera is inside it.
@@ -94,11 +100,18 @@ impl Intersectable for Sphere {
         if t < EPS_NEAR {
             t = (-b + sqrt_d) / (2.0 * a);
         }
-        if t < EPS_NEAR { return None; }
+        if t < EPS_NEAR {
+            return None;
+        }
 
         let p = ray.at(t);
         let normal = (p - self.center).normalize();
-        Some(HitRecord { t, p, normal, mat: self.mat })
+        Some(HitRecord {
+            t,
+            p,
+            normal,
+            mat: self.mat,
+        })
     }
 
     fn bounding_box(&self) -> BBox {
@@ -120,9 +133,13 @@ pub struct Plane {
 impl Intersectable for Plane {
     fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
         let denom = self.normal.dot(ray.direction);
-        if denom.abs() < 1e-6 { return None; }
+        if denom.abs() < 1e-6 {
+            return None;
+        }
         let t = (self.point - ray.origin).dot(self.normal) / denom;
-        if t < EPS_NEAR { return None; }
+        if t < EPS_NEAR {
+            return None;
+        }
 
         Some(HitRecord {
             t,
@@ -163,13 +180,28 @@ pub(crate) fn quad_frame(normal: Vec3, width: f32, height: f32) -> (Vec3, Vec3, 
     const AXIS: f32 = 1.0 - 1e-3;
     if normal.y.abs() > AXIS {
         // Floor/ceiling: width along x, height along z.
-        (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), width * 0.5, height * 0.5)
+        (
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 1.0),
+            width * 0.5,
+            height * 0.5,
+        )
     } else if normal.x.abs() > AXIS {
         // Side walls: width along z, height along y.
-        (Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 1.0, 0.0), width * 0.5, height * 0.5)
+        (
+            Vec3::new(0.0, 0.0, 1.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            width * 0.5,
+            height * 0.5,
+        )
     } else if normal.z.abs() > AXIS {
         // Back/front walls: width along x, height along y.
-        (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), width * 0.5, height * 0.5)
+        (
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            width * 0.5,
+            height * 0.5,
+        )
     } else {
         // Diagonal normal: |normal.x| <= 1 - 1e-3, so the x axis is
         // never parallel to it and works as the helper axis.
@@ -198,16 +230,28 @@ impl Quad {
     pub fn new(center: Vec3, normal: Vec3, width: f32, height: f32, mat: Material) -> Self {
         let normal = normal.normalize();
         let (tangent, bitangent, half_w, half_h) = quad_frame(normal, width, height);
-        Self { center, normal, tangent, bitangent, half_w, half_h, mat }
+        Self {
+            center,
+            normal,
+            tangent,
+            bitangent,
+            half_w,
+            half_h,
+            mat,
+        }
     }
 }
 
 impl Intersectable for Quad {
     fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
         let denom = self.normal.dot(ray.direction);
-        if denom.abs() < 1e-6 { return None; }
+        if denom.abs() < 1e-6 {
+            return None;
+        }
         let t = (self.center - ray.origin).dot(self.normal) / denom;
-        if t < EPS_NEAR { return None; }
+        if t < EPS_NEAR {
+            return None;
+        }
 
         let p = ray.at(t);
         let local = p - self.center;
@@ -216,7 +260,12 @@ impl Intersectable for Quad {
         {
             return None;
         }
-        Some(HitRecord { t, p, normal: self.normal, mat: self.mat })
+        Some(HitRecord {
+            t,
+            p,
+            normal: self.normal,
+            mat: self.mat,
+        })
     }
 
     fn bounding_box(&self) -> BBox {
@@ -226,7 +275,10 @@ impl Intersectable for Quad {
                 let corner = self.center
                     + self.tangent * (sx * self.half_w)
                     + self.bitangent * (sy * self.half_h);
-                bbox = bbox.surround(BBox { min: corner, max: corner });
+                bbox = bbox.surround(BBox {
+                    min: corner,
+                    max: corner,
+                });
             }
         }
         bbox
@@ -275,7 +327,9 @@ impl Intersectable for Cube {
             let inv_d = 1.0 / dirs[i];
             let mut t0 = (mins[i] - origins[i]) * inv_d;
             let mut t1 = (maxs[i] - origins[i]) * inv_d;
-            if t0 > t1 { std::mem::swap(&mut t0, &mut t1); }
+            if t0 > t1 {
+                std::mem::swap(&mut t0, &mut t1);
+            }
             t_min = t_min.max(t0);
             t_max = t_max.min(t1);
         }
@@ -284,7 +338,9 @@ impl Intersectable for Cube {
             return None;
         }
         let t = if t_min < EPS_NEAR { t_max } else { t_min };
-        if t < EPS_NEAR { return None; }
+        if t < EPS_NEAR {
+            return None;
+        }
 
         let p = ray.at(t);
 
@@ -305,11 +361,19 @@ impl Intersectable for Cube {
             .map(|(_, n)| *n)
             .unwrap_or(Vec3::new(0.0, 1.0, 0.0));
 
-        Some(HitRecord { t, p, normal, mat: self.mat })
+        Some(HitRecord {
+            t,
+            p,
+            normal,
+            mat: self.mat,
+        })
     }
 
     fn bounding_box(&self) -> BBox {
-        BBox { min: self.min, max: self.max }
+        BBox {
+            min: self.min,
+            max: self.max,
+        }
     }
 }
 
@@ -318,8 +382,18 @@ impl Intersectable for Cube {
 /// object in the scene so that BDPT can connect paths to real geometry.
 #[derive(Clone)]
 pub enum LightShape {
-    Sphere { center: Vec3, radius: f32 },
-    Quad { center: Vec3, normal: Vec3, tangent: Vec3, bitangent: Vec3, half_w: f32, half_h: f32 },
+    Sphere {
+        center: Vec3,
+        radius: f32,
+    },
+    Quad {
+        center: Vec3,
+        normal: Vec3,
+        tangent: Vec3,
+        bitangent: Vec3,
+        half_w: f32,
+        half_h: f32,
+    },
 }
 
 #[derive(Clone)]
@@ -371,7 +445,14 @@ impl AreaLight {
                 let dir = Vec3::new(r * phi.cos(), r * phi.sin(), z);
                 (*center + dir * *radius, dir)
             }
-            LightShape::Quad { center, normal, tangent, bitangent, half_w, half_h } => {
+            LightShape::Quad {
+                center,
+                normal,
+                tangent,
+                bitangent,
+                half_w,
+                half_h,
+            } => {
                 let u = rng.gen::<f32>() * 2.0 - 1.0;
                 let v = rng.gen::<f32>() * 2.0 - 1.0;
                 let p = *center + *tangent * (u * half_w) + *bitangent * (v * half_h);
@@ -386,7 +467,14 @@ impl AreaLight {
             LightShape::Sphere { center, radius } => {
                 ((p - *center).length() - *radius).abs() < 1e-3
             }
-            LightShape::Quad { center, normal, tangent, bitangent, half_w, half_h } => {
+            LightShape::Quad {
+                center,
+                normal,
+                tangent,
+                bitangent,
+                half_w,
+                half_h,
+            } => {
                 let local = p - *center;
                 local.dot(*normal).abs() < 1e-3
                     && local.dot(*tangent).abs() <= half_w + 1e-3
@@ -402,11 +490,18 @@ mod tests {
     use rand::SeedableRng;
 
     fn diffuse(albedo: Vec3) -> Material {
-        Material { albedo, emission: Vec3::new(0.0, 0.0, 0.0), mat_type: MaterialType::Diffuse }
+        Material {
+            albedo,
+            emission: Vec3::new(0.0, 0.0, 0.0),
+            mat_type: MaterialType::Diffuse,
+        }
     }
 
     fn ray(origin: Vec3, direction: Vec3) -> Ray {
-        Ray { origin, direction: direction.normalize() }
+        Ray {
+            origin,
+            direction: direction.normalize(),
+        }
     }
 
     #[test]
@@ -428,7 +523,11 @@ mod tests {
 
     #[test]
     fn cube_normals_face_outward_on_all_sides() {
-        let c = Cube::new(Vec3::new(0.0, 0.0, 0.0), 1.0, diffuse(Vec3::new(1.0, 1.0, 1.0)));
+        let c = Cube::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            1.0,
+            diffuse(Vec3::new(1.0, 1.0, 1.0)),
+        );
         let top = c
             .intersect(&ray(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.0, -1.0, 0.0)))
             .unwrap();

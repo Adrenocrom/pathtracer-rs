@@ -67,7 +67,14 @@ impl CpuRenderer {
 
 impl Renderer for CpuRenderer {
     fn render_frame(&mut self, cam: &Cam, max_depth: usize) {
-        let frame = cam.render(&*self.scene, self.width, self.height, self.samples, max_depth, &self.lights);
+        let frame = cam.render(
+            &*self.scene,
+            self.width,
+            self.height,
+            self.samples,
+            max_depth,
+            &self.lights,
+        );
         match &mut self.accum {
             Some(a) if a.len() == frame.pixels.len() => {
                 accumulate(a, &frame.pixels, self.frames);

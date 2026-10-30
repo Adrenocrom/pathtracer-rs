@@ -9,9 +9,7 @@
 
 use crate::camera::Cam;
 use crate::gpu::GpuRenderer;
-use crate::renderer::{
-    MAX_ACCUMULATED_FRAMES, MAX_DEPTH_FHD, SAMPLES_FHD, FHD_HEIGHT, FHD_WIDTH,
-};
+use crate::renderer::{FHD_HEIGHT, FHD_WIDTH, MAX_ACCUMULATED_FRAMES, MAX_DEPTH_FHD, SAMPLES_FHD};
 use crate::scene::SceneData;
 use std::sync::Arc;
 use std::time::Instant;
@@ -75,7 +73,9 @@ struct Keys {
 
 impl Keys {
     fn new() -> Self {
-        Self { pressed: [false; Key::COUNT as usize] }
+        Self {
+            pressed: [false; Key::COUNT as usize],
+        }
     }
 
     fn set(&mut self, key: Key, state: ElementState) {
@@ -230,7 +230,11 @@ impl Display {
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("overlay"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -253,7 +257,11 @@ impl Display {
                     bytes_per_row: Some(width * 4),
                     rows_per_image: Some(height),
                 },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
             );
         }
         (tex, view)
@@ -270,9 +278,18 @@ impl Display {
             label: Some("display-bind-group"),
             layout: bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: renderer.accum_buf().as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(overlay_view) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: renderer.accum_buf().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(overlay_view),
+                },
             ],
         })
     }
@@ -280,7 +297,13 @@ impl Display {
     /// Rebind the accumulation buffer after a resize.
     fn rebind(&mut self, device: &wgpu::Device, renderer: &GpuRenderer) {
         let bgl = self.pipeline.get_bind_group_layout(0);
-        self.bind_group = Self::bind_group(device, &bgl, &self.uniform_buf, renderer, &self.overlay_view);
+        self.bind_group = Self::bind_group(
+            device,
+            &bgl,
+            &self.uniform_buf,
+            renderer,
+            &self.overlay_view,
+        );
     }
 
     /// Upload new overlay text. `lines` are drawn white-on-transparent; the
@@ -299,8 +322,13 @@ impl Display {
         self.overlay_tex = tex;
         self.overlay_view = view;
         let bgl = self.pipeline.get_bind_group_layout(0);
-        self.bind_group =
-            Self::bind_group(device, &bgl, &self.uniform_buf, renderer, &self.overlay_view);
+        self.bind_group = Self::bind_group(
+            device,
+            &bgl,
+            &self.uniform_buf,
+            renderer,
+            &self.overlay_view,
+        );
     }
 
     fn write_uniforms(
@@ -394,10 +422,18 @@ impl App {
     /// (Re)configure the surface for the current window size and rebuild
     /// the resolution-dependent GPU resources.
     fn configure_surface(&mut self) {
-        let Some(window) = self.window.as_ref() else { return };
-        let Some(surface) = self.surface.as_ref() else { return };
-        let Some(renderer) = self.renderer.as_ref() else { return };
-        let Some(config) = self.config.as_mut() else { return };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let Some(surface) = self.surface.as_ref() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let Some(config) = self.config.as_mut() else {
+            return;
+        };
 
         let size = window.inner_size();
         let width = size.width.max(1);
@@ -432,8 +468,12 @@ impl App {
     /// while `showing_help`, otherwise nothing (the status readout lives
     /// in the window title, which needs no texture).
     fn update_overlay(&mut self) {
-        let Some(renderer) = self.renderer.as_ref() else { return };
-        let Some(display) = self.display.as_mut() else { return };
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let Some(display) = self.display.as_mut() else {
+            return;
+        };
         if self.showing_help {
             display.set_overlay(
                 renderer.device(),
@@ -458,16 +498,30 @@ impl App {
             display.set_overlay(renderer.device(), renderer.queue(), renderer, &[]);
         }
         let (w, h) = renderer.size();
-        display.write_uniforms(renderer.queue(), w, h, self.filter_enabled, self.showing_help);
+        display.write_uniforms(
+            renderer.queue(),
+            w,
+            h,
+            self.filter_enabled,
+            self.showing_help,
+        );
     }
 
     /// One iteration: trace one sample per pixel (if still accumulating),
     /// then present the display pass.
     fn render(&mut self) {
-        let Some(window) = self.window.as_ref() else { return };
-        let Some(surface) = self.surface.as_ref() else { return };
-        let Some(renderer) = self.renderer.as_mut() else { return };
-        let Some(display) = self.display.as_ref() else { return };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let Some(surface) = self.surface.as_ref() else {
+            return;
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(display) = self.display.as_ref() else {
+            return;
+        };
 
         // Delta time since the previous frame, so movement speed is
         // independent of the display refresh rate.
@@ -563,7 +617,10 @@ impl App {
         {
             let spp = renderer.samples_accumulated();
             let shot = match &self.screenshot {
-                Some(s) => format!(" | exporting {}%", (s.batches * SPP_BATCH * 100 / SAMPLES_FHD).min(100)),
+                Some(s) => format!(
+                    " | exporting {}%",
+                    (s.batches * SPP_BATCH * 100 / SAMPLES_FHD).min(100)
+                ),
                 None => String::new(),
             };
             window.set_title(&format!(
@@ -573,7 +630,8 @@ impl App {
         }
 
         let frame = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.configure_surface();
                 return;
@@ -581,11 +639,16 @@ impl App {
             // Timeout/Occluded: skip this frame and try again later.
             _ => return,
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = renderer.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("display-encoder"),
-        });
+        let mut encoder =
+            renderer
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("display-encoder"),
+                });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("display-pass"),
@@ -644,8 +707,9 @@ impl ApplicationHandler for App {
         let info = adapter.get_info();
         let adapter_info = format!("{} ({})", info.name, info.backend);
 
-        let (device, queue) = pollster::block_on(adapter.request_device(&crate::gpu::device_descriptor()))
-            .expect("failed to create GPU device");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&crate::gpu::device_descriptor()))
+                .expect("failed to create GPU device");
 
         let size = window.inner_size();
         let renderer = GpuRenderer::from_parts(
@@ -665,7 +729,12 @@ impl ApplicationHandler for App {
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(renderer.device(), &config);
 
-        let display = Display::new(renderer.device(), renderer.queue(), &renderer, config.format);
+        let display = Display::new(
+            renderer.device(),
+            renderer.queue(),
+            &renderer,
+            config.format,
+        );
         display.write_uniforms(
             renderer.queue(),
             size.width.max(1),
@@ -683,7 +752,12 @@ impl ApplicationHandler for App {
         self.window.as_ref().unwrap().request_redraw();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::Resized(_) => self.configure_surface(),
@@ -788,7 +862,9 @@ impl ApplicationHandler for App {
 pub fn run_window(scene: SceneData, cam: Cam) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|e| format!("failed to create event loop: {e}"))?;
     let mut app = App::new(scene, cam);
-    event_loop.run_app(&mut app).map_err(|e| format!("event loop error: {e}"))
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| format!("event loop error: {e}"))
 }
 
 #[cfg(test)]

@@ -28,7 +28,11 @@ const PI_F64: f64 = std::f64::consts::PI;
 pub const MAX_PATH_VERTICES: usize = 8;
 
 /// Color returned when the primary ray escapes the scene.
-pub const BACKGROUND: Vec3 = Vec3 { x: 0.02, y: 0.02, z: 0.05 };
+pub const BACKGROUND: Vec3 = Vec3 {
+    x: 0.02,
+    y: 0.02,
+    z: 0.05,
+};
 
 /// Russian roulette: minimum survival probability. Bounds the variance the
 /// 1/q compensation can add (a surviving path never gains more than a 20x
@@ -128,7 +132,14 @@ fn visible(from: Vec3, from_normal: Vec3, to: Vec3, scene: &dyn Intersectable) -
 ///   p[k]  = P * Qe(k)                                                        (eye subpath hits light)
 /// All strategies share the factor P, so the weights depend only on the
 /// ratios r[s'] = p[s'] / P.
-fn mis_weight(edges: &[f64], qe: &[f64], ql: &[f64], k: usize, inv_light_pdf: f64, s: usize) -> f32 {
+fn mis_weight(
+    edges: &[f64],
+    qe: &[f64],
+    ql: &[f64],
+    k: usize,
+    inv_light_pdf: f64,
+    s: usize,
+) -> f32 {
     debug_assert!(edges.len() + 1 == k);
     debug_assert!(qe.len() > k && ql.len() + 1 >= k);
 
@@ -333,11 +344,11 @@ pub fn bdpt_trace(
         // last light vertex (j = max_depth - 1) could never be connected.
         // Building one vertex fewer avoids a wasted intersection.
         for _ in 1..max_depth.saturating_sub(1) {
-            let Some(hit) = scene.intersect(&cur) else { break };
+            let Some(hit) = scene.intersect(&cur) else {
+                break;
+            };
             // Pure emitters do not reflect; back faces cannot scatter.
-            if hit.mat.mat_type == MaterialType::Emissive
-                || hit.normal.dot(cur.direction) > 0.0
-            {
+            if hit.mat.mat_type == MaterialType::Emissive || hit.normal.dot(cur.direction) > 0.0 {
                 break;
             }
             let prev = light_path.last().unwrap();
@@ -386,7 +397,16 @@ pub fn bdpt_trace(
                 // (emission * n * A, the inverse light-sampling pdf).
                 let mut qe = [0.0f64; MAX_PATH_VERTICES + 1];
                 let mut ql = [0.0f64; MAX_PATH_VERTICES + 1];
-                rr_prefix_products(&eye, &light_path, k, k, 0, light.emission * inv_pdf as f32, &mut qe, &mut ql);
+                rr_prefix_products(
+                    &eye,
+                    &light_path,
+                    k,
+                    k,
+                    0,
+                    light.emission * inv_pdf as f32,
+                    &mut qe,
+                    &mut ql,
+                );
                 mis_weight(&edges[..k - 1], &qe, &ql, k, inv_pdf, k)
             }
             None => 1.0,
@@ -405,7 +425,12 @@ pub fn bdpt_trace(
             if k > max_depth {
                 break;
             }
-            let g_conn = g_term(eye[i].p, eye[i].normal, light_path[j].p, light_path[j].normal);
+            let g_conn = g_term(
+                eye[i].p,
+                eye[i].normal,
+                light_path[j].p,
+                light_path[j].normal,
+            );
             if g_conn <= 0.0 {
                 continue;
             }
@@ -437,7 +462,16 @@ pub fn bdpt_trace(
 
             let mut qe = [0.0f64; MAX_PATH_VERTICES + 1];
             let mut ql = [0.0f64; MAX_PATH_VERTICES + 1];
-            rr_prefix_products(&eye, &light_path, k, i + 1, j + 1, light_path[0].throughput, &mut qe, &mut ql);
+            rr_prefix_products(
+                &eye,
+                &light_path,
+                k,
+                i + 1,
+                j + 1,
+                light_path[0].throughput,
+                &mut qe,
+                &mut ql,
+            );
             let w = mis_weight(&edges[..k - 1], &qe, &ql, k, inv_light_pdf, i + 1);
             total = total + contrib * w;
         }
@@ -454,15 +488,26 @@ mod tests {
     use rand::SeedableRng;
 
     fn diffuse(albedo: Vec3) -> Material {
-        Material { albedo, emission: VEC_ZERO, mat_type: MaterialType::Diffuse }
+        Material {
+            albedo,
+            emission: VEC_ZERO,
+            mat_type: MaterialType::Diffuse,
+        }
     }
 
     fn emissive(emission: Vec3) -> Material {
-        Material { albedo: VEC_ZERO, emission, mat_type: MaterialType::Emissive }
+        Material {
+            albedo: VEC_ZERO,
+            emission,
+            mat_type: MaterialType::Emissive,
+        }
     }
 
     fn ray(origin: Vec3, direction: Vec3) -> Ray {
-        Ray { origin, direction: direction.normalize() }
+        Ray {
+            origin,
+            direction: direction.normalize(),
+        }
     }
 
     /// A tiny room: floor at y=0, one 1x1 quad light at y=3 facing down.
@@ -550,9 +595,14 @@ mod tests {
         let mut qe = [0.0f64; MAX_PATH_VERTICES + 1];
         let mut ql = [0.0f64; MAX_PATH_VERTICES + 1];
         rr_prefix_products(
-            &eye, &light_path, 5, 3, 2,
+            &eye,
+            &light_path,
+            5,
+            3,
+            2,
             Vec3::new(0.1, 0.1, 0.1),
-            &mut qe, &mut ql,
+            &mut qe,
+            &mut ql,
         );
 
         // Eye sweep: ext 1, 2 unconditional; ext 3: beta = 0.5^3 = 0.125;
@@ -600,7 +650,9 @@ mod tests {
         let mut throughput = Vec3::new(1.0, 1.0, 1.0);
         let mut cur = ray.clone();
         for _ in 0..max_depth {
-            let Some(hit) = scene.intersect(&cur) else { break };
+            let Some(hit) = scene.intersect(&cur) else {
+                break;
+            };
             if hit.normal.dot(cur.direction) > 0.0 {
                 break;
             }
@@ -735,7 +787,10 @@ mod tests {
         mean_lit = mean_lit * (1.0 / 4096.0);
 
         // The shadowed point receives only weak indirect light...
-        assert!(mean_shadowed.x < 0.05, "shadowed point too bright: {mean_shadowed:?}");
+        assert!(
+            mean_shadowed.x < 0.05,
+            "shadowed point too bright: {mean_shadowed:?}"
+        );
         // ...while the same point without the occluder is much brighter.
         assert!(
             mean_lit.x > mean_shadowed.x * 3.0,
@@ -745,7 +800,11 @@ mod tests {
 
     #[test]
     fn visibility_detects_occlusion() {
-        let cube = Cube::new(Vec3::new(0.0, 0.5, 0.0), 1.0, diffuse(Vec3::new(1.0, 1.0, 1.0)));
+        let cube = Cube::new(
+            Vec3::new(0.0, 0.5, 0.0),
+            1.0,
+            diffuse(Vec3::new(1.0, 1.0, 1.0)),
+        );
         let a = Vec3::new(-2.0, 0.5, 0.0);
         let b = Vec3::new(2.0, 0.5, 0.0);
         // Segment passes straight through the cube.

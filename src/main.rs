@@ -54,20 +54,56 @@ fn build_scene() -> SceneData {
     let mid_y = room_height * 0.5;
 
     // Floor and ceiling (width spans x, height spans z)
-    scene.add_wall(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), floor_w, floor_w, white);
-    scene.add_wall(Vec3::new(0.0, room_height, 0.0), Vec3::new(0.0, -1.0, 0.0), floor_w, floor_w, white);
+    scene.add_wall(
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        floor_w,
+        floor_w,
+        white,
+    );
+    scene.add_wall(
+        Vec3::new(0.0, room_height, 0.0),
+        Vec3::new(0.0, -1.0, 0.0),
+        floor_w,
+        floor_w,
+        white,
+    );
 
     // Back wall (width spans x, height spans y)
-    scene.add_wall(Vec3::new(0.0, mid_y, -room_size), Vec3::new(0.0, 0.0, 1.0), floor_w, wall_h, white);
+    scene.add_wall(
+        Vec3::new(0.0, mid_y, -room_size),
+        Vec3::new(0.0, 0.0, 1.0),
+        floor_w,
+        wall_h,
+        white,
+    );
 
     // Left wall (red) (width spans z, height spans y)
-    scene.add_wall(Vec3::new(-room_size, mid_y, 0.0), Vec3::new(1.0, 0.0, 0.0), floor_w, wall_h, red);
+    scene.add_wall(
+        Vec3::new(-room_size, mid_y, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        floor_w,
+        wall_h,
+        red,
+    );
 
     // Right wall (green)
-    scene.add_wall(Vec3::new(room_size, mid_y, 0.0), Vec3::new(-1.0, 0.0, 0.0), floor_w, wall_h, green);
+    scene.add_wall(
+        Vec3::new(room_size, mid_y, 0.0),
+        Vec3::new(-1.0, 0.0, 0.0),
+        floor_w,
+        wall_h,
+        green,
+    );
 
     // Front wall
-    scene.add_wall(Vec3::new(0.0, mid_y, room_size), Vec3::new(0.0, 0.0, -1.0), floor_w, wall_h, white);
+    scene.add_wall(
+        Vec3::new(0.0, mid_y, room_size),
+        Vec3::new(0.0, 0.0, -1.0),
+        floor_w,
+        wall_h,
+        white,
+    );
 
     // Central spheres
     scene.add_sphere(Vec3::new(-0.9, 0.4, -0.9), 0.4, white);
@@ -87,7 +123,9 @@ fn build_scene() -> SceneData {
     // Hanging light (small emissive sphere). `add_light` registers the
     // emitter as geometry too, so both backends can hit it.
     scene.add_light(LightData::from_sphere(
-        Vec3::new(0.65, 0.1, 1.5), 0.2, emission,
+        Vec3::new(0.65, 0.1, 1.5),
+        0.2,
+        emission,
     ));
 
     // Ceiling light panel (one-sided: emits along its normal, i.e.
@@ -150,7 +188,10 @@ mod tests {
             Vec3::new(0.0, 0.0, 1.0),
             Vec3::new(0.0, 0.0, -1.0),
         ] {
-            let ray = crate::geometry::Ray { origin: center, direction: dir };
+            let ray = crate::geometry::Ray {
+                origin: center,
+                direction: dir,
+            };
             assert!(
                 cpu_scene.intersect(&ray).is_some(),
                 "ray {dir:?} escaped the room"
@@ -163,7 +204,10 @@ mod tests {
             origin: Vec3::new(2.0, 1.0, 0.0),
             direction: Vec3::new(0.0, 0.0, -1.0),
         };
-        assert!(cpu_scene.intersect(&beside_back).is_some(), "back wall too narrow");
+        assert!(
+            cpu_scene.intersect(&beside_back).is_some(),
+            "back wall too narrow"
+        );
 
         // Through the old half-height side-wall gap: y ≈ 1.9 at the wall
         // was above the old y ∈ [-1, 1] coverage.
@@ -171,7 +215,10 @@ mod tests {
             origin: Vec3::new(0.0, 1.8, 0.0),
             direction: Vec3::new(1.0, 0.05, 0.0).normalize(),
         };
-        assert!(cpu_scene.intersect(&above_side).is_some(), "side wall too short");
+        assert!(
+            cpu_scene.intersect(&above_side).is_some(),
+            "side wall too short"
+        );
     }
 
     #[test]
@@ -206,7 +253,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match window::run_window(scene, cam) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                eprintln!("Windowed frontend unavailable ({}), falling back to terminal UI", e);
+                eprintln!(
+                    "Windowed frontend unavailable ({}), falling back to terminal UI",
+                    e
+                );
             }
         }
     }
@@ -232,17 +282,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cheap `Arc` handles are kept for the FHD export; the boxed renderer
     // itself drives the loop.
     let mut shared_device: Option<(wgpu::Device, wgpu::Queue)> = None;
-    let mut renderer: Box<dyn Renderer> = match gpu::GpuRenderer::new(&scene, width as u32, height as u32) {
-        Ok(gpu) => {
-            eprintln!("GPU backend: {}", gpu.adapter_info());
-            shared_device = Some((gpu.device_clone(), gpu.queue_clone()));
-            Box::new(gpu)
-        }
-        Err(e) => {
-            eprintln!("GPU unavailable ({}), falling back to CPU", e);
-            Box::new(renderer::CpuRenderer::new(&scene, width, height, SAMPLES_PREVIEW))
-        }
-    };
+    let mut renderer: Box<dyn Renderer> =
+        match gpu::GpuRenderer::new(&scene, width as u32, height as u32) {
+            Ok(gpu) => {
+                eprintln!("GPU backend: {}", gpu.adapter_info());
+                shared_device = Some((gpu.device_clone(), gpu.queue_clone()));
+                Box::new(gpu)
+            }
+            Err(e) => {
+                eprintln!("GPU unavailable ({}), falling back to CPU", e);
+                Box::new(renderer::CpuRenderer::new(
+                    &scene,
+                    width,
+                    height,
+                    SAMPLES_PREVIEW,
+                ))
+            }
+        };
     eprintln!("Renderer: {}", renderer.name());
 
     let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
@@ -288,15 +344,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if key.kind == crossterm::event::KeyEventKind::Press =>
                 {
                     match key.code {
-                    crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
-                    crossterm::event::KeyCode::Char('f') => {
-                        filter_enabled = !filter_enabled;
-                        needs_render = true;
-                    },
-                    crossterm::event::KeyCode::Char('h') => {
-                        // Show help overlay; any key dismisses it.
-                        showing_help = true;
-                        let help = "\x1b[2J\x1b[H\
+                        crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
+                            break
+                        }
+                        crossterm::event::KeyCode::Char('f') => {
+                            filter_enabled = !filter_enabled;
+                            needs_render = true;
+                        }
+                        crossterm::event::KeyCode::Char('h') => {
+                            // Show help overlay; any key dismisses it.
+                            showing_help = true;
+                            let help = "\x1b[2J\x1b[H\
                             \x1b[1;36m╔══════════════════════════════════════╗\x1b[0m\n\
                             \x1b[1;36m║         Keyboard Controls             ║\x1b[0m\n\
                             \x1b[1;36m╠══════════════════════════════════════╣\x1b[0m\n\
@@ -308,67 +366,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             \x1b[1;37m  Q/Esc\x1b[0m - Quit                        \n\
                             \x1b[1;36m╚══════════════════════════════════════╝\x1b[0m\n\
                             \x1b[0m\nPress any key to return...\x1b[0m";
-                        write!(stdout, "{}", help).unwrap();
-                        stdout.flush()?;
-                    },
-                    crossterm::event::KeyCode::Char('p') => {
-                        write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
-                        stdout.flush()?;
-
-                        // Render the FHD image with a dedicated renderer at
-                        // 1920x1080, sharing the preview renderer's device
-                        // (no new adapter, no scene re-upload). On the GPU
-                        // this is a single dispatch per sample batch; on
-                        // the CPU it renders in bands with a progress bar.
-                        let fhd_buffer =
-                            render_fhd(&scene, &cam, filter_enabled, shared_device.clone());
-
-                        match fhd_buffer.save_as_png("screenshot.png") {
-                            Ok(()) => write!(stdout, "Saved to screenshot.png!").unwrap(),
-                            Err(e) => write!(stdout, "Failed to save: {}", e).unwrap(),
+                            write!(stdout, "{}", help).unwrap();
+                            stdout.flush()?;
                         }
-                        stdout.flush()?;
-                        std::thread::sleep(std::time::Duration::from_secs(2));
-                        // Redraw the preview over the progress-bar text.
-                        needs_render = true;
-                    },
-                    crossterm::event::KeyCode::Char('w') => {
-                        cam.move_forward(0.1);
-                        renderer.reset_accumulation();
-                        frames_accumulated = 0;
-                        needs_render = true;
-                    },
-                    crossterm::event::KeyCode::Char('s') => {
-                        cam.move_forward(-0.1);
-                        renderer.reset_accumulation();
-                        frames_accumulated = 0;
-                        needs_render = true;
-                    },
-                    crossterm::event::KeyCode::Char('a') => {
-                        cam.rotate(0.05);
-                        renderer.reset_accumulation();
-                        frames_accumulated = 0;
-                        needs_render = true;
-                    },
-                    crossterm::event::KeyCode::Char('d') => {
-                        cam.rotate(-0.05);
-                        renderer.reset_accumulation();
-                        frames_accumulated = 0;
-                        needs_render = true;
-                    },
-                    _ => {}
-                }},
+                        crossterm::event::KeyCode::Char('p') => {
+                            write!(stdout, "\r\nRendering FHD screenshot... ").unwrap();
+                            stdout.flush()?;
+
+                            // Render the FHD image with a dedicated renderer at
+                            // 1920x1080, sharing the preview renderer's device
+                            // (no new adapter, no scene re-upload). On the GPU
+                            // this is a single dispatch per sample batch; on
+                            // the CPU it renders in bands with a progress bar.
+                            let fhd_buffer =
+                                render_fhd(&scene, &cam, filter_enabled, shared_device.clone());
+
+                            match fhd_buffer.save_as_png("screenshot.png") {
+                                Ok(()) => write!(stdout, "Saved to screenshot.png!").unwrap(),
+                                Err(e) => write!(stdout, "Failed to save: {}", e).unwrap(),
+                            }
+                            stdout.flush()?;
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            // Redraw the preview over the progress-bar text.
+                            needs_render = true;
+                        }
+                        crossterm::event::KeyCode::Char('w') => {
+                            cam.move_forward(0.1);
+                            renderer.reset_accumulation();
+                            frames_accumulated = 0;
+                            needs_render = true;
+                        }
+                        crossterm::event::KeyCode::Char('s') => {
+                            cam.move_forward(-0.1);
+                            renderer.reset_accumulation();
+                            frames_accumulated = 0;
+                            needs_render = true;
+                        }
+                        crossterm::event::KeyCode::Char('a') => {
+                            cam.rotate(0.05);
+                            renderer.reset_accumulation();
+                            frames_accumulated = 0;
+                            needs_render = true;
+                        }
+                        crossterm::event::KeyCode::Char('d') => {
+                            cam.rotate(-0.05);
+                            renderer.reset_accumulation();
+                            frames_accumulated = 0;
+                            needs_render = true;
+                        }
+                        _ => {}
+                    }
+                }
                 crossterm::event::Event::Resize(w, h) => {
                     // Terminal resized: clear stale characters from the
                     // previous (possibly larger) frame and rebuild buffers.
-                    crossterm::execute!(stdout, crossterm::terminal::Clear(crossterm::terminal::ClearType::All))?;
+                    crossterm::execute!(
+                        stdout,
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                    )?;
                     // Reuse the existing renderer (device, pipeline, scene
                     // buffers) at the new resolution instead of creating a
                     // whole new GPU renderer.
                     renderer.resize(w as u32, h as u32 * 2);
                     frames_accumulated = 0;
                     needs_render = true;
-                },
+                }
                 _ => {}
             }
         }
@@ -451,8 +513,18 @@ fn render_fhd(
                             let px = (u_jitter * 2.0 - 1.0) * w;
                             let py = -(v_jitter * 2.0 - 1.0) * h;
                             let dir = (right * px + up * py + forward).normalize();
-                            let ray = crate::geometry::Ray { origin: cam.origin, direction: dir };
-                            color = color + crate::bdpt::bdpt_trace(&ray, &*cpu_scene, MAX_DEPTH_FHD as usize, &lights, &mut rng);
+                            let ray = crate::geometry::Ray {
+                                origin: cam.origin,
+                                direction: dir,
+                            };
+                            color = color
+                                + crate::bdpt::bdpt_trace(
+                                    &ray,
+                                    &*cpu_scene,
+                                    MAX_DEPTH_FHD as usize,
+                                    &lights,
+                                    &mut rng,
+                                );
                         }
                         color / SAMPLES_FHD as f32
                     })
@@ -466,7 +538,10 @@ fn render_fhd(
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
 
-    println!("{}", PixelBuffer::render_progress(total_pixels, total_pixels));
+    println!(
+        "{}",
+        PixelBuffer::render_progress(total_pixels, total_pixels)
+    );
 
     let mut buffer = PixelBuffer {
         width: fhd_w as usize,

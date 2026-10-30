@@ -5,7 +5,9 @@
 //! GPU backend uploads the same data as flat POD buffers. Keeping one source
 //! of truth for the scene guarantees both backends trace identical geometry.
 
-use crate::geometry::{AreaLight, Cube, Intersectable, Material, MaterialType, Plane, Quad, Sphere};
+use crate::geometry::{
+    AreaLight, Cube, Intersectable, Material, MaterialType, Plane, Quad, Sphere,
+};
 use crate::math::Vec3;
 
 /// Diffuse surface. For emissive materials the albedo is ignored: emitters
@@ -19,11 +21,19 @@ pub struct MaterialData {
 
 impl MaterialData {
     pub fn diffuse(albedo: Vec3) -> Self {
-        Self { albedo, emission: Vec3::new(0.0, 0.0, 0.0), mat_type: MaterialType::Diffuse }
+        Self {
+            albedo,
+            emission: Vec3::new(0.0, 0.0, 0.0),
+            mat_type: MaterialType::Diffuse,
+        }
     }
 
     pub fn emissive(emission: Vec3) -> Self {
-        Self { albedo: Vec3::new(0.0, 0.0, 0.0), emission, mat_type: MaterialType::Emissive }
+        Self {
+            albedo: Vec3::new(0.0, 0.0, 0.0),
+            emission,
+            mat_type: MaterialType::Emissive,
+        }
     }
 }
 
@@ -150,14 +160,25 @@ impl SceneData {
     }
 
     pub fn add_sphere(&mut self, center: Vec3, radius: f32, mat: MaterialData) {
-        self.spheres.push(SphereData { center, radius, mat });
+        self.spheres.push(SphereData {
+            center,
+            radius,
+            mat,
+        });
     }
 
     /// Add a finite rectangle (e.g. a light panel). Not used by the demo
     /// scene, but part of the scene API — the original code had a
     /// commented-out ceiling quad light.
     #[allow(dead_code)]
-    pub fn add_quad(&mut self, center: Vec3, normal: Vec3, width: f32, height: f32, mat: MaterialData) {
+    pub fn add_quad(
+        &mut self,
+        center: Vec3,
+        normal: Vec3,
+        width: f32,
+        height: f32,
+        mat: MaterialData,
+    ) {
         let normal = normal.normalize();
         let (tangent, bitangent, half_w, half_h) =
             crate::geometry::quad_frame(normal, width, height);
@@ -241,7 +262,11 @@ impl SceneData {
     pub fn add_light(&mut self, light: LightData) {
         let mat = MaterialData::emissive(light.emission);
         if light.shape == 0 {
-            self.spheres.push(SphereData { center: light.center, radius: light.radius, mat });
+            self.spheres.push(SphereData {
+                center: light.center,
+                radius: light.radius,
+                mat,
+            });
         } else {
             self.quads.push(QuadData {
                 center: light.center,
@@ -267,7 +292,11 @@ impl SceneData {
             objects.push(Box::new(Sphere {
                 center: s.center,
                 radius: s.radius,
-                mat: Material { albedo: s.mat.albedo, emission: s.mat.emission, mat_type: s.mat.mat_type },
+                mat: Material {
+                    albedo: s.mat.albedo,
+                    emission: s.mat.emission,
+                    mat_type: s.mat.mat_type,
+                },
             }));
         }
         for q in &self.quads {
@@ -278,21 +307,33 @@ impl SceneData {
                 bitangent: q.bitangent,
                 half_w: q.half_w,
                 half_h: q.half_h,
-                mat: Material { albedo: q.mat.albedo, emission: q.mat.emission, mat_type: q.mat.mat_type },
+                mat: Material {
+                    albedo: q.mat.albedo,
+                    emission: q.mat.emission,
+                    mat_type: q.mat.mat_type,
+                },
             }));
         }
         for c in &self.cubes {
             objects.push(Box::new(Cube {
                 min: c.min,
                 max: c.max,
-                mat: Material { albedo: c.mat.albedo, emission: c.mat.emission, mat_type: c.mat.mat_type },
+                mat: Material {
+                    albedo: c.mat.albedo,
+                    emission: c.mat.emission,
+                    mat_type: c.mat.mat_type,
+                },
             }));
         }
         for p in &self.planes {
             objects.push(Box::new(Plane {
                 point: p.point,
                 normal: p.normal,
-                mat: Material { albedo: p.mat.albedo, emission: p.mat.emission, mat_type: p.mat.mat_type },
+                mat: Material {
+                    albedo: p.mat.albedo,
+                    emission: p.mat.emission,
+                    mat_type: p.mat.mat_type,
+                },
             }));
         }
         // Emitter geometry is already part of `spheres`/`quads` —
@@ -345,15 +386,29 @@ mod tests {
     fn light_area_matches_geometry_definitions() {
         let s = LightData::from_sphere(Vec3::new(0.0, 2.0, 0.0), 0.5, Vec3::new(1.0, 1.0, 1.0));
         assert!((s.area() - 4.0 * std::f32::consts::PI * 0.25).abs() < 1e-5);
-        let q = LightData::from_quad(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 2.0, 4.0, Vec3::new(1.0, 1.0, 1.0));
+        let q = LightData::from_quad(
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            2.0,
+            4.0,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
         assert!((q.area() - 8.0).abs() < 1e-5);
     }
 
     #[test]
     fn cpu_scene_conversion_preserves_light_count() {
         let mut scene = SceneData::new();
-        scene.add_plane(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)));
-        scene.add_light(LightData::from_sphere(Vec3::new(0.0, 2.0, 0.0), 0.5, Vec3::new(5.0, 5.0, 5.0)));
+        scene.add_plane(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        scene.add_light(LightData::from_sphere(
+            Vec3::new(0.0, 2.0, 0.0),
+            0.5,
+            Vec3::new(5.0, 5.0, 5.0),
+        ));
         let (cpu_scene, lights) = scene.build_cpu_scene();
         assert_eq!(lights.len(), 1);
         // A ray straight up from the floor must hit the light sphere.
@@ -389,8 +444,16 @@ mod tests {
         // The quad's bbox must be tight: no ±1e6 extents.
         let (cpu_scene, _) = scene.build_cpu_scene();
         let bbox = cpu_scene.bounding_box();
-        assert!(bbox.max.x - bbox.min.x <= 5.0 + 1e-4, "x extent: {:?}", bbox);
-        assert!(bbox.max.y - bbox.min.y <= 2.0 + 1e-4, "y extent: {:?}", bbox);
+        assert!(
+            bbox.max.x - bbox.min.x <= 5.0 + 1e-4,
+            "x extent: {:?}",
+            bbox
+        );
+        assert!(
+            bbox.max.y - bbox.min.y <= 2.0 + 1e-4,
+            "y extent: {:?}",
+            bbox
+        );
         assert!(bbox.max.z - bbox.min.z <= 1e-4, "z extent: {:?}", bbox);
         // A ray through the wall's center hits it...
         let hit = crate::geometry::Ray {
@@ -428,8 +491,16 @@ mod tests {
         assert_eq!(q.half_h, 1.0);
         let (cpu_scene, _) = scene.build_cpu_scene();
         let bbox = cpu_scene.bounding_box();
-        assert!(bbox.max.z - bbox.min.z <= 5.0 + 1e-4, "z extent: {:?}", bbox);
-        assert!(bbox.max.y - bbox.min.y <= 2.0 + 1e-4, "y extent: {:?}", bbox);
+        assert!(
+            bbox.max.z - bbox.min.z <= 5.0 + 1e-4,
+            "z extent: {:?}",
+            bbox
+        );
+        assert!(
+            bbox.max.y - bbox.min.y <= 2.0 + 1e-4,
+            "y extent: {:?}",
+            bbox
+        );
         assert!(bbox.max.x - bbox.min.x <= 1e-4, "x extent: {:?}", bbox);
     }
 
@@ -456,7 +527,9 @@ mod tests {
             origin: Vec3::new(0.0, 0.1, 0.0),
             direction: Vec3::new(0.0, 1.0, 0.0),
         };
-        let hit = cpu_scene.intersect(&ray).expect("light must be intersectable");
+        let hit = cpu_scene
+            .intersect(&ray)
+            .expect("light must be intersectable");
         assert_eq!(hit.mat.mat_type, MaterialType::Emissive);
 
         // Same for quad lights.

@@ -249,6 +249,9 @@ mod tests {
         // designed to blow out to white); the display path clamps. The
         // mapped value must stay finite and above the white-point value.
         let over = PixelBuffer::tone_map(Vec3::new(w * 10.0, w * 10.0, w * 10.0));
-        assert!(over.x > t.x && over.x.is_finite(), "over-white mapping: {over:?}");
+        assert!(
+            over.x > t.x && over.x.is_finite(),
+            "over-white mapping: {over:?}"
+        );
     }
 }

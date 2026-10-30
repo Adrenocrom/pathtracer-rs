@@ -217,13 +217,34 @@ impl StaticResources {
             label: Some("bdpt-bind-group"),
             layout: &self.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.sphere_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.quad_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: self.cube_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.plane_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: self.light_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: accum_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.sphere_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.quad_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.cube_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.plane_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.light_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: accum_buf.as_entire_binding(),
+                },
             ],
         })
     }
@@ -233,14 +254,22 @@ impl GpuRenderer {
     /// Create a renderer for `scene` at the given resolution.
     pub fn new(scene: &SceneData, width: u32, height: u32) -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-            .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
         let info = adapter.get_info();
         let adapter_info = format!("{} ({})", info.name, info.backend);
         let (device, queue) = pollster::block_on(adapter.request_device(&device_descriptor()))
             .map_err(|e| format!("failed to create GPU device: {e}"))?;
 
-        Ok(Self::from_parts(device, queue, scene, width, height, adapter_info))
+        Ok(Self::from_parts(
+            device,
+            queue,
+            scene,
+            width,
+            height,
+            adapter_info,
+        ))
     }
 
     /// Build a renderer from an existing device/queue (shared with the
@@ -256,65 +285,111 @@ impl GpuRenderer {
         let shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/bdpt.wgsl"));
 
         // --- Scene buffers (flat POD arrays, uploaded once) ---
-        let spheres: Vec<GpuSphere> = scene.spheres.iter().map(|s| GpuSphere {
-            center: vec3s(s.center),
-            radius: s.radius,
-            albedo: vec3s(s.mat.albedo),
-            _pad0: 0.0,
-            emission: vec3s(s.mat.emission),
-            mat_type: mat_type_u32(s.mat.mat_type),
-            _pad1: [0.0; 3],
-            _pad2: 0.0,
-        }).collect();
-        let quads: Vec<GpuQuad> = scene.quads.iter().map(|q| GpuQuad {
-            center: vec3s(q.center),
-            half_w: q.half_w,
-            normal: vec3s(q.normal),
-            half_h: q.half_h,
-            tangent: vec3s(q.tangent),
-            _pad0: 0.0,
-            bitangent: vec3s(q.bitangent),
-            _pad1: 0.0,
-            albedo: vec3s(q.mat.albedo),
-            _pad2: 0.0,
-            emission: vec3s(q.mat.emission),
-            mat_type: mat_type_u32(q.mat.mat_type),
-            _pad3: [0.0; 3],
-            _pad4: 0.0,
-        }).collect();
-        let cubes: Vec<GpuCube> = scene.cubes.iter().map(|c| GpuCube {
-            min: vec3s(c.min),
-            _pad0: 0.0,
-            max: vec3s(c.max),
-            _pad1: 0.0,
-            albedo: vec3s(c.mat.albedo),
-            _pad2: 0.0,
-            emission: vec3s(c.mat.emission),
-            mat_type: mat_type_u32(c.mat.mat_type),
-            _pad3: [0.0; 3],
-            _pad4: 0.0,
-        }).collect();
-        let planes: Vec<GpuPlane> = scene.planes.iter().map(|p| GpuPlane {
-            point: vec3s(p.point),
-            _pad0: 0.0,
-            normal: vec3s(p.normal),
-            _pad1: 0.0,
-            albedo: vec3s(p.mat.albedo),
-            _pad2: 0.0,
-            emission: vec3s(p.mat.emission),
-            mat_type: mat_type_u32(p.mat.mat_type),
-            _pad3: [0.0; 3],
-            _pad4: 0.0,
-        }).collect();
+        let spheres: Vec<GpuSphere> = scene
+            .spheres
+            .iter()
+            .map(|s| GpuSphere {
+                center: vec3s(s.center),
+                radius: s.radius,
+                albedo: vec3s(s.mat.albedo),
+                _pad0: 0.0,
+                emission: vec3s(s.mat.emission),
+                mat_type: mat_type_u32(s.mat.mat_type),
+                _pad1: [0.0; 3],
+                _pad2: 0.0,
+            })
+            .collect();
+        let quads: Vec<GpuQuad> = scene
+            .quads
+            .iter()
+            .map(|q| GpuQuad {
+                center: vec3s(q.center),
+                half_w: q.half_w,
+                normal: vec3s(q.normal),
+                half_h: q.half_h,
+                tangent: vec3s(q.tangent),
+                _pad0: 0.0,
+                bitangent: vec3s(q.bitangent),
+                _pad1: 0.0,
+                albedo: vec3s(q.mat.albedo),
+                _pad2: 0.0,
+                emission: vec3s(q.mat.emission),
+                mat_type: mat_type_u32(q.mat.mat_type),
+                _pad3: [0.0; 3],
+                _pad4: 0.0,
+            })
+            .collect();
+        let cubes: Vec<GpuCube> = scene
+            .cubes
+            .iter()
+            .map(|c| GpuCube {
+                min: vec3s(c.min),
+                _pad0: 0.0,
+                max: vec3s(c.max),
+                _pad1: 0.0,
+                albedo: vec3s(c.mat.albedo),
+                _pad2: 0.0,
+                emission: vec3s(c.mat.emission),
+                mat_type: mat_type_u32(c.mat.mat_type),
+                _pad3: [0.0; 3],
+                _pad4: 0.0,
+            })
+            .collect();
+        let planes: Vec<GpuPlane> = scene
+            .planes
+            .iter()
+            .map(|p| GpuPlane {
+                point: vec3s(p.point),
+                _pad0: 0.0,
+                normal: vec3s(p.normal),
+                _pad1: 0.0,
+                albedo: vec3s(p.mat.albedo),
+                _pad2: 0.0,
+                emission: vec3s(p.mat.emission),
+                mat_type: mat_type_u32(p.mat.mat_type),
+                _pad3: [0.0; 3],
+                _pad4: 0.0,
+            })
+            .collect();
         let lights: Vec<GpuLight> = scene.lights.iter().map(GpuLight::from_light_data).collect();
 
         // Storage buffers must be non-empty for WGSL arrayLength to be valid;
         // pad empty families to one zeroed element of the right stride.
-        let sphere_buf = upload_storage(&device, &queue, bytemuck::cast_slice(&spheres), std::mem::size_of::<GpuSphere>() as u64, "spheres");
-        let quad_buf = upload_storage(&device, &queue, bytemuck::cast_slice(&quads), std::mem::size_of::<GpuQuad>() as u64, "quads");
-        let cube_buf = upload_storage(&device, &queue, bytemuck::cast_slice(&cubes), std::mem::size_of::<GpuCube>() as u64, "cubes");
-        let plane_buf = upload_storage(&device, &queue, bytemuck::cast_slice(&planes), std::mem::size_of::<GpuPlane>() as u64, "planes");
-        let light_buf = upload_storage(&device, &queue, bytemuck::cast_slice(&lights), std::mem::size_of::<GpuLight>() as u64, "lights");
+        let sphere_buf = upload_storage(
+            &device,
+            &queue,
+            bytemuck::cast_slice(&spheres),
+            std::mem::size_of::<GpuSphere>() as u64,
+            "spheres",
+        );
+        let quad_buf = upload_storage(
+            &device,
+            &queue,
+            bytemuck::cast_slice(&quads),
+            std::mem::size_of::<GpuQuad>() as u64,
+            "quads",
+        );
+        let cube_buf = upload_storage(
+            &device,
+            &queue,
+            bytemuck::cast_slice(&cubes),
+            std::mem::size_of::<GpuCube>() as u64,
+            "cubes",
+        );
+        let plane_buf = upload_storage(
+            &device,
+            &queue,
+            bytemuck::cast_slice(&planes),
+            std::mem::size_of::<GpuPlane>() as u64,
+            "planes",
+        );
+        let light_buf = upload_storage(
+            &device,
+            &queue,
+            bytemuck::cast_slice(&lights),
+            std::mem::size_of::<GpuLight>() as u64,
+            "lights",
+        );
 
         let n_pixels = (width * height) as u64;
         let accum_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -535,11 +610,14 @@ impl GpuRenderer {
             _pad1: 0,
             _pad2: 0,
         };
-        self.queue.write_buffer(&self.res.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        self.queue
+            .write_buffer(&self.res.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bdpt-encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bdpt-encoder"),
+            });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("bdpt-pass"),
@@ -560,10 +638,18 @@ impl GpuRenderer {
     /// Copy the accumulation buffer to the CPU and return it as a PixelBuffer.
     /// Blocks until the GPU has finished the pending frame.
     pub fn read_pixels(&mut self) -> PixelBuffer {
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bdpt-readback-encoder"),
-        });
-        encoder.copy_buffer_to_buffer(&self.accum_buf, 0, &self.readback_buf, 0, self.readback_buf.size());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("bdpt-readback-encoder"),
+            });
+        encoder.copy_buffer_to_buffer(
+            &self.accum_buf,
+            0,
+            &self.readback_buf,
+            0,
+            self.readback_buf.size(),
+        );
         self.queue.submit(Some(encoder.finish()));
 
         let slice = self.readback_buf.slice(..);
@@ -571,7 +657,9 @@ impl GpuRenderer {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("GPU poll failed");
-        let data = slice.get_mapped_range().expect("readback buffer not mapped");
+        let data = slice
+            .get_mapped_range()
+            .expect("readback buffer not mapped");
         let floats: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         self.readback_buf.unmap();
@@ -607,7 +695,13 @@ pub(crate) fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
 /// element so the WGSL `arrayLength` is never 0 and the buffer size is a
 /// multiple of the element stride (avoids out-of-bounds reads and validation
 /// errors).
-fn upload_storage(device: &wgpu::Device, queue: &wgpu::Queue, contents: &[u8], elem_size: u64, label: &str) -> wgpu::Buffer {
+fn upload_storage(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    contents: &[u8],
+    elem_size: u64,
+    label: &str,
+) -> wgpu::Buffer {
     let size = if contents.is_empty() {
         elem_size
     } else {
@@ -695,7 +789,11 @@ mod tests {
                 .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
                 .unwrap_or_else(|| "unknown".to_string());
-            std::fs::write("target/gpu_smoke_error.txt", format!("panic at {loc}: {msg}")).ok();
+            std::fs::write(
+                "target/gpu_smoke_error.txt",
+                format!("panic at {loc}: {msg}"),
+            )
+            .ok();
             default_hook(info);
         }));
         // Clear stale error files so we only see fresh failures.
@@ -773,7 +871,11 @@ mod tests {
                 .location()
                 .map(|l| format!("{}:{}", l.file(), l.line()))
                 .unwrap_or_else(|| "unknown".to_string());
-            std::fs::write("target/gpu_oracle_error.txt", format!("panic at {loc}: {msg}")).ok();
+            std::fs::write(
+                "target/gpu_oracle_error.txt",
+                format!("panic at {loc}: {msg}"),
+            )
+            .ok();
             default_hook(info);
         }));
         // Clear stale error files so we only see fresh failures.
@@ -893,13 +995,21 @@ mod tests {
         let gpu_buf = gpu.read_pixels();
 
         // CPU: same number of samples.
-        let mut cpu = crate::renderer::CpuRenderer::new(&scene, W as usize, H as usize, FRAMES as usize);
+        let mut cpu =
+            crate::renderer::CpuRenderer::new(&scene, W as usize, H as usize, FRAMES as usize);
         cpu.render_frame(&cam, 8);
         let cpu_buf = cpu.read_pixels();
 
         // Compare per-channel means and standard deviations.
         let mean = |buf: &crate::output::PixelBuffer, ch: usize| -> f32 {
-            buf.pixels.iter().map(|p| match ch { 0 => p.x, 1 => p.y, _ => p.z }).sum::<f32>()
+            buf.pixels
+                .iter()
+                .map(|p| match ch {
+                    0 => p.x,
+                    1 => p.y,
+                    _ => p.z,
+                })
+                .sum::<f32>()
                 / buf.pixels.len() as f32
         };
         for ch in 0..3 {

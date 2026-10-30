@@ -4,7 +4,11 @@ use std::ops::{Add, Div, Index, Mul, Neg, Sub};
 
 // --- CONSTANTS ---
 pub const EPS_NEAR: f32 = 0.001;
-pub const VEC_ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
+pub const VEC_ZERO: Vec3 = Vec3 {
+    x: 0.0,
+    y: 0.0,
+    z: 0.0,
+};
 
 // --- VEC3 ---
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -21,7 +25,11 @@ impl Vec3 {
 
     pub fn normalize(self) -> Self {
         let len = self.length();
-        if len == 0.0 { self } else { self * (1.0 / len) }
+        if len == 0.0 {
+            self
+        } else {
+            self * (1.0 / len)
+        }
     }
 
     pub fn length(self) -> f32 {
@@ -45,11 +53,19 @@ impl Vec3 {
     }
 
     pub fn min(self, other: Vec3) -> Vec3 {
-        Vec3::new(self.x.min(other.x), self.y.min(other.y), self.z.min(other.z))
+        Vec3::new(
+            self.x.min(other.x),
+            self.y.min(other.y),
+            self.z.min(other.z),
+        )
     }
 
     pub fn max(self, other: Vec3) -> Vec3 {
-        Vec3::new(self.x.max(other.x), self.y.max(other.y), self.z.max(other.z))
+        Vec3::new(
+            self.x.max(other.x),
+            self.y.max(other.y),
+            self.z.max(other.z),
+        )
     }
 }
 
