@@ -20,9 +20,13 @@ use std::io::Write;
 
 // --- CONFIGURATION ---
 const SAMPLES_PREVIEW: usize = 1;
-const MAX_DEPTH_PREVIEW: usize = 4;
+/// Path depth. Russian roulette terminates paths by throughput instead of
+/// this cap, so it can sit at the vertex-array maximum without cost: short
+/// paths (which carry most of the energy) are never killed, and deep ones
+/// survive in proportion to their contribution.
+const MAX_DEPTH_PREVIEW: usize = 8;
 const SAMPLES_FHD: usize = 1024;
-const MAX_DEPTH_FHD: usize = 4;
+const MAX_DEPTH_FHD: usize = 8;
 
 /// Build the scene with multiple objects for interesting lighting.
 fn build_scene() -> SceneData {

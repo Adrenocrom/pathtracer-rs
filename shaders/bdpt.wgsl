@@ -4,6 +4,14 @@
 // area-measure pdf of every sampled path edge is G/PI and the MIS weights
 // reduce to per-edge ratios (power heuristic, beta = 2). See bdpt.rs for
 // the derivation.
+//
+// Paths are terminated by Russian roulette rather than a short fixed
+// depth: from extension RR_START on, a subpath survives each bounce with
+// probability q = clamp(max(throughput), RR_MIN, 1) and divides its
+// throughput by q on survival, which keeps the estimator unbiased while
+// letting deep paths through. The survival probabilities are part of the
+// sampling pdfs, so they also enter the MIS weights, as the prefix
+// products computed by rr_prefix_products.
 
 struct Uniforms {
     cam_origin: vec3<f32>,
@@ -122,6 +130,11 @@ const PI: f32 = 3.141592653589793;
 const EPS_NEAR: f32 = 0.001;
 const MAX_PATH_VERTICES: u32 = 8u;
 const BACKGROUND: vec3<f32> = vec3<f32>(0.02, 0.02, 0.05);
+// Russian roulette: minimum survival probability and the extension number
+// the roulette starts at (the first RR_START - 1 extensions are
+// unconditional). Must match src/bdpt.rs.
+const RR_MIN: f32 = 0.05;
+const RR_START: u32 = 3u;
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> spheres: array<GpuSphere>;
@@ -311,13 +324,20 @@ fn visible(p_from: vec3<f32>, from_normal: vec3<f32>, to: vec3<f32>) -> bool {
 }
 
 // --- MIS weight (power heuristic, beta = 2), f32 port of bdpt.rs ---
+//
+// qe[m] is Qe(m), the product of the Russian-roulette survival
+// probabilities of the eye-subpath prefix x_1..x_m (the rolls at
+// x_1..x_{m-1}); ql[j] is Ql(j), the same for the light-subpath prefix
+// y_0..y_j (the rolls at y_0..y_{j-1}). Without roulette they are all 1.
 
-fn mis_weight(edges: ptr<function, array<f32, 8>>, k: u32, inv_light_pdf: f32, s: u32) -> f32 {
+fn mis_weight(edges: ptr<function, array<f32, 8>>, qe: ptr<function, array<f32, 9>>,
+              ql: ptr<function, array<f32, 9>>, k: u32, inv_light_pdf: f32, s: u32) -> f32 {
     var r = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    r[k] = 1.0;
+    // r[k] = Qe(k); r[m] = PI * Qe(m) * Ql(k-m-1) / (nA * e_{m+1}) for m < k.
+    r[k] = (*qe)[k];
     for (var m = 1u; m < k; m = m + 1u) {
         let e = (*edges)[m - 1u]; // e_{m+1}
-        r[m] = select(0.0, PI / (inv_light_pdf * e), e > 0.0);
+        r[m] = select(0.0, PI * (*qe)[m] * (*ql)[k - m - 1u] / (inv_light_pdf * e), e > 0.0);
     }
     var r_max = 0.0;
     for (var m = 1u; m <= k; m = m + 1u) {
@@ -331,6 +351,75 @@ fn mis_weight(edges: ptr<function, array<f32, 8>>, k: u32, inv_light_pdf: f32, s
     }
     let q = r[s] / r_max;
     return q * q / sum;
+}
+
+// --- Russian roulette ---
+
+fn rr_survival(beta: vec3<f32>, ext: u32) -> f32 {
+    if (ext < RR_START) { return 1.0; }
+    return clamp(max(beta.x, max(beta.y, beta.z)), RR_MIN, 1.0);
+}
+
+// Fill the Russian-roulette prefix products the MIS weights need.
+//
+// The path is the eye prefix x_1..x_{n_eye} followed by the light vertices
+// y_{n_light-1}..y_0 (k = n_eye + n_light vertices after the camera). The
+// direct-hit strategy passes the whole eye subpath (n_light == 0) plus the
+// light-subpath throughput at the hit point.
+//
+// Both sweeps recompute the compensated throughputs the rolls were made
+// from - those are deterministic functions of the path prefix - so the
+// q's here are exactly the ones the subpath sampling rolled. That also
+// covers the hypothetical rolls of strategies that would extend a
+// subpath past where it actually stopped (killed by roulette, escaped, or
+// depth-capped): the albedos those extensions would scatter at belong to
+// the path, so their q's are computable even though the rolls never
+// happened.
+fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
+                      light_path: ptr<function, array<PathVertex, 8>>,
+                      k: u32, n_eye: u32, n_light: u32, alpha_light0: vec3<f32>,
+                      qe: ptr<function, array<f32, 9>>,
+                      ql: ptr<function, array<f32, 9>>) {
+    // Eye-side sweep: the roll at x_l governs the extension to x_{l+1}.
+    var alpha = vec3<f32>(1.0);
+    (*qe)[1u] = 1.0;
+    for (var l = 1u; l < k; l = l + 1u) {
+        // Position l of the path: an eye vertex while l <= n_eye, then
+        // the light vertices in reverse order (x_{n_eye+m} = y_{n_light-m}).
+        // Explicit branches, not select(): the discarded side would read
+        // slots past the realized subpath.
+        var alb: vec3<f32>;
+        if (l <= n_eye) {
+            alb = (*eye)[l - 1u].albedo;
+        } else {
+            alb = (*light_path)[k - l].albedo;
+        }
+        let beta = alpha * alb;
+        let q = rr_survival(beta, l);
+        (*qe)[l + 1u] = (*qe)[l] * q;
+        alpha = beta / q;
+    }
+
+    // Light-side sweep: the roll at y_j governs the extension to y_{j+1}.
+    // The first step has no BSDF at the emitter, hence the PI factor.
+    var alpha_l = alpha_light0;
+    (*ql)[0u] = 1.0;
+    for (var j = 0u; j < k - min(k, 2u); j = j + 1u) {
+        // y_j is a real light vertex while j < n_light, then the eye
+        // vertices in reverse order (y_{n_light+m} = x_{n_eye-m}).
+        var factor: vec3<f32>;
+        if (j == 0u) {
+            factor = vec3<f32>(PI);
+        } else if (j < n_light) {
+            factor = (*light_path)[j].albedo;
+        } else {
+            factor = (*eye)[k - j - 1u].albedo;
+        }
+        let beta = alpha_l * factor;
+        let q = rr_survival(beta, j + 1u);
+        (*ql)[j + 1u] = (*ql)[j] * q;
+        alpha_l = beta / q;
+    }
 }
 
 // --- Light sampling (uniform surface sample, pdf = 1/area) ---
@@ -390,8 +479,14 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
             hit.p, hit.normal, hit.albedo, hit.emission, throughput, edge_g, on_light);
         eye_len = eye_len + 1u;
         if (on_light) { break; }
+        // Russian roulette for the extension x_l -> x_{l+1} (l = eye_len):
+        // survive with probability q and divide the throughput by q, which
+        // keeps the expected contribution of the subpath unchanged.
+        let beta = throughput * hit.albedo;
+        let q = rr_survival(beta, eye_len);
+        if (q < 1.0 && pcg(state) >= q) { break; }
+        throughput = beta / q;
         let dir = cosine_hemisphere(hit.normal, state);
-        throughput = throughput * hit.albedo;
         cur_origin = hit.p + hit.normal * EPS_NEAR;
         cur_dir = dir;
     }
@@ -410,6 +505,10 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         light_path[0] = PathVertex(p0, n0, vec3<f32>(0.0), light.emission, ltp, 0.0, true);
         light_len = 1u;
 
+        // The first light extension (y_0 -> y_1) is unconditional
+        // (RR_START >= 2). The emitter has no BSDF, so the edge contributes
+        // a factor PI.
+        ltp = ltp * PI;
         cur_origin = p0 + n0 * EPS_NEAR;
         cur_dir = cosine_hemisphere(n0, state);
         // The connection strategies need k = i + j + 2 <= max_depth, so the
@@ -423,13 +522,19 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
             if (hit.mat_type == 1u || dot(hit.normal, cur_dir) > 0.0) { break; }
             let prev = light_path[light_len - 1u];
             let edge_g = g_term(prev.p, prev.normal, hit.p, hit.normal);
-            // First step has no BSDF at the emitter, so the edge contributes
-            // a factor PI; later steps contribute the previous vertex's albedo.
-            // NOTE: select(f, t, cond) returns t when cond is TRUE.
-            ltp = select(ltp * prev.albedo, ltp * PI, light_len == 1u);
             light_path[light_len] = PathVertex(
                 hit.p, hit.normal, hit.albedo, hit.emission, ltp, edge_g, false);
             light_len = light_len + 1u;
+            // Russian roulette for the extension y_j -> y_{j+1}
+            // (j = light_len - 1 >= 1, number j + 1). The factor is the
+            // vertex's own albedo; the emitter's PI case is applied before
+            // the loop. Surviving divides ltp by q, which also applies the
+            // factor for the next vertex.
+            let j = light_len - 1u;
+            let beta = ltp * hit.albedo;
+            let q = rr_survival(beta, j + 1u);
+            if (q < 1.0 && pcg(state) >= q) { break; }
+            ltp = beta / q;
             let dir = cosine_hemisphere(hit.normal, state);
             cur_origin = hit.p + hit.normal * EPS_NEAR;
             cur_dir = dir;
@@ -450,7 +555,16 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                     for (var idx = 0u; idx < k - 1u; idx = idx + 1u) {
                         edges[idx] = eye[idx + 1u].edge_g;
                     }
-                    w = mis_weight(&edges, k, f32(uniforms.n_lights) * light_area(lights[li]), k);
+                    // The hypothetical light subpath of the other strategies
+                    // starts at this hit point with the emitter's throughput
+                    // (emission * n * A, the inverse light-sampling pdf).
+                    var qe = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                    var ql = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                    rr_prefix_products(&eye, &light_path, k, k, 0u,
+                                       lights[li].emission * (f32(uniforms.n_lights) * light_area(lights[li])),
+                                       &qe, &ql);
+                    w = mis_weight(&edges, &qe, &ql, k,
+                                   f32(uniforms.n_lights) * light_area(lights[li]), k);
                 }
             }
         }
@@ -486,7 +600,11 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                 edges[m - 2u] = light_path[k - m + 1u].edge_g;
             }
 
-            let w = mis_weight(&edges, k, inv_light_pdf, i + 1u);
+            var qe = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            var ql = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            rr_prefix_products(&eye, &light_path, k, i + 1u, j + 1u,
+                               light_path[0].throughput, &qe, &ql);
+            let w = mis_weight(&edges, &qe, &ql, k, inv_light_pdf, i + 1u);
             total += contrib * w;
         }
     }

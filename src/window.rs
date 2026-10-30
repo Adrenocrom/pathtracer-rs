@@ -21,8 +21,9 @@ use winit::window::{Window, WindowId};
 
 /// How many preview frames to accumulate while the camera is stationary.
 //const MAX_ACCUMULATED_FRAMES: u32 = 100000;
-/// Preview path depth (same as the terminal frontend).
-const MAX_DEPTH_PREVIEW: u32 = 4;
+/// Preview path depth (same as the terminal frontend). Russian roulette
+/// terminates paths by throughput, so the cap can sit at the maximum.
+const MAX_DEPTH_PREVIEW: u32 = 8;
 
 /// Camera speed in world units per second (W/S).
 const MOVE_SPEED: f32 = 1.0;

@@ -18,7 +18,7 @@ A high-performance, interactive path tracer rendered directly in the terminal us
     - **Bilateral Filtering:** Edge-preserving denoising on the linear HDR buffer to remove path-tracing grain while keeping silhouettes crisp.
     - **Reinhard Tone Mapping:** Preserves detail in high-intensity emissive areas.
     - **Gamma Correction:** Linear-to-sRGB conversion (γ = 2.2) for natural lighting.
-- **High-Quality Export:** Trigger a full FHD (1920×1080) render at 128 samples per pixel with up to 8 bounces, saved as a PNG with a progress bar.
+- **High-Quality Export:** Trigger a full FHD (1920×1080) render at 1024 samples per pixel with up to 8 bounces, saved as a PNG with a progress bar.
 - **BVH Acceleration:** Scene geometry is organized in a bounding volume hierarchy (median split along the widest axis, with a subtree early-exit test) for fast ray intersection.
 
 ## 🎮 Controls

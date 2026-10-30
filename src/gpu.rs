@@ -712,7 +712,7 @@ mod tests {
             crate::math::Vec3::new(0.0, 0.5, 0.0),
             90.0,
         );
-        gpu.render_frame(&cam, 4);
+        gpu.render_frame(&cam, 8);
         let buf = gpu.read_pixels();
         assert_eq!(buf.pixels.len(), 32 * 32);
         for p in &buf.pixels {
