@@ -195,15 +195,40 @@ impl SceneData {
         self.planes.push(PlaneData { point, normal, mat });
     }
 
+    /// Register an emitter. The light is stored in two places, by design:
+    ///
+    /// * as real intersectable geometry (`spheres`/`quads`), so eye
+    ///   subpaths can hit it on *both* backends — the GPU's
+    ///   `intersect_scene` reads only the geometry buffers, never the
+    ///   light buffer;
+    /// * as a sampleable `LightData`, which drives the light subpath and
+    ///   the MIS weight of the "eye subpath hits the emitter" strategy.
+    ///
+    /// Because this registers the primitive, do not also add the same
+    /// shape via `add_sphere`/`add_quad` — that would duplicate it.
     pub fn add_light(&mut self, light: LightData) {
+        let mat = MaterialData::emissive(light.emission);
+        if light.shape == 0 {
+            self.spheres.push(SphereData { center: light.center, radius: light.radius, mat });
+        } else {
+            self.quads.push(QuadData {
+                center: light.center,
+                normal: light.normal,
+                tangent: light.tangent,
+                bitangent: light.bitangent,
+                half_w: light.half_w,
+                half_h: light.half_h,
+                mat,
+            });
+        }
         self.lights.push(light);
     }
 
     /// Build the trait-object scene (BVH) used by the CPU renderer.
     ///
-    /// The light geometry is added as real intersectable objects (mirroring
-    /// the original scene construction) so BDPT eye subpaths can hit the
-    /// emitters, while `lights` provides the area-sampling interface.
+    /// Emitter geometry is already part of `spheres`/`quads` (registered
+    /// by `add_light`), so it is intersectable here without any special
+    /// handling; `lights` provides the area-sampling interface.
     pub fn build_cpu_scene(&self) -> (Box<dyn Intersectable>, Vec<AreaLight>) {
         let mut objects: Vec<Box<dyn Intersectable>> = Vec::new();
         for s in &self.spheres {
@@ -238,35 +263,8 @@ impl SceneData {
                 mat: Material { albedo: p.mat.albedo, emission: p.mat.emission, mat_type: p.mat.mat_type },
             }));
         }
-        // Light geometry must be intersectable too: BDPT connects paths to
-        // real surfaces, and the eye subpath must be able to hit an emitter.
-        for l in &self.lights {
-            if l.shape == 0 {
-                objects.push(Box::new(Sphere {
-                    center: l.center,
-                    radius: l.radius,
-                    mat: Material {
-                        albedo: Vec3::new(0.0, 0.0, 0.0),
-                        emission: l.emission,
-                        mat_type: MaterialType::Emissive,
-                    },
-                }));
-            } else {
-                objects.push(Box::new(Quad {
-                    center: l.center,
-                    normal: l.normal,
-                    tangent: l.tangent,
-                    bitangent: l.bitangent,
-                    half_w: l.half_w,
-                    half_h: l.half_h,
-                    mat: Material {
-                        albedo: Vec3::new(0.0, 0.0, 0.0),
-                        emission: l.emission,
-                        mat_type: MaterialType::Emissive,
-                    },
-                }));
-            }
-        }
+        // Emitter geometry is already part of `spheres`/`quads` —
+        // `add_light` registers it — so it must not be added again here.
         let scene = crate::bvh::BVHNode::build(objects).expect("scene is non-empty");
         let lights = self.lights.iter().map(|l| self.cpu_light(l)).collect();
         (scene, lights)
@@ -332,5 +330,44 @@ mod tests {
             direction: Vec3::new(0.0, 1.0, 0.0),
         };
         assert!(cpu_scene.intersect(&ray).is_some());
+    }
+
+    /// A light added *only* via `add_light` must be real geometry: the GPU
+    /// uploads `spheres`/`quads` and its `intersect_scene` never reads the
+    /// light buffer, so a light missing from the geometry arrays would be
+    /// invisible to eye subpaths on the GPU while visible on the CPU.
+    #[test]
+    fn add_light_registers_geometry_for_both_backends() {
+        let mut scene = SceneData::new();
+        scene.add_light(LightData::from_sphere(
+            Vec3::new(0.0, 2.0, 0.0),
+            0.5,
+            Vec3::new(5.0, 5.0, 5.0),
+        ));
+        // Registered exactly once as geometry (no duplicate registration).
+        assert_eq!(scene.spheres.len(), 1);
+        assert_eq!(scene.spheres[0].mat.mat_type, MaterialType::Emissive);
+        assert_eq!(scene.spheres[0].mat.emission, Vec3::new(5.0, 5.0, 5.0));
+        // ...and the CPU BVH hits it with the emissive material.
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        assert_eq!(lights.len(), 1);
+        let ray = crate::geometry::Ray {
+            origin: Vec3::new(0.0, 0.1, 0.0),
+            direction: Vec3::new(0.0, 1.0, 0.0),
+        };
+        let hit = cpu_scene.intersect(&ray).expect("light must be intersectable");
+        assert_eq!(hit.mat.mat_type, MaterialType::Emissive);
+
+        // Same for quad lights.
+        let mut scene = SceneData::new();
+        scene.add_light(LightData::from_quad(
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            1.0,
+            1.0,
+            Vec3::new(5.0, 5.0, 5.0),
+        ));
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(scene.quads[0].mat.mat_type, MaterialType::Emissive);
     }
 }

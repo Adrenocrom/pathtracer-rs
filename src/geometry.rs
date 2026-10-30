@@ -48,7 +48,7 @@ pub struct HitRecord {
 }
 
 // --- MATERIALS ---
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MaterialType {
     Diffuse,
     Emissive,

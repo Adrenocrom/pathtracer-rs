@@ -690,11 +690,8 @@ mod tests {
             crate::math::Vec3::new(0.0, 1.0, 0.0),
             crate::scene::MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
         );
-        scene.add_sphere(
-            crate::math::Vec3::new(0.0, 1.0, 0.0),
-            0.5,
-            crate::scene::MaterialData::emissive(crate::math::Vec3::new(5.0, 5.0, 5.0)),
-        );
+        // `add_light` registers the sphere as geometry too, so the GPU's
+        // intersect_scene sees it (it never reads the light buffer).
         scene.add_light(crate::scene::LightData::from_sphere(
             crate::math::Vec3::new(0.0, 1.0, 0.0),
             0.5,
@@ -844,11 +841,7 @@ mod tests {
                 0.6,
                 crate::scene::MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
             );
-            s.add_sphere(
-                crate::math::Vec3::new(-0.4, 0.05, -0.8),
-                0.1,
-                crate::scene::MaterialData::emissive(crate::math::Vec3::new(10.0, 10.0, 4.0)),
-            );
+            // `add_light` registers the emitter as geometry too.
             s.add_light(crate::scene::LightData::from_sphere(
                 crate::math::Vec3::new(-0.4, 0.05, -0.8),
                 0.1,

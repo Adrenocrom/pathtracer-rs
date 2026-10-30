@@ -33,7 +33,6 @@ fn build_scene() -> SceneData {
     let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
     let red = MaterialData::diffuse(Vec3::new(0.75, 0.25, 0.25));
     let green = MaterialData::diffuse(Vec3::new(0.25, 0.75, 0.25));
-    let light_mat = MaterialData::emissive(emision);
 
     let mut scene = SceneData::new();
 
@@ -68,24 +67,22 @@ fn build_scene() -> SceneData {
     scene.add_cube(Vec3::new(0.45, 0.9, 0.8), 0.6, white);
     scene.add_cube(Vec3::new(1.09, 0.9, 0.8), 0.6, white);
 
-    // Hanging light (small emissive sphere)
-    scene.add_sphere(Vec3::new(0.65, 0.1, 1.5), 0.2, light_mat);
+    // Hanging light (small emissive sphere). `add_light` registers the
+    // emitter as geometry too, so both backends can hit it.
     scene.add_light(LightData::from_sphere(
         Vec3::new(0.65, 0.1, 1.5), 0.2, emision,
     ));
 
-    //// Ceiling light panel (one-sided: emits along its normal, i.e. downward)
-    //scene.add_quad(Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
+    // Ceiling light panel (one-sided: emits along its normal, i.e.
+    // downward). `add_light` registers the quad as geometry too.
     //scene.add_light(LightData::from_quad(
     //        Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
     //));
 
-    //scene.add_quad(Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
     //scene.add_light(LightData::from_quad(
     //        Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
     //));
 
-    //scene.add_quad(Vec3::new(15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, light_mat);
     //scene.add_light(LightData::from_quad(
     //        Vec3::new(15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emision,
     //));

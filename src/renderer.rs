@@ -6,7 +6,7 @@
 //! change and the CPU path stays fully testable.
 
 use crate::camera::Cam;
-use crate::math::Vec3;
+use crate::math::{Vec3, VEC_ZERO};
 use crate::output::PixelBuffer;
 use crate::scene::SceneData;
 
@@ -69,10 +69,17 @@ impl Renderer for CpuRenderer {
     }
 
     fn read_pixels(&mut self) -> PixelBuffer {
+        // Before the first `render_frame` nothing is accumulated yet. Return
+        // a zero-filled buffer of the full size so callers can index or
+        // display it without panicking on an empty vec.
+        let pixels = self
+            .accum
+            .clone()
+            .unwrap_or_else(|| vec![VEC_ZERO; self.width * self.height]);
         PixelBuffer {
             width: self.width,
             height: self.height,
-            pixels: self.accum.clone().unwrap_or_default(),
+            pixels,
         }
     }
 
@@ -112,5 +119,23 @@ mod tests {
             accumulate(&mut accum, &frame, n);
         }
         assert!(accum[0].x < 0.02);
+    }
+
+    /// `read_pixels` before the first `render_frame` used to return an
+    /// empty vec; indexing it (`get_pixel`, terminal display) panicked.
+    #[test]
+    fn read_pixels_before_first_frame_is_zero_filled() {
+        let mut scene = crate::scene::SceneData::new();
+        scene.add_plane(
+            crate::math::Vec3::new(0.0, 0.0, 0.0),
+            crate::math::Vec3::new(0.0, 1.0, 0.0),
+            crate::scene::MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
+        );
+        let mut renderer = CpuRenderer::new(&scene, 4, 3, 1);
+        let buffer = renderer.read_pixels();
+        assert_eq!(buffer.pixels.len(), 4 * 3);
+        assert_eq!(buffer.get_pixel(3, 2), Vec3::new(0.0, 0.0, 0.0));
+        // Displaying the buffer must not panic either.
+        assert!(!buffer.to_string().is_empty());
     }
 }
