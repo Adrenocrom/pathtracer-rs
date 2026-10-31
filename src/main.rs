@@ -31,7 +31,7 @@ const MAX_DEPTH_PREVIEW: usize = 8;
 
 /// Build the scene with multiple objects for interesting lighting.
 fn build_scene() -> SceneData {
-    let emission = Vec3::new(10.0, 10.0, 10.0);
+    let emission = Vec3::new(1000.0, 1000.0, 1000.0);
     let room_size = 2.5;
     let room_height = 2.0;
 
@@ -144,17 +144,17 @@ fn build_scene() -> SceneData {
     // ball and focuses into the caustic on the floor below — the Phase 1
     // payoff (paper.md §6.2): a light path the unidirectional tracer
     // cannot find.
-    scene.add_light(LightData::from_sphere(
-        Vec3::new(-0.4, 1.2, 0.1),
-        0.2,
-        emission,
-    ));
+    //scene.add_light(LightData::from_sphere(
+    //    Vec3::new(-0.4, 1.2, 0.1),
+    //    0.2,
+    //    emission,
+    //));
 
     // Ceiling light panel (one-sided: emits along its normal, i.e.
     // downward). `add_light` registers the quad as geometry too.
-    //scene.add_light(LightData::from_quad(
-    //        Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
-    //));
+    scene.add_light(LightData::from_quad(
+            Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
+    ));
 
     //scene.add_light(LightData::from_quad(
     //        Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
