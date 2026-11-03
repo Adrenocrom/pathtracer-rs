@@ -1255,8 +1255,8 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         let last = eye[eye_len - 1u];
         let k = eye_len;
         // Default 0: a hit on emissive geometry that is no sampleable
-        // light surface (the dark curved side of a laser housing)
-        // carries no emission. A found light overwrites this.
+        // light surface (the dark curved side of the laser's aperture
+        // puck) carries no emission. A found light overwrites this.
         var w = 0.0;
         if (uniforms.n_lights > 0u) {
             var found = false;

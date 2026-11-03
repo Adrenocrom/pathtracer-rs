@@ -816,7 +816,7 @@ pub fn bdpt_trace(
                 }
             }
             // The hit is on no sampleable light (e.g. the dark curved
-            // side of a laser housing, which is emissive-tagged
+            // side of the laser's aperture puck, which is emissive-tagged
             // geometry but not the aperture): no emission there.
             None => 0.0,
         };

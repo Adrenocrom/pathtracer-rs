@@ -172,15 +172,15 @@ fn build_scene() -> SceneData {
     // (0.8, ·, 1.5), painted the floor *behind* the cube stack, so the
     // spot was occluded and the beam invisible.
     //
-    // The whole cylinder carries the laser material: the curved side and
-    // the base cap are dark (their normals point outside the beam cone,
-    // so the emission gate zeroes them), only the aperture radiates. The
-    // aperture is dark from the camera too — physically correct: the
-    // emission cone is ±1.1° around the downward normal and the camera
-    // sits ~85° off-axis, so the aperture glows only when viewed from
-    // inside the beam (e.g. a floor-level camera near the spot). The
-    // visible showcase is the dark housing silhouette plus the blazing
-    // red floor spot.
+    // The housing carries a normal diffuse material, so it shades like
+    // any other object; the aperture is a thin puck of laser material
+    // whose top cap radiates into the cone (the rest of the puck is
+    // hidden inside the housing). The aperture is dark from the camera
+    // too — physically correct: the emission cone is ±1.1° around the
+    // downward normal and the camera sits ~85° off-axis, so the
+    // aperture glows only when viewed from inside the beam (e.g. a
+    // floor-level camera near the spot). The visible showcase is the
+    // shaded housing plus the blazing red floor spot.
     // The radiance is enormous on purpose. The cone is so narrow that a
     // floor point sees only a tiny central patch of the aperture inside
     // the beam: the spot's irradiance is L·π·tan²θ, ~50 W/m² here —
@@ -541,40 +541,57 @@ mod tests {
         assert_eq!(lights.len(), 2);
     }
 
-    /// The laser light source: a cylinder housing whose top cap is the
-    /// aperture. The scene must register it as real geometry (a cylinder
-    /// with the laser material) on both backends, and the aperture disc
-    /// must be the cylinder's top cap.
+    /// The laser light source: a diffuse cylinder housing plus a thin
+    /// cylinder puck of laser material whose top cap is the aperture.
+    /// The scene must register both as real geometry on both backends,
+    /// the housing must carry a normal (non-emissive) material, and the
+    /// aperture disc must be the puck's top cap.
     #[test]
     fn laser_is_a_cylinder_with_an_emitting_top_cap() {
         let scene = build_scene();
-        // Exactly one cylinder, carrying the laser material.
-        assert_eq!(scene.cylinders.len(), 1);
-        let cyl = &scene.cylinders[0];
-        assert!(cyl.mat.is_laser());
-        assert!(cyl.mat.is_emissive());
-        // The light's aperture is the cylinder's top cap center.
+        // Exactly two cylinders: the diffuse housing and the laser puck.
+        assert_eq!(scene.cylinders.len(), 2);
+        let housing = scene
+            .cylinders
+            .iter()
+            .find(|c| !c.mat.is_laser())
+            .expect("the housing must carry a normal material");
+        let puck = scene
+            .cylinders
+            .iter()
+            .find(|c| c.mat.is_laser())
+            .expect("the puck must carry the laser material");
+        assert!(puck.mat.is_emissive());
+        assert!(!housing.mat.is_emissive());
+        // The light's aperture is the puck's top cap center.
         let laser_light = scene
             .lights
             .iter()
             .find(|l| l.shape == 2)
             .expect("the laser must be registered as a light");
-        let top = cyl.base + cyl.axis * (2.0 * cyl.half_h);
+        let top = puck.base + puck.axis * (2.0 * puck.half_h);
         assert!((laser_light.center - top).length() < 1e-5);
-        assert!((laser_light.normal - cyl.axis).length() < 1e-5);
-        assert!((laser_light.radius - cyl.radius).abs() < 1e-5);
-        // The CPU scene must contain the cylinder as intersectable
-        // geometry: a ray along the axis from beyond the top cap hits it.
+        assert!((laser_light.normal - puck.axis).length() < 1e-5);
+        assert!((laser_light.radius - puck.radius).abs() < 1e-5);
+        // The housing is fatter than the puck and reaches further along
+        // the axis, so the puck's rim never peeks out from behind it.
+        assert!(housing.radius > puck.radius);
+        assert!(
+            housing.base.dot(housing.axis) < puck.base.dot(puck.axis),
+            "the housing must start behind the puck"
+        );
+        // The CPU scene must contain the puck as intersectable geometry:
+        // a ray along the axis from beyond the top cap hits it.
         let (cpu_scene, _) = scene.build_cpu_scene();
         let along_axis = crate::geometry::Ray {
-            origin: top + cyl.axis * 0.5,
-            direction: cyl.axis * -1.0,
+            origin: top + puck.axis * 0.5,
+            direction: puck.axis * -1.0,
         };
         let hit = cpu_scene
             .intersect(&along_axis)
             .expect("the laser housing must be intersectable");
         assert!(hit.mat.is_emissive());
-        // ...and the hit is the aperture (the top cap), in the beam.
+        // ...and the hit is the aperture (the puck's top cap), in the beam.
         assert!((hit.p - top).length() < 1e-4);
     }
 
@@ -758,7 +775,13 @@ mod tests {
             .iter()
             .find(|l| l.shape == 2)
             .expect("demo scene must contain a laser");
-        let cyl = &scene.cylinders[0];
+        // The housing: the non-laser cylinder (the other one is the
+        // aperture puck, hidden inside it).
+        let cyl = scene
+            .cylinders
+            .iter()
+            .find(|c| !c.mat.is_laser())
+            .expect("the laser housing");
         let aperture = laser.center;
 
         let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);

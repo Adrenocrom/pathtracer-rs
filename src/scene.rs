@@ -10,6 +10,23 @@ use crate::geometry::{
 };
 use crate::math::Vec3;
 
+/// The laser housing's material: a normal diffuse surface, so the
+/// cylinder shades like any other object in the scene (the laser
+/// material is a pure emitter — albedo 0, emission gated to the beam
+/// cone — which renders the whole surface black).
+const LASER_HOUSING_ALBEDO: Vec3 = Vec3 {
+    x: 0.8,
+    y: 0.8,
+    z: 0.8,
+};
+/// How much fatter (and longer) the housing is than the aperture puck,
+/// so the puck's rim never peeks out from behind it: 10%.
+const LASER_HOUSING_MARGIN: f32 = 0.1;
+/// The aperture puck's height as a fraction of the housing's: thin
+/// (10%), so it reads as the aperture disc rather than a second
+/// cylinder.
+const LASER_PUCK_FRACTION: f32 = 0.1;
+
 /// A surface material in flat, GPU-friendly form. `emission != 0` marks a
 /// pure emitter: the BSDF is ignored and the surface does not scatter.
 #[derive(Clone, Copy)]
@@ -234,7 +251,8 @@ pub struct PlaneData {
 
 /// A closed cylinder in flat form: `base` is the center of the base cap,
 /// `axis` the unit direction from base to top, `half_h` the half-height.
-/// The top cap carries the material (for a laser: the emitting aperture).
+/// For a laser, the housing cylinder is diffuse and the aperture is a
+/// separate thin cylinder puck of laser material (see `add_light`).
 #[derive(Clone, Copy)]
 pub struct CylinderData {
     pub base: Vec3,
@@ -365,19 +383,39 @@ impl SceneData {
                 mat,
             });
         } else if light.shape == 2 {
-            // A laser aperture: the disc is the top cap of a cylinder
-            // housing, whose material carries the emission cone. The
-            // housing is registered here so the aperture is real
-            // geometry on both backends.
+            // A laser aperture: the disc is the top cap of a small
+            // cylinder "puck" of laser material, registered here so the
+            // aperture is real geometry on both backends. The puck pokes
+            // through the top cap of the housing cylinder, so the
+            // aperture disc is the puck's own top cap and no ray can
+            // tie between the two surfaces.
             let theta = light.half_w; // the cone half-angle rides in half_w
             let height = light.half_h; // the housing height rides in half_h
             let axis = light.normal;
-            let base = light.center - axis * height;
+            // The housing: a normal diffuse material, so the cylinder
+            // shades like any other object (giving the whole housing
+            // the laser material would render it black — a pure emitter
+            // scatters nothing). It is fatter than the puck, and its top
+            // cap sits at the puck's mid-height — behind the aperture
+            // plane — so the beam exits unoccluded.
             self.cylinders.push(CylinderData {
-                base,
+                base: light.center - axis * height,
+                axis,
+                radius: light.radius * (1.0 + LASER_HOUSING_MARGIN),
+                half_h: (height - height * LASER_PUCK_FRACTION * 0.5) * 0.5,
+                mat: MaterialData::diffuse(LASER_HOUSING_ALBEDO),
+            });
+            // The aperture puck: thin, carrying the laser material.
+            // Its top cap is the aperture disc; its lower half is sunk
+            // into the housing. The laser material is a pure emitter
+            // (albedo 0, emission gated to the beam cone), so only the
+            // top cap radiates — the exposed sliver of the curved side
+            // reads as the dark bezel around the aperture.
+            self.cylinders.push(CylinderData {
+                base: light.center - axis * (height * LASER_PUCK_FRACTION),
                 axis,
                 radius: light.radius,
-                half_h: height * 0.5,
+                half_h: height * LASER_PUCK_FRACTION * 0.5,
                 mat: MaterialData::laser(light.emission, theta),
             });
         } else {
@@ -400,11 +438,12 @@ impl SceneData {
     /// `theta`. `height` is the cylinder's total height; the aperture
     /// disc sits at `center + axis * height/2`.
     ///
-    /// The whole cylinder carries the laser material: the curved side
-    /// and the base cap are dark (their normals point outside the beam
-    /// cone, so the emission gate zeroes them), while the top cap — the
-    /// aperture — radiates into the cone. One primitive, one material,
-    /// no separate housing mesh needed.
+    /// The housing carries a normal diffuse material, so it shades like
+    /// any other object; the aperture is a thin cylinder puck of laser
+    /// material whose top cap is the aperture disc, poking through the
+    /// housing's top cap. The laser material is a pure emitter (albedo
+    /// 0, emission gated to the beam cone), so only the puck's top cap
+    /// radiates — the rest of it is hidden inside the housing.
     pub fn add_laser(
         &mut self,
         center: Vec3,
