@@ -190,10 +190,10 @@ fn build_scene() -> SceneData {
     // (same chromaticity) is what makes the narrow beam deposit a
     // clearly visible spot.
     scene.add_laser(
-        Vec3::new(-1.2, room_height - 0.34, 1.0), // housing center, base sunk into the ceiling
-        Vec3::new(0.0, -1.0, 0.0),                // beam straight down
+        Vec3::new(-1.2, 0.4, 1.0), // housing center, base sunk into the ceiling
+        Vec3::new(0.0, 0.0, 1.0),                // beam straight down
         0.2,                                      // housing height
-        0.12,                                    // aperture radius
+        0.02,                                    // aperture radius
         0.02,                                    // beam half-angle (radians, ~1.1°)
         Vec3::new(40000.0, 800.0, 800.0),        // red laser
     );
