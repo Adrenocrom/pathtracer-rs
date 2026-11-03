@@ -4,6 +4,12 @@
 //! persistent accumulation buffer on the GPU. The CPU reads the buffer back
 //! only when pixels are needed (terminal frame or PNG export), so the render
 //! loop never stalls on a GPU round-trip while the camera is stationary.
+//!
+//! Intersection runs on a flat BVH: the scene's prims (spheres, quads,
+//! cubes, planes — one kind-tagged array) and the node tree are built
+//! here and uploaded once as two storage buffers; the shader traverses
+//! with an explicit stack (WGSL has no recursion) and culls every box
+//! by the current best hit distance.
 
 use crate::math::Vec3;
 use crate::output::PixelBuffer;
@@ -29,76 +35,59 @@ struct Uniforms {
     reset: u32,
     /// Samples traced per pixel in this dispatch.
     spp: u32,
-    _pad0: u32,
+    /// Scene prims; 0 = empty scene, the shader skips traversal.
+    n_prims: u32,
     _pad1: u32,
     _pad2: u32,
 }
 
-/// One sphere in GPU form (matches `GpuSphere` in shaders/bdpt.wgsl).
+/// One scene primitive in GPU form (matches `Prim` in shaders/bdpt.wgsl).
+///
+/// All four families (sphere/quad/cube/plane) share this layout, kind-
+/// tagged, so a single array — and a single BVH leaf range — can hold
+/// them all. The families share slots: the cube's min/max live in
+/// `center`/`normal`, the quad's `half_w` lives in `radius`.
 ///
 /// Layout rule: every `vec3<f32>` is immediately followed by an `f32` so
 /// WGSL's implicit 16-byte alignment never inserts padding that Rust's
 /// `#[repr(C)]` doesn't have.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuSphere {
+struct GpuPrim {
+    kind: u32,
+    ior: f32,
+    mat_type: u32,
+    _pad0: f32,
     center: [f32; 3],
     radius: f32,
-    albedo: [f32; 3],
-    _pad0: f32,
-    emission: [f32; 3],
-    mat_type: u32,
-    ior: f32,
-    _pad1: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuQuad {
-    center: [f32; 3],
-    half_w: f32,
     normal: [f32; 3],
     half_h: f32,
     tangent: [f32; 3],
-    _pad0: f32,
+    _pad1: f32,
     bitangent: [f32; 3],
-    _pad1: f32,
-    albedo: [f32; 3],
     _pad2: f32,
+    albedo: [f32; 3],
+    _pad3: f32,
     emission: [f32; 3],
-    mat_type: u32,
-    ior: f32,
-    _pad3: [f32; 3],
+    _pad4: f32,
 }
 
+/// One flat BVH node in GPU form (matches `BvhNode` in shaders/bdpt.wgsl).
+///
+/// * Leaf (`count > 0`): `right_first` indexes the first prim of a
+///   contiguous run of `count` prims — the prim array is uploaded in
+///   leaf order, so a leaf needs no per-prim indirection.
+/// * Inner (`count == 0`): `right_first` is the right child's node
+///   index; the left child is always this node's index + 1, because the
+///   builder emits nodes in pre-order (the same layout trick as pbrt's
+///   LinearBVHNode), so no second child field is needed.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuCube {
+struct GpuBvhNode {
     min: [f32; 3],
-    _pad0: f32,
+    right_first: u32,
     max: [f32; 3],
-    _pad1: f32,
-    albedo: [f32; 3],
-    _pad2: f32,
-    emission: [f32; 3],
-    mat_type: u32,
-    ior: f32,
-    _pad3: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuPlane {
-    point: [f32; 3],
-    _pad0: f32,
-    normal: [f32; 3],
-    _pad1: f32,
-    albedo: [f32; 3],
-    _pad2: f32,
-    emission: [f32; 3],
-    mat_type: u32,
-    ior: f32,
-    _pad3: [f32; 3],
+    count: u32,
 }
 
 #[repr(C)]
@@ -154,17 +143,166 @@ const MAT_EMISSIVE: u32 = 1;
 const MAT_MIRROR: u32 = 2;
 const MAT_GLASS: u32 = 3;
 
+// Prim kind tags, shared with shaders/bdpt.wgsl.
+const KIND_SPHERE: u32 = 0;
+const KIND_QUAD: u32 = 1;
+const KIND_CUBE: u32 = 2;
+const KIND_PLANE: u32 = 3;
+
 /// Compile-time layout checks: the Rust structs must match the WGSL
 /// structs byte-for-byte. WGSL aligns vec3<f32> to 16 bytes, so every
 /// vec3 is followed by an explicit f32 pad in both languages.
 const _: () = {
-    assert!(std::mem::size_of::<GpuSphere>() == 64);
-    assert!(std::mem::size_of::<GpuQuad>() == 112);
-    assert!(std::mem::size_of::<GpuCube>() == 80);
-    assert!(std::mem::size_of::<GpuPlane>() == 80);
+    assert!(std::mem::size_of::<GpuPrim>() == 112);
+    assert!(std::mem::size_of::<GpuBvhNode>() == 32);
     assert!(std::mem::size_of::<GpuLight>() == 112);
     assert!(std::mem::size_of::<Uniforms>() == 96);
 };
+
+// --- Flat BVH construction ---
+//
+// The GPU analogue of src/bvh.rs's BVHNode: same median-split-along-
+// the-widest-axis strategy, but emitted as a flat array the shader can
+// traverse with an explicit stack (WGSL has no recursion). Nodes are
+// written in pre-order, so an inner node's left child is always its own
+// index + 1 and only the right child needs storing.
+
+/// Maximum BVH depth the builder allows. A pop-based traversal of a
+/// depth-d binary tree holds at most d+1 pending nodes; the shader's
+/// stack is 32 entries, so 24 leaves plenty of headroom even for
+/// degenerate trees.
+const MAX_BVH_DEPTH: u32 = 24;
+
+/// The bounding box of one prim, in the same terms as geometry.rs.
+fn prim_bbox(p: &GpuPrim) -> ([f32; 3], [f32; 3]) {
+    match p.kind {
+        KIND_SPHERE => {
+            let r = p.radius;
+            (
+                [p.center[0] - r, p.center[1] - r, p.center[2] - r],
+                [p.center[0] + r, p.center[1] + r, p.center[2] + r],
+            )
+        }
+        KIND_QUAD => {
+            // The four corners of the rectangle.
+            let mut bmin = [f32::INFINITY; 3];
+            let mut bmax = [f32::NEG_INFINITY; 3];
+            for sx in [-1.0f32, 1.0] {
+                for sy in [-1.0f32, 1.0] {
+                    for a in 0..3 {
+                        let c = p.center[a]
+                            + p.tangent[a] * (sx * p.radius)
+                            + p.bitangent[a] * (sy * p.half_h);
+                        bmin[a] = bmin[a].min(c);
+                        bmax[a] = bmax[a].max(c);
+                    }
+                }
+            }
+            (bmin, bmax)
+        }
+        KIND_CUBE => (p.center, p.normal),
+        _ => {
+            // Planes are infinite; a ±1e6 box matches geometry.rs's
+            // Plane::bounding_box (and makes the root box huge, exactly
+            // as on the CPU — the demo scene uses finite quads instead).
+            ([-1e6; 3], [1e6; 3])
+        }
+    }
+}
+
+/// Build the flat BVH over `prims` (reordered in place into leaf order)
+/// and return the node array. Returns `None` for an empty scene.
+///
+/// The recursion is bounded by `MAX_BVH_DEPTH`: beyond it the split
+/// falls back to a plain median cut, which guarantees progress (each
+/// side gets at least one prim) and keeps the shader's fixed stack
+/// safe.
+fn build_bvh(prims: &mut Vec<GpuPrim>) -> Option<Vec<GpuBvhNode>> {
+    if prims.is_empty() {
+        return None;
+    }
+    let mut nodes: Vec<GpuBvhNode> = Vec::new();
+    let n = prims.len();
+    build_bvh_rec(prims, 0, n, 0, &mut nodes);
+    Some(nodes)
+}
+
+/// Recursive builder. `first..end` is the prim slice still to process,
+/// `depth` the current tree depth. Emits this node, then the left
+/// subtree, then the right subtree (pre-order).
+fn build_bvh_rec(
+    prims: &mut [GpuPrim],
+    first: usize,
+    end: usize,
+    depth: u32,
+    nodes: &mut Vec<GpuBvhNode>,
+) -> usize {
+    let count = end - first;
+    let node_idx = nodes.len();
+    nodes.push(GpuBvhNode {
+        min: [0.0; 3],
+        right_first: 0,
+        max: [0.0; 3],
+        count: 0,
+    });
+
+    // Total bounds of this subtree.
+    let mut bmin = [f32::INFINITY; 3];
+    let mut bmax = [f32::NEG_INFINITY; 3];
+    for p in &prims[first..end] {
+        let (pmin, pmax) = prim_bbox(p);
+        for a in 0..3 {
+            bmin[a] = bmin[a].min(pmin[a]);
+            bmax[a] = bmax[a].max(pmax[a]);
+        }
+    }
+
+    if count <= 1 || depth >= MAX_BVH_DEPTH {
+        // Leaf. The prims are already contiguous in leaf order.
+        nodes[node_idx] = GpuBvhNode {
+            min: bmin,
+            right_first: first as u32,
+            max: bmax,
+            count: count as u32,
+        };
+        return node_idx;
+    }
+
+    // Median split along the widest axis (same heuristic as bvh.rs).
+    let mut extent = [0.0f32; 3];
+    for a in 0..3 {
+        extent[a] = bmax[a] - bmin[a];
+    }
+    let axis = if extent[0] >= extent[1] && extent[0] >= extent[2] {
+        0
+    } else if extent[1] >= extent[2] {
+        1
+    } else {
+        2
+    };
+    let slice = &mut prims[first..end];
+    slice.sort_unstable_by(|a, b| {
+        let (amin, _) = prim_bbox(a);
+        let (bmin, _) = prim_bbox(b);
+        amin[axis]
+            .partial_cmp(&bmin[axis])
+            .expect("BVH sort: prim bbox min is not NaN")
+    });
+    let mid = first + count / 2;
+
+    // Left subtree is emitted immediately after this node (pre-order),
+    // so its index is node_idx + 1; the right subtree's index is known
+    // only after the left recursion returns.
+    build_bvh_rec(prims, first, mid, depth + 1, nodes);
+    let right_idx = build_bvh_rec(prims, mid, end, depth + 1, nodes);
+    nodes[node_idx] = GpuBvhNode {
+        min: bmin,
+        right_first: right_idx as u32,
+        max: bmax,
+        count: 0,
+    };
+    node_idx
+}
 
 fn mat_type_u32(m: &crate::scene::MaterialData) -> u32 {
     if m.is_emissive() {
@@ -206,6 +344,8 @@ pub struct GpuRenderer {
     width: u32,
     height: u32,
     n_lights: u32,
+    /// Scene prims; 0 = empty scene, the shader skips traversal.
+    n_prims: u32,
     /// Number of samples accumulated in the current accumulation epoch.
     samples: u32,
     /// True when the accumulation buffer must be overwritten this frame.
@@ -218,15 +358,13 @@ pub struct GpuRenderer {
 struct StaticResources {
     bgl: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
-    sphere_buf: wgpu::Buffer,
-    quad_buf: wgpu::Buffer,
-    cube_buf: wgpu::Buffer,
-    plane_buf: wgpu::Buffer,
+    prim_buf: wgpu::Buffer,
+    bvh_buf: wgpu::Buffer,
     light_buf: wgpu::Buffer,
 }
 
 impl StaticResources {
-    /// Bind group layout order: uniform + 5 read-only storage + 1
+    /// Bind group layout order: uniform + 3 read-only storage + 1
     /// read-write storage (the accumulation buffer).
     fn bind_group(&self, device: &wgpu::Device, accum_buf: &wgpu::Buffer) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -239,26 +377,18 @@ impl StaticResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.sphere_buf.as_entire_binding(),
+                    resource: self.prim_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.quad_buf.as_entire_binding(),
+                    resource: self.bvh_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.cube_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.plane_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
                     resource: self.light_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 6,
+                    binding: 4,
                     resource: accum_buf.as_entire_binding(),
                 },
             ],
@@ -301,103 +431,109 @@ impl GpuRenderer {
         let shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/bdpt.wgsl"));
 
         // --- Scene buffers (flat POD arrays, uploaded once) ---
-        let spheres: Vec<GpuSphere> = scene
-            .spheres
-            .iter()
-            .map(|s| GpuSphere {
+        // All four prim families share one kind-tagged array so a BVH
+        // leaf can reference a contiguous range with no per-prim
+        // indirection.
+        let mut prims: Vec<GpuPrim> = Vec::new();
+        for s in &scene.spheres {
+            prims.push(GpuPrim {
+                kind: KIND_SPHERE,
+                ior: mat_ior(&s.mat),
+                mat_type: mat_type_u32(&s.mat),
+                _pad0: 0.0,
                 center: vec3s(s.center),
                 radius: s.radius,
+                normal: [0.0; 3],
+                half_h: 0.0,
+                tangent: [0.0; 3],
+                _pad1: 0.0,
+                bitangent: [0.0; 3],
+                _pad2: 0.0,
                 albedo: vec3s(s.mat.albedo),
-                _pad0: 0.0,
+                _pad3: 0.0,
                 emission: vec3s(s.mat.emission),
-                mat_type: mat_type_u32(&s.mat),
-                ior: mat_ior(&s.mat),
-                _pad1: [0.0; 3],
-            })
-            .collect();
-        let quads: Vec<GpuQuad> = scene
-            .quads
-            .iter()
-            .map(|q| GpuQuad {
+                _pad4: 0.0,
+            });
+        }
+        for q in &scene.quads {
+            prims.push(GpuPrim {
+                kind: KIND_QUAD,
+                ior: mat_ior(&q.mat),
+                mat_type: mat_type_u32(&q.mat),
+                _pad0: 0.0,
                 center: vec3s(q.center),
-                half_w: q.half_w,
+                radius: q.half_w,
                 normal: vec3s(q.normal),
                 half_h: q.half_h,
                 tangent: vec3s(q.tangent),
-                _pad0: 0.0,
+                _pad1: 0.0,
                 bitangent: vec3s(q.bitangent),
-                _pad1: 0.0,
+                _pad2: 0.0,
                 albedo: vec3s(q.mat.albedo),
-                _pad2: 0.0,
+                _pad3: 0.0,
                 emission: vec3s(q.mat.emission),
-                mat_type: mat_type_u32(&q.mat),
-                ior: mat_ior(&q.mat),
-                _pad3: [0.0; 3],
-            })
-            .collect();
-        let cubes: Vec<GpuCube> = scene
-            .cubes
-            .iter()
-            .map(|c| GpuCube {
-                min: vec3s(c.min),
-                _pad0: 0.0,
-                max: vec3s(c.max),
-                _pad1: 0.0,
-                albedo: vec3s(c.mat.albedo),
-                _pad2: 0.0,
-                emission: vec3s(c.mat.emission),
-                mat_type: mat_type_u32(&c.mat),
+                _pad4: 0.0,
+            });
+        }
+        for c in &scene.cubes {
+            prims.push(GpuPrim {
+                kind: KIND_CUBE,
                 ior: mat_ior(&c.mat),
-                _pad3: [0.0; 3],
-            })
-            .collect();
-        let planes: Vec<GpuPlane> = scene
-            .planes
-            .iter()
-            .map(|p| GpuPlane {
-                point: vec3s(p.point),
+                mat_type: mat_type_u32(&c.mat),
                 _pad0: 0.0,
-                normal: vec3s(p.normal),
+                center: vec3s(c.min),
+                radius: 0.0,
+                normal: vec3s(c.max),
+                half_h: 0.0,
+                tangent: [0.0; 3],
                 _pad1: 0.0,
-                albedo: vec3s(p.mat.albedo),
+                bitangent: [0.0; 3],
                 _pad2: 0.0,
-                emission: vec3s(p.mat.emission),
-                mat_type: mat_type_u32(&p.mat),
+                albedo: vec3s(c.mat.albedo),
+                _pad3: 0.0,
+                emission: vec3s(c.mat.emission),
+                _pad4: 0.0,
+            });
+        }
+        for p in &scene.planes {
+            prims.push(GpuPrim {
+                kind: KIND_PLANE,
                 ior: mat_ior(&p.mat),
-                _pad3: [0.0; 3],
-            })
-            .collect();
+                mat_type: mat_type_u32(&p.mat),
+                _pad0: 0.0,
+                center: vec3s(p.point),
+                radius: 0.0,
+                normal: vec3s(p.normal),
+                half_h: 0.0,
+                tangent: [0.0; 3],
+                _pad1: 0.0,
+                bitangent: [0.0; 3],
+                _pad2: 0.0,
+                albedo: vec3s(p.mat.albedo),
+                _pad3: 0.0,
+                emission: vec3s(p.mat.emission),
+                _pad4: 0.0,
+            });
+        }
+        let n_prims = prims.len() as u32;
+        let bvh_nodes = build_bvh(&mut prims).unwrap_or_default();
         let lights: Vec<GpuLight> = scene.lights.iter().map(GpuLight::from_light_data).collect();
 
         // Storage buffers must be non-empty for WGSL arrayLength to be valid;
         // pad empty families to one zeroed element of the right stride.
-        let sphere_buf = upload_storage(
+        let prim_buf = upload_storage(
             &device,
             &queue,
-            bytemuck::cast_slice(&spheres),
-            std::mem::size_of::<GpuSphere>() as u64,
-            "spheres",
+            bytemuck::cast_slice(&prims),
+            std::mem::size_of::<GpuPrim>() as u64,
+            "prims",
         );
-        let quad_buf = upload_storage(
+        let bvh_buf = upload_storage(
             &device,
             &queue,
-            bytemuck::cast_slice(&quads),
-            std::mem::size_of::<GpuQuad>() as u64,
-            "quads",
-        );
-        let cube_buf = upload_storage(
-            &device,
-            &queue,
-            bytemuck::cast_slice(&cubes),
-            std::mem::size_of::<GpuCube>() as u64,
-            "cubes",
-        );
-        let plane_buf = upload_storage(
-            &device,
-            &queue,
-            bytemuck::cast_slice(&planes),
-            std::mem::size_of::<GpuPlane>() as u64,
-            "planes",
+            bytemuck::cast_slice(&bvh_nodes),
+            std::mem::size_of::<GpuBvhNode>() as u64,
+            "bvh_nodes",
         );
         let light_buf = upload_storage(
             &device,
@@ -427,7 +563,7 @@ impl GpuRenderer {
             mapped_at_creation: false,
         });
 
-        // --- Bind group: uniform + 5 read-only storage + 1 read-write storage ---
+        // --- Bind group: uniform + 3 read-only storage + 1 read-write storage ---
         let uniform_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -465,19 +601,15 @@ impl GpuRenderer {
                 storage_ro(1),
                 storage_ro(2),
                 storage_ro(3),
-                storage_ro(4),
-                storage_ro(5),
-                storage_rw(6),
+                storage_rw(4),
             ],
         });
 
         let res = StaticResources {
             bgl,
             uniform_buf,
-            sphere_buf,
-            quad_buf,
-            cube_buf,
-            plane_buf,
+            prim_buf,
+            bvh_buf,
             light_buf,
         };
         let bind_group = res.bind_group(&device, &accum_buf);
@@ -507,6 +639,7 @@ impl GpuRenderer {
             width,
             height,
             n_lights: scene.lights.len() as u32,
+            n_prims,
             samples: 0,
             reset: true,
             adapter_info,
@@ -591,7 +724,7 @@ impl GpuRenderer {
     /// GPU. Does not block on the GPU; call `read_pixels` when pixels are
     /// needed.
     pub fn render_frame(&mut self, cam: &crate::camera::Cam, max_depth: u32) {
-        self.render_frame_spp(cam, max_depth, 2);
+        self.render_frame_spp(cam, max_depth, 1);
     }
 
     /// Render one frame with `spp` samples per pixel (traced in a single
@@ -622,7 +755,7 @@ impl GpuRenderer {
             samples: self.samples,
             reset: if self.reset { 1 } else { 0 },
             spp: spp.max(1),
-            _pad0: 0,
+            n_prims: self.n_prims,
             _pad1: 0,
             _pad2: 0,
         };
@@ -696,8 +829,9 @@ impl GpuRenderer {
 
 /// Device descriptor shared by the standalone and windowed frontends.
 ///
-/// The BDPT shader binds 6 storage buffers (5 scene + 1 accum); downlevel
-/// defaults only allow 4. Request the standard WebGPU limits, which allow 8.
+/// The BDPT shader binds 4 storage buffers (prims + BVH nodes + lights +
+/// accum); downlevel defaults only allow 4. Request the standard WebGPU
+/// limits, which allow 8.
 pub(crate) fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
     wgpu::DeviceDescriptor {
         label: Some("bdpt-device"),
@@ -767,6 +901,7 @@ impl crate::renderer::Renderer for GpuRenderer {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::renderer::Renderer;
 
     /// The WGSL shader must parse and validate with the same naga version
@@ -784,6 +919,203 @@ mod tests {
         .validate(&module)
         .expect("WGSL validation failed");
         assert!(!module.entry_points.is_empty());
+    }
+
+    /// The flat BVH must be a valid traversal structure:
+    /// * every prim appears in exactly one leaf;
+    /// * leaf prim ranges are disjoint and cover all prims;
+    /// * inner nodes point at children inside the array, with the left
+    ///   child at index+1 (the pre-order invariant the shader relies on);
+    /// * every node's box contains its subtree's prim boxes.
+    #[test]
+    fn flat_bvh_is_a_valid_traversal_structure() {
+        use crate::scene::MaterialData;
+        let mut scene = crate::scene::SceneData::new();
+        // A spread of all four prim kinds, some overlapping.
+        for i in 0..8 {
+            let x = i as f32 * 0.7;
+            scene.add_sphere(
+                crate::math::Vec3::new(x, 0.4, -0.8),
+                0.4,
+                MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
+            );
+        }
+        scene.add_wall(
+            crate::math::Vec3::new(0.0, 0.0, -2.5),
+            crate::math::Vec3::new(0.0, 0.0, 1.0),
+            5.0,
+            2.0,
+            MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
+        );
+        scene.add_cube(
+            crate::math::Vec3::new(1.0, 0.3, 0.8),
+            0.6,
+            MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
+        );
+        scene.add_plane(
+            crate::math::Vec3::new(0.0, 0.0, 0.0),
+            crate::math::Vec3::new(0.0, 1.0, 0.0),
+            MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
+        );
+
+        let mut prims: Vec<GpuPrim> = Vec::new();
+        for s in &scene.spheres {
+            prims.push(GpuPrim {
+                kind: KIND_SPHERE,
+                ior: 1.0,
+                mat_type: 0,
+                _pad0: 0.0,
+                center: vec3s(s.center),
+                radius: s.radius,
+                normal: [0.0; 3],
+                half_h: 0.0,
+                tangent: [0.0; 3],
+                _pad1: 0.0,
+                bitangent: [0.0; 3],
+                _pad2: 0.0,
+                albedo: [0.0; 3],
+                _pad3: 0.0,
+                emission: [0.0; 3],
+                _pad4: 0.0,
+            });
+        }
+        for q in &scene.quads {
+            prims.push(GpuPrim {
+                kind: KIND_QUAD,
+                ior: 1.0,
+                mat_type: 0,
+                _pad0: 0.0,
+                center: vec3s(q.center),
+                radius: q.half_w,
+                normal: vec3s(q.normal),
+                half_h: q.half_h,
+                tangent: vec3s(q.tangent),
+                _pad1: 0.0,
+                bitangent: vec3s(q.bitangent),
+                _pad2: 0.0,
+                albedo: [0.0; 3],
+                _pad3: 0.0,
+                emission: [0.0; 3],
+                _pad4: 0.0,
+            });
+        }
+        for c in &scene.cubes {
+            prims.push(GpuPrim {
+                kind: KIND_CUBE,
+                ior: 1.0,
+                mat_type: 0,
+                _pad0: 0.0,
+                center: vec3s(c.min),
+                radius: 0.0,
+                normal: vec3s(c.max),
+                half_h: 0.0,
+                tangent: [0.0; 3],
+                _pad1: 0.0,
+                bitangent: [0.0; 3],
+                _pad2: 0.0,
+                albedo: [0.0; 3],
+                _pad3: 0.0,
+                emission: [0.0; 3],
+                _pad4: 0.0,
+            });
+        }
+        for p in &scene.planes {
+            prims.push(GpuPrim {
+                kind: KIND_PLANE,
+                ior: 1.0,
+                mat_type: 0,
+                _pad0: 0.0,
+                center: vec3s(p.point),
+                radius: 0.0,
+                normal: vec3s(p.normal),
+                half_h: 0.0,
+                tangent: [0.0; 3],
+                _pad1: 0.0,
+                bitangent: [0.0; 3],
+                _pad2: 0.0,
+                albedo: [0.0; 3],
+                _pad3: 0.0,
+                emission: [0.0; 3],
+                _pad4: 0.0,
+            });
+        }
+        let n = prims.len();
+        let nodes = build_bvh(&mut prims).expect("non-empty scene must build a BVH");
+        assert!(!nodes.is_empty());
+
+        // Walk the tree, collecting leaf ranges and checking invariants.
+        let mut covered = vec![false; n];
+        let mut stack = vec![0usize];
+        while let Some(idx) = stack.pop() {
+            let node = nodes[idx];
+            let (nmin, nmax) = (node.min, node.max);
+            if node.count > 0 {
+                let first = node.right_first as usize;
+                let count = node.count as usize;
+                assert!(first + count <= n, "leaf range out of bounds");
+                for i in 0..count {
+                    assert!(!covered[first + i], "prim covered by two leaves");
+                    covered[first + i] = true;
+                    let (pmin, pmax) = prim_bbox(&prims[first + i]);
+                    for a in 0..3 {
+                        assert!(pmin[a] >= nmin[a] - 1e-4 && pmax[a] <= nmax[a] + 1e-4);
+                    }
+                }
+            } else {
+                let left = idx + 1;
+                let right = node.right_first as usize;
+                assert!(left < nodes.len(), "left child out of bounds");
+                assert!(right < nodes.len(), "right child out of bounds");
+                assert!(right > idx, "right child must follow the node");
+                stack.push(left);
+                stack.push(right);
+            }
+        }
+        assert!(covered.iter().all(|c| *c), "every prim must be in a leaf");
+    }
+
+    /// A degenerate case: all prims at the same position. The median
+    /// split must still terminate and produce a valid tree (the sort is
+    /// stable on equal keys, and each side gets at least one prim).
+    #[test]
+    fn flat_bvh_handles_degenerate_scenes() {
+        let mut prims: Vec<GpuPrim> = Vec::new();
+        for _ in 0..16 {
+            prims.push(GpuPrim {
+                kind: KIND_SPHERE,
+                ior: 1.0,
+                mat_type: 0,
+                _pad0: 0.0,
+                center: [0.0, 0.0, 0.0],
+                radius: 0.5,
+                normal: [0.0; 3],
+                half_h: 0.0,
+                tangent: [0.0; 3],
+                _pad1: 0.0,
+                bitangent: [0.0; 3],
+                _pad2: 0.0,
+                albedo: [0.0; 3],
+                _pad3: 0.0,
+                emission: [0.0; 3],
+                _pad4: 0.0,
+            });
+        }
+        let nodes = build_bvh(&mut prims).expect("non-empty scene must build a BVH");
+        // 16 prims, median split: 15 inner nodes + 16 leaves = 31 nodes.
+        assert_eq!(nodes.len(), 31);
+        // Every leaf holds exactly one prim (the median split of an even
+        // count gives 8/8, then 4/4, 2/2, 1/1).
+        let leaves: Vec<_> = nodes.iter().filter(|nd| nd.count > 0).collect();
+        assert_eq!(leaves.len(), 16);
+        assert!(leaves.iter().all(|nd| nd.count == 1));
+    }
+
+    /// The empty scene must produce no nodes (the shader skips traversal
+    /// when n_prims == 0).
+    #[test]
+    fn flat_bvh_empty_scene() {
+        let mut prims: Vec<GpuPrim> = Vec::new();
+        assert!(build_bvh(&mut prims).is_none());
     }
 
     /// Smoke test: GpuRenderer::new must either succeed or fail with a

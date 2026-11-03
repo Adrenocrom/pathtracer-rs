@@ -1,4 +1,6 @@
 // Bidirectional path tracing with MIS, ported 1:1 from src/bdpt.rs.
+// Intersection runs on a flat BVH built on the CPU (src/gpu.rs) and
+// traversed here with an explicit stack — see the Intersection section.
 //
 // Surfaces carry a general BSDF (diffuse, mirror, glass). Subpaths sample
 // directions with the BSDF's own distribution, and the MIS weights are
@@ -46,78 +48,55 @@ struct Uniforms {
     samples: u32,        // samples already accumulated in `accum`
     reset: u32,
     spp: u32,            // samples traced per pixel in this dispatch
-    _pad0: u32,
+    n_prims: u32,        // scene prims; 0 = empty scene, skip traversal
     _pad1: u32,
     _pad2: u32,
 };
 
-// Material structs: mat_type is 0 diffuse / 1 emissive / 2 mirror /
-// 3 glass, and ior carries the glass interior index (1.0 otherwise).
-// Layout note: ior takes the place of the first scalar of the old
-// trailing vec3 pad. A vec3<f32> member would force 16-byte alignment
-// and grow the struct, so the remaining pad is two plain f32s (plus
-// the implicit tail padding) — the strides stay 64/112/80/80 and match
-// the compile-time asserts in gpu.rs.
-
-struct GpuSphere {
-    center: vec3<f32>,
-    radius: f32,
-    albedo: vec3<f32>,
-    _pad0: f32,
-    emission: vec3<f32>,
-    mat_type: u32,
+// One scene primitive, whichever kind — the GPU shape of the scene's
+// spheres/quads/cubes/planes, kind-tagged so a single array (and a single
+// BVH leaf range) can hold them all. The families share slots: the cube's
+// min/max live in center/normal, the quad's half_w lives in radius, and
+// tangent/bitangent exist only for quads. mat_type is 0 diffuse / 1
+// emissive / 2 mirror / 3 glass; ior carries the glass interior index
+// (1.0 otherwise).
+//
+// Layout rule: every vec3<f32> is immediately followed by an f32/u32 so
+// WGSL's implicit 16-byte alignment never inserts padding that Rust's
+// #[repr(C)] doesn't have. Stride 112, matching GpuPrim in gpu.rs.
+struct Prim {
+    kind: u32,              // KIND_SPHERE / KIND_QUAD / KIND_CUBE / KIND_PLANE
     ior: f32,
-    _pad1: f32,
-    _pad2: f32,
-};
-
-struct GpuQuad {
-    center: vec3<f32>,
-    half_w: f32,
-    normal: vec3<f32>,
-    half_h: f32,
-    tangent: vec3<f32>,
-    _pad0: f32,
-    bitangent: vec3<f32>,
-    _pad1: f32,
-    albedo: vec3<f32>,
-    _pad2: f32,
-    emission: vec3<f32>,
     mat_type: u32,
-    ior: f32,
+    _pad0: f32,
+    center: vec3<f32>,      // sphere/quad center, plane point, cube min
+    radius: f32,            // sphere radius, quad half_w
+    normal: vec3<f32>,      // quad/plane normal, cube max
+    half_h: f32,            // quad half_h
+    tangent: vec3<f32>,     // quad tangent
+    _pad1: f32,
+    bitangent: vec3<f32>,   // quad bitangent
+    _pad2: f32,
+    albedo: vec3<f32>,
     _pad3: f32,
+    emission: vec3<f32>,
     _pad4: f32,
-    _pad5: f32,
 };
 
-struct GpuCube {
+// One flat BVH node, 32 bytes (matching GpuBvhNode in gpu.rs).
+//
+// * Leaf (count > 0): right_first indexes the first prim of a contiguous
+//   run of `count` prims — the prim array is uploaded in leaf order, so a
+//   leaf needs no per-prim indirection.
+// * Inner (count == 0): right_first is the right child's node index; the
+//   left child is always this node's index + 1, because the builder emits
+//   nodes in pre-order (the same layout trick as pbrt's LinearBVHNode),
+//   so no second child field is needed.
+struct BvhNode {
     min: vec3<f32>,
-    _pad0: f32,
+    right_first: u32,
     max: vec3<f32>,
-    _pad1: f32,
-    albedo: vec3<f32>,
-    _pad2: f32,
-    emission: vec3<f32>,
-    mat_type: u32,
-    ior: f32,
-    _pad3: f32,
-    _pad4: f32,
-    _pad5: f32,
-};
-
-struct GpuPlane {
-    point: vec3<f32>,
-    _pad0: f32,
-    normal: vec3<f32>,
-    _pad1: f32,
-    albedo: vec3<f32>,
-    _pad2: f32,
-    emission: vec3<f32>,
-    mat_type: u32,
-    ior: f32,
-    _pad3: f32,
-    _pad4: f32,
-    _pad5: f32,
+    count: u32,
 };
 
 struct GpuLight {
@@ -212,12 +191,10 @@ const TRANSPORT_RADIANCE: u32 = 0u;
 const TRANSPORT_IMPORTANCE: u32 = 1u;
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var<storage, read> spheres: array<GpuSphere>;
-@group(0) @binding(2) var<storage, read> quads: array<GpuQuad>;
-@group(0) @binding(3) var<storage, read> cubes: array<GpuCube>;
-@group(0) @binding(4) var<storage, read> planes: array<GpuPlane>;
-@group(0) @binding(5) var<storage, read> lights: array<GpuLight>;
-@group(0) @binding(6) var<storage, read_write> accum: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> prims: array<Prim>;
+@group(0) @binding(2) var<storage, read> bvh_nodes: array<BvhNode>;
+@group(0) @binding(3) var<storage, read> lights: array<GpuLight>;
+@group(0) @binding(4) var<storage, read_write> accum: array<vec4<f32>>;
 
 // --- RNG: PCG32 (stateless-seedable, standard for GPU path tracing) ---
 
@@ -237,108 +214,160 @@ fn normalize3(v: vec3<f32>) -> vec3<f32> {
     return v / l;
 }
 
-// --- Intersection: brute force over all primitives (scene is small) ---
+// --- Intersection: flat BVH traversal ---
+//
+// The scene is uploaded as a kind-tagged prim array plus a flat BVH
+// (built on the CPU, src/gpu.rs). Traversal keeps an explicit stack of
+// pending nodes (the GPU analogue of the CPU BVH's recursion) and
+// culls every box by the current best hit distance — the analogue of
+// the CPU's subtree early-exit test. The builder caps the tree depth
+// at 24, and a pop-based traversal of a depth-d binary tree holds at
+// most d+1 pending nodes, so the 32-entry stack cannot overflow (the
+// bounds guards make it impossible even for a degenerate tree).
 
-fn intersect_sphere(s: GpuSphere, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function, Hit>) {
-    let oc = origin - s.center;
-    let a = dot(dir, dir);
-    let b = 2.0 * dot(oc, dir);
-    let c = dot(oc, oc) - s.radius * s.radius;
-    let disc = b * b - 4.0 * a * c;
-    if (disc < 0.0) { return; }
-    let sqrt_d = sqrt(disc);
-    var t = (-b - sqrt_d) / (2.0 * a);
-    if (t < EPS_NEAR) { t = (-b + sqrt_d) / (2.0 * a); }
-    if (t < EPS_NEAR || t >= (*best).t) { return; }
-    let p = origin + dir * t;
-    (*best).t = t;
-    (*best).p = p;
-    (*best).normal = normalize3(p - s.center);
-    (*best).albedo = s.albedo;
-    (*best).emission = s.emission;
-    (*best).mat_type = s.mat_type;
-    (*best).ior = s.ior;
-}
+const KIND_SPHERE: u32 = 0u;
+const KIND_QUAD: u32 = 1u;
+const KIND_CUBE: u32 = 2u;
+const KIND_PLANE: u32 = 3u;
+// The builder caps the tree depth at MAX_BVH_DEPTH; a pop-based
+// traversal of a depth-d binary tree holds at most d+1 pending nodes,
+// so a 32-entry stack can never overflow (the guards below make it
+// impossible even for a degenerate tree).
+const MAX_BVH_STACK: u32 = 32u;
 
-fn intersect_quad(q: GpuQuad, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function, Hit>) {
-    let denom = dot(q.normal, dir);
-    if (abs(denom) < 1e-6) { return; }
-    let t = dot(q.center - origin, q.normal) / denom;
-    if (t < EPS_NEAR || t >= (*best).t) { return; }
-    let p = origin + dir * t;
-    let local = p - q.center;
-    if (abs(dot(local, q.tangent)) > q.half_w || abs(dot(local, q.bitangent)) > q.half_h) { return; }
-    (*best).t = t;
-    (*best).p = p;
-    (*best).normal = q.normal;
-    (*best).albedo = q.albedo;
-    (*best).emission = q.emission;
-    (*best).mat_type = q.mat_type;
-    (*best).ior = q.ior;
-}
-
-fn intersect_cube(c: GpuCube, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function, Hit>) {
-    var t_min = -3.4e38;
-    var t_max = 3.4e38;
-    // Slab test per axis; unrolled to avoid indexing overhead.
+// Slab test of one AABB against the ray segment [0, t_max). Returns
+// false when the box is behind the ray or beyond the current best hit.
+// Axis-parallel rays are handled explicitly (checking the direction,
+// never the reciprocal — 1/0 is inf and 0*inf is NaN) so a parallel
+// slab can never produce a NaN that silently drops valid hits. This is
+// the WGSL shape of math.rs's BBox::intersect.
+fn aabb_hit(bmin: vec3<f32>, bmax: vec3<f32>, origin: vec3<f32>,
+            dir: vec3<f32>, inv_dir: vec3<f32>, t_max: f32) -> bool {
+    var t_min = 0.0;
+    var t_max_slab = t_max;
     for (var i = 0u; i < 3u; i = i + 1u) {
         let d = dir[i];
-        let o = origin[i];
-        let lo = c.min[i];
-        let hi = c.max[i];
         if (d == 0.0) {
-            if (o < lo || o > hi) { return; }
+            // Parallel to this slab: the origin must lie inside it.
+            if (origin[i] < bmin[i] || origin[i] > bmax[i]) { return false; }
             continue;
         }
-        let inv_d = 1.0 / d;
-        var t0 = (lo - o) * inv_d;
-        var t1 = (hi - o) * inv_d;
+        let inv = inv_dir[i];
+        var t0 = (bmin[i] - origin[i]) * inv;
+        var t1 = (bmax[i] - origin[i]) * inv;
         if (t0 > t1) {
             let tmp = t0;
             t0 = t1;
             t1 = tmp;
         }
         t_min = max(t_min, t0);
-        t_max = min(t_max, t1);
+        t_max_slab = min(t_max_slab, t1);
+        if (t_min > t_max_slab) { return false; }
     }
-    if (!(t_max >= t_min && t_max > 0.0 && t_min < 1e6)) { return; }
-    var t = t_min;
-    if (t < EPS_NEAR) { t = t_max; }
-    if (t < EPS_NEAR || t >= (*best).t) { return; }
-    let p = origin + dir * t;
-    // Outward normal of the face closest to the hit point (same rule as
-    // geometry.rs so top/+x/+z hits shade identically).
-    let d0 = abs(p.x - c.min.x); let d1 = abs(p.x - c.max.x);
-    let d2 = abs(p.y - c.min.y); let d3 = abs(p.y - c.max.y);
-    let d4 = abs(p.z - c.min.z); let d5 = abs(p.z - c.max.z);
-    var best_d = d0;
-    var normal = vec3<f32>(-1.0, 0.0, 0.0);
-    if (d1 < best_d) { best_d = d1; normal = vec3<f32>(1.0, 0.0, 0.0); }
-    if (d2 < best_d) { best_d = d2; normal = vec3<f32>(0.0, -1.0, 0.0); }
-    if (d3 < best_d) { best_d = d3; normal = vec3<f32>(0.0, 1.0, 0.0); }
-    if (d4 < best_d) { best_d = d4; normal = vec3<f32>(0.0, 0.0, -1.0); }
-    if (d5 < best_d) { best_d = d5; normal = vec3<f32>(0.0, 0.0, 1.0); }
-    (*best).t = t;
-    (*best).p = p;
-    (*best).normal = normal;
-    (*best).albedo = c.albedo;
-    (*best).emission = c.emission;
-    (*best).mat_type = c.mat_type;
-    (*best).ior = c.ior;
+    return true;
 }
 
-fn intersect_plane(pl: GpuPlane, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function, Hit>) {
-    let denom = dot(pl.normal, dir);
+fn intersect_prim(p: Prim, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function, Hit>) {
+    if (p.kind == KIND_SPHERE) {
+        let oc = origin - p.center;
+        let a = dot(dir, dir);
+        let b = 2.0 * dot(oc, dir);
+        let c = dot(oc, oc) - p.radius * p.radius;
+        let disc = b * b - 4.0 * a * c;
+        if (disc < 0.0) { return; }
+        let sqrt_d = sqrt(disc);
+        var t = (-b - sqrt_d) / (2.0 * a);
+        if (t < EPS_NEAR) { t = (-b + sqrt_d) / (2.0 * a); }
+        if (t < EPS_NEAR || t >= (*best).t) { return; }
+        let hp = origin + dir * t;
+        (*best).t = t;
+        (*best).p = hp;
+        (*best).normal = normalize3(hp - p.center);
+        (*best).albedo = p.albedo;
+        (*best).emission = p.emission;
+        (*best).mat_type = p.mat_type;
+        (*best).ior = p.ior;
+        return;
+    }
+    if (p.kind == KIND_QUAD) {
+        let denom = dot(p.normal, dir);
+        if (abs(denom) < 1e-6) { return; }
+        let t = dot(p.center - origin, p.normal) / denom;
+        if (t < EPS_NEAR || t >= (*best).t) { return; }
+        let hp = origin + dir * t;
+        let local = hp - p.center;
+        if (abs(dot(local, p.tangent)) > p.radius || abs(dot(local, p.bitangent)) > p.half_h) { return; }
+        (*best).t = t;
+        (*best).p = hp;
+        (*best).normal = p.normal;
+        (*best).albedo = p.albedo;
+        (*best).emission = p.emission;
+        (*best).mat_type = p.mat_type;
+        (*best).ior = p.ior;
+        return;
+    }
+    if (p.kind == KIND_CUBE) {
+        var t_min = -3.4e38;
+        var t_max = 3.4e38;
+        // Slab test per axis; unrolled to avoid indexing overhead.
+        for (var i = 0u; i < 3u; i = i + 1u) {
+            let d = dir[i];
+            let o = origin[i];
+            let lo = p.center[i]; // cube min
+            let hi = p.normal[i]; // cube max
+            if (d == 0.0) {
+                if (o < lo || o > hi) { return; }
+                continue;
+            }
+            let inv_d = 1.0 / d;
+            var t0 = (lo - o) * inv_d;
+            var t1 = (hi - o) * inv_d;
+            if (t0 > t1) {
+                let tmp = t0;
+                t0 = t1;
+                t1 = tmp;
+            }
+            t_min = max(t_min, t0);
+            t_max = min(t_max, t1);
+        }
+        if (!(t_max >= t_min && t_max > 0.0 && t_min < 1e6)) { return; }
+        var t = t_min;
+        if (t < EPS_NEAR) { t = t_max; }
+        if (t < EPS_NEAR || t >= (*best).t) { return; }
+        let hp = origin + dir * t;
+        // Outward normal of the face closest to the hit point (same rule as
+        // geometry.rs so top/+x/+z hits shade identically).
+        let d0 = abs(hp.x - p.center.x); let d1 = abs(hp.x - p.normal.x);
+        let d2 = abs(hp.y - p.center.y); let d3 = abs(hp.y - p.normal.y);
+        let d4 = abs(hp.z - p.center.z); let d5 = abs(hp.z - p.normal.z);
+        var best_d = d0;
+        var normal = vec3<f32>(-1.0, 0.0, 0.0);
+        if (d1 < best_d) { best_d = d1; normal = vec3<f32>(1.0, 0.0, 0.0); }
+        if (d2 < best_d) { best_d = d2; normal = vec3<f32>(0.0, -1.0, 0.0); }
+        if (d3 < best_d) { best_d = d3; normal = vec3<f32>(0.0, 1.0, 0.0); }
+        if (d4 < best_d) { best_d = d4; normal = vec3<f32>(0.0, 0.0, -1.0); }
+        if (d5 < best_d) { best_d = d5; normal = vec3<f32>(0.0, 0.0, 1.0); }
+        (*best).t = t;
+        (*best).p = hp;
+        (*best).normal = normal;
+        (*best).albedo = p.albedo;
+        (*best).emission = p.emission;
+        (*best).mat_type = p.mat_type;
+        (*best).ior = p.ior;
+        return;
+    }
+    // KIND_PLANE
+    let denom = dot(p.normal, dir);
     if (abs(denom) < 1e-6) { return; }
-    let t = dot(pl.point - origin, pl.normal) / denom;
+    let t = dot(p.center - origin, p.normal) / denom;
     if (t < EPS_NEAR || t >= (*best).t) { return; }
     (*best).t = t;
     (*best).p = origin + dir * t;
-    (*best).normal = pl.normal;
-    (*best).albedo = pl.albedo;
-    (*best).emission = pl.emission;
-    (*best).mat_type = pl.mat_type;
-    (*best).ior = pl.ior;
+    (*best).normal = p.normal;
+    (*best).albedo = p.albedo;
+    (*best).emission = p.emission;
+    (*best).mat_type = p.mat_type;
+    (*best).ior = p.ior;
 }
 
 fn intersect_scene(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
@@ -350,17 +379,46 @@ fn intersect_scene(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     best.emission = vec3<f32>(0.0);
     best.mat_type = 0u;
     best.ior = 1.0;
-    for (var i = 0u; i < arrayLength(&spheres); i = i + 1u) {
-        intersect_sphere(spheres[i], origin, dir, &best);
+    if (uniforms.n_prims == 0u) { return best; }
+
+    // Precompute the reciprocals once per ray; the per-node slab tests
+    // reuse them. A zero direction component would be a division by
+    // zero, so those lanes keep a dummy 1.0 — aabb_hit tests the raw
+    // direction for zero first and never consumes the dummy.
+    var inv_dir = vec3<f32>(1.0);
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        if (dir[i] != 0.0) {
+            inv_dir[i] = 1.0 / dir[i];
+        }
     }
-    for (var i = 0u; i < arrayLength(&quads); i = i + 1u) {
-        intersect_quad(quads[i], origin, dir, &best);
-    }
-    for (var i = 0u; i < arrayLength(&cubes); i = i + 1u) {
-        intersect_cube(cubes[i], origin, dir, &best);
-    }
-    for (var i = 0u; i < arrayLength(&planes); i = i + 1u) {
-        intersect_plane(planes[i], origin, dir, &best);
+    var stack: array<u32, MAX_BVH_STACK>;
+    var sp = 0u;
+    stack[0] = 0u; // root
+    sp = 1u;
+    while (sp > 0u) {
+        sp = sp - 1u;
+        let cur = stack[sp];
+        let node = bvh_nodes[cur];
+        if (!aabb_hit(node.min, node.max, origin, dir, inv_dir, best.t)) { continue; }
+        if (node.count > 0u) {
+            // Leaf: a contiguous run of prims, tested in order.
+            for (var i = 0u; i < node.count; i = i + 1u) {
+                intersect_prim(prims[node.right_first + i], origin, dir, &best);
+            }
+            continue;
+        }
+        // Inner: left child is cur+1 (pre-order layout), right child is
+        // right_first. Push both; the pop order visits the left subtree
+        // first, which tends to find the near hit early and lets the
+        // best.t culling skip the right subtree's boxes.
+        if (sp < MAX_BVH_STACK) {
+            stack[sp] = node.right_first;
+            sp = sp + 1u;
+        }
+        if (sp < MAX_BVH_STACK) {
+            stack[sp] = cur + 1u;
+            sp = sp + 1u;
+        }
     }
     return best;
 }

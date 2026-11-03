@@ -271,8 +271,9 @@ demo.
    bright-region smoothing test that the current filter fails.
 4. **JSON scene format** — serde + loader; `build_scene()` becomes
    `scenes/demo.json` (embedded via `include_str!` for tests). This is
-   the prerequisite that justifies bigger scenes — and only then the
-   WGSL BVH (explicitly deferred until it exists).
+   the prerequisite that justifies bigger scenes — the WGSL BVH now
+   exists (flat-array traversal in `shaders/bdpt.wgsl`, built in
+   `src/gpu.rs`), so larger scenes scale on both backends.
 5. *(stretch)* **Environment map** — an infinite-area light vertex
    type in BDPT (directional pdf, no G/π structure; the "ray escapes"
    strategy connects to the env instead of returning `BACKGROUND`).

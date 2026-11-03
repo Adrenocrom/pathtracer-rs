@@ -19,7 +19,7 @@ A high-performance, interactive path tracer rendered directly in the terminal us
     - **Extended Reinhard Tone Mapping:** Maps the scene white point to display white (`c(1+c/W²)/(1+c)`), so highlights roll off to pure white instead of plateauing below it.
     - **Gamma Correction:** Linear-to-sRGB conversion (γ = 2.2) for natural lighting.
 - **High-Quality Export:** Trigger a full FHD (1920×1080) render at 1024 samples per pixel with up to 8 bounces, saved as a PNG with a progress bar (terminal) or in background batches (window).
-- **BVH Acceleration:** Scene geometry is organized in a bounding volume hierarchy (median split along the widest axis, with a subtree early-exit test) for fast ray intersection. The room walls are finite quads, not infinite planes, so their bounding boxes are tight and the BVH can actually cull.
+- **BVH Acceleration:** Scene geometry is organized in a bounding volume hierarchy (median split along the widest axis, with a subtree early-exit test) for fast ray intersection. The room walls are finite quads, not infinite planes, so their bounding boxes are tight and the BVH can actually cull. Both backends use one: the CPU renderer walks a trait-object tree, the GPU renderer traverses a flat BVH (built on the CPU, uploaded as two storage buffers) with an explicit stack in the shader.
 
 ## 🎮 Controls
 
@@ -50,7 +50,7 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 ## 🛠️ Technical Details
 
 - **Language:** Rust
-- **Parallelism:** Powered by `rayon` for multi-core ray tracing (preview and FHD renders); the GPU backend uses one wgpu compute thread per pixel.
+- **Parallelism:** Powered by `rayon` for multi-core ray tracing (preview and FHD renders); the GPU backend uses one wgpu compute thread per pixel, intersecting through a flat BVH (one kind-tagged prim array + a 32-byte-node tree, both uploaded once).
 - **Terminal Handling:** `crossterm` for raw mode, alternate screen, and ANSI 24-bit color sequences.
 - **Windowing:** `winit` 0.30 (`ApplicationHandler`) with a wgpu 30 surface; the display pass reads the accumulation buffer directly (no readback).
 - **Image Processing:** `image` crate for PNG export.
@@ -84,4 +84,4 @@ cargo test
 The test suite covers the MIS weights (hand-computed values and sum-to-one), light-transport sanity checks (direct hits, shadows, energy bounds), geometry intersection, the bilateral denoiser, temporal accumulation, and offline WGSL validation of both shaders.
 
 ## 📈 Rendering Pipeline
-`Ray Generation` $\rightarrow$ `Intersection Testing (BVH)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Extended Reinhard Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output / wgpu Surface`
+`Ray Generation` $\rightarrow$ `Intersection Testing (BVH, CPU tree / GPU flat-array traversal)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Extended Reinhard Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output / wgpu Surface`
