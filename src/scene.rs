@@ -251,8 +251,9 @@ pub struct PlaneData {
 
 /// A closed cylinder in flat form: `base` is the center of the base cap,
 /// `axis` the unit direction from base to top, `half_h` the half-height.
-/// For a laser, the housing cylinder is diffuse and the aperture is a
-/// separate thin cylinder puck of laser material (see `add_light`).
+/// Regular cylinders are added via `add_cylinder`; for a laser, the
+/// housing cylinder is diffuse and the aperture is a separate thin
+/// cylinder puck of laser material (see `add_light`).
 #[derive(Clone, Copy)]
 pub struct CylinderData {
     pub base: Vec3,
@@ -308,11 +309,70 @@ impl SceneData {
         });
     }
 
+    /// Add a cube (equal extents on all axes). For a rectangular box
+    /// (a "Quader") with different extents per axis, use `add_box`.
     pub fn add_cube(&mut self, center: Vec3, size: f32, mat: MaterialData) {
         let half = size * 0.5;
         self.cubes.push(CubeData {
             min: center - Vec3::new(half, half, half),
             max: center + Vec3::new(half, half, half),
+            mat,
+        });
+    }
+
+    /// Add an axis-aligned rectangular box (cuboid) — like `add_cube`,
+    /// but with independent extents per axis. `size` is the *full*
+    /// extent along each axis (x, y, z), matching `add_cube`'s
+    /// convention: `add_box(c, Vec3::new(s, s, s), m)` equals
+    /// `add_cube(c, s, m)`.
+    ///
+    /// Unlike a wall (a one-sided quad), a box shades from all sides:
+    /// each of the six faces carries its own outward normal, so it can
+    /// serve as a slab, pillar, table top or any block seen from
+    /// multiple directions.
+    ///
+    /// The box is stored as min/max — exactly what both backends
+    /// consume (the CPU `Cube` and the GPU's slab test both read
+    /// min/max), so no backend changes are involved.
+    ///
+    /// Not used by the demo scene, but part of the scene API — covered
+    /// by tests and available for future scenes.
+    #[allow(dead_code)]
+    pub fn add_box(&mut self, center: Vec3, size: Vec3, mat: MaterialData) {
+        let half = size * 0.5;
+        self.cubes.push(CubeData {
+            min: center - half,
+            max: center + half,
+            mat,
+        });
+    }
+
+    /// Add a closed cylinder as a regular scene object: centered at
+    /// `center`, axis along `axis` (any length; normalized internally),
+    /// total height `height`, radius `radius`. The caps are one-sided
+    /// (they shade only from outside), the curved side shades from both
+    /// sides. Works with any material — diffuse, mirror, glass, or even
+    /// emissive (though for a light source prefer `add_light`, which
+    /// also registers it as a sampleable emitter).
+    ///
+    /// Not used by the demo scene (its only cylinders are the laser
+    /// housing and puck, registered via `add_light`), but part of the
+    /// scene API — covered by tests and available for future scenes.
+    #[allow(dead_code)]
+    pub fn add_cylinder(
+        &mut self,
+        center: Vec3,
+        axis: Vec3,
+        height: f32,
+        radius: f32,
+        mat: MaterialData,
+    ) {
+        let axis = axis.normalize();
+        self.cylinders.push(CylinderData {
+            base: center - axis * (height * 0.5),
+            axis,
+            radius,
+            half_h: height * 0.5,
             mat,
         });
     }
@@ -527,8 +587,8 @@ impl SceneData {
                 mat: c.mat.to_material(),
             }));
         }
-        // Emitter geometry is already part of `spheres`/`quads` —
-        // `add_light` registers it — so it must not be added again here.
+        // Emitter geometry is already part of `spheres`/`quads`/`cylinders`
+        // — `add_light` registers it — so it must not be added again here.
         let scene = crate::bvh::BVHNode::build(objects).expect("scene is non-empty");
         let lights = self.lights.iter().map(|l| self.cpu_light(l)).collect();
         (scene, lights)
@@ -687,6 +747,157 @@ mod tests {
             bbox
         );
         assert!(bbox.max.x - bbox.min.x <= 1e-4, "x extent: {:?}", bbox);
+    }
+
+    /// A cylinder added via `add_cylinder` must be a regular scene
+    /// object: real geometry on both backends (the GPU uploads the
+    /// `cylinders` array like any other primitive family), with the
+    /// flat form matching `geometry::Cylinder::new` (base at
+    /// center - axis*height/2, unit axis, half_h = height/2) — and
+    /// *not* a light: only `add_light` registers sampleable emitters.
+    #[test]
+    fn add_cylinder_is_a_regular_scene_object() {
+        let mut scene = SceneData::new();
+        scene.add_cylinder(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0), // non-unit on purpose: must normalize
+            2.0,
+            0.5,
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        assert_eq!(scene.cylinders.len(), 1);
+        assert!(scene.lights.is_empty());
+        let c = &scene.cylinders[0];
+        assert!((c.base - Vec3::new(0.0, 0.0, 0.0)).length() < 1e-6);
+        assert!((c.axis - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-6);
+        assert!((c.half_h - 1.0).abs() < 1e-6);
+        assert!((c.radius - 0.5).abs() < 1e-6);
+        // Intersectable on the CPU: the curved side and the top cap.
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        assert!(lights.is_empty());
+        let side = crate::geometry::Ray {
+            origin: Vec3::new(2.0, 1.0, 0.0),
+            direction: Vec3::new(-1.0, 0.0, 0.0),
+        };
+        let hit = cpu_scene
+            .intersect(&side)
+            .expect("the curved side must be intersectable");
+        assert!((hit.p - Vec3::new(0.5, 1.0, 0.0)).length() < 1e-4);
+        let cap = crate::geometry::Ray {
+            origin: Vec3::new(0.0, 3.0, 0.0),
+            direction: Vec3::new(0.0, -1.0, 0.0),
+        };
+        let hit = cpu_scene
+            .intersect(&cap)
+            .expect("the top cap must be intersectable");
+        assert!((hit.p - Vec3::new(0.0, 2.0, 0.0)).length() < 1e-4);
+    }
+
+    /// A box added via `add_box` must be a regular scene object with
+    /// independent per-axis extents — the whole point over `add_cube`
+    /// (which forces equal extents) and over `add_wall` (a one-sided
+    /// quad: it shades only from its normal direction, so a wall used
+    /// as a table top is black from below). A box must shade from all
+    /// six sides, each face with its own outward normal.
+    #[test]
+    fn add_box_is_a_regular_scene_object() {
+        let mut scene = SceneData::new();
+        // A 4 x 1 x 2 box centered at (0, 0.5, 0): a flat slab.
+        scene.add_box(
+            Vec3::new(0.0, 0.5, 0.0),
+            Vec3::new(4.0, 1.0, 2.0),
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        assert_eq!(scene.cubes.len(), 1);
+        assert!(scene.lights.is_empty());
+        let c = &scene.cubes[0];
+        assert_eq!(c.min, Vec3::new(-2.0, 0.0, -1.0));
+        assert_eq!(c.max, Vec3::new(2.0, 1.0, 1.0));
+        // The bbox must be tight (a box, not a ±1e6 plane box).
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        assert!(lights.is_empty());
+        let bbox = cpu_scene.bounding_box();
+        assert_eq!(bbox.min, Vec3::new(-2.0, 0.0, -1.0));
+        assert_eq!(bbox.max, Vec3::new(2.0, 1.0, 1.0));
+
+        // All six faces shade, each with its own outward normal.
+        let faces = [
+            // (ray origin, expected hit point, expected normal)
+            (
+                Vec3::new(0.0, 3.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ),
+            (
+                Vec3::new(0.0, -3.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+            ),
+            (
+                Vec3::new(3.0, 0.5, 0.0),
+                Vec3::new(2.0, 0.5, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+            ),
+            (
+                Vec3::new(-3.0, 0.5, 0.0),
+                Vec3::new(-2.0, 0.5, 0.0),
+                Vec3::new(-1.0, 0.0, 0.0),
+            ),
+            (
+                Vec3::new(0.0, 0.5, 3.0),
+                Vec3::new(0.0, 0.5, 1.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ),
+            (
+                Vec3::new(0.0, 0.5, -3.0),
+                Vec3::new(0.0, 0.5, -1.0),
+                Vec3::new(0.0, 0.0, -1.0),
+            ),
+        ];
+        for (origin, expected_p, expected_n) in faces {
+            let ray = crate::geometry::Ray {
+                origin,
+                direction: (Vec3::new(0.0, 0.5, 0.0) - origin).normalize(),
+            };
+            let hit = cpu_scene
+                .intersect(&ray)
+                .expect("every face of the box must be intersectable");
+            assert!(
+                (hit.p - expected_p).length() < 1e-4,
+                "hit {:?}, expected {:?}",
+                hit.p,
+                expected_p
+            );
+            assert!(
+                (hit.normal - expected_n).length() < 1e-4,
+                "normal {:?}, expected {:?}",
+                hit.normal,
+                expected_n
+            );
+        }
+
+        // Rays outside the box's extents miss (a plane would hit).
+        let beside = crate::geometry::Ray {
+            origin: Vec3::new(3.0, 3.0, 0.0),
+            direction: Vec3::new(0.0, -1.0, 0.0),
+        };
+        assert!(cpu_scene.intersect(&beside).is_none());
+
+        // `add_box` with equal extents equals `add_cube`.
+        let mut a = SceneData::new();
+        a.add_box(
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(0.6, 0.6, 0.6),
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        let mut b = SceneData::new();
+        b.add_cube(
+            Vec3::new(1.0, 2.0, 3.0),
+            0.6,
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        assert_eq!(a.cubes[0].min, b.cubes[0].min);
+        assert_eq!(a.cubes[0].max, b.cubes[0].max);
     }
 
     /// A light added *only* via `add_light` must be real geometry: the GPU
