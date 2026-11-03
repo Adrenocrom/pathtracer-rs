@@ -44,6 +44,13 @@ impl Vec3 {
         self.x * other.x + self.y * other.y + self.z * other.z
     }
 
+    /// Rec. 709 relative luminance. The scalar statistic the firefly
+    /// rejection works on (a color can be an outlier only if its
+    /// luminance is).
+    pub fn luminance(self) -> f32 {
+        self.dot(Vec3::new(0.2126, 0.7152, 0.0722))
+    }
+
     pub fn cross(self, other: Vec3) -> Vec3 {
         Vec3::new(
             self.y * other.z - self.z * other.y,

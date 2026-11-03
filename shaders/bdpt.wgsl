@@ -49,7 +49,7 @@ struct Uniforms {
     reset: u32,
     spp: u32,            // samples traced per pixel in this dispatch
     n_prims: u32,        // scene prims; 0 = empty scene, skip traversal
-    _pad1: u32,
+    firefly_clamp: f32,  // per-sample luminance clamp bound (0 = disable)
     _pad2: u32,
 };
 
@@ -1168,6 +1168,54 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
     return total;
 }
 
+// --- Firefly rejection ---
+//
+// Caustic and mirror paths are sampled by BDPT's specular-chain
+// strategies, which succeed rarely and carry a huge throughput when
+// they do. One lucky sample with radiance ~50 landing in a pixel whose
+// true mean is ~0.05 enters the running average at full weight and
+// then only dilutes as 1/n — a persistent white dot (everything at or
+// above the tone-map white point displays as pure white, so the dot is
+// saturated from the first frame it lands). Two complementary controls
+// remove it: the per-sample clamp below (bounds the magnitude) and the
+// temporal outlier rejection in the accumulation block of `main` (stops
+// it from sticking). The CPU applies the same two controls in
+// src/bdpt.rs and src/renderer.rs.
+
+// Rec. 709 relative luminance (same weights as Vec3::luminance).
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// Clamp one sample's luminance to `bound`, preserving its chroma.
+// `bound` comes from the `firefly_clamp` uniform, computed on the CPU
+// (src/bdpt.rs::firefly_clamp_bound) as a loose multiple of the
+// brightest emitter's luminance — loose because a rare legitimate
+// caustic sample is per-sample indistinguishable from a firefly (both
+// are huge relative to the pixel mean; the caustic's estimator is a
+// rare-event one), so only the physically implausible tail is clamped
+// here and the mean-aware temporal rejection handles the rest.
+// 0 disables the clamp.
+fn clamp_sample(c: vec3<f32>, bound: f32) -> vec3<f32> {
+    if (bound <= 0.0) { return c; }
+    let lum = luminance(c);
+    if (lum > bound && lum > 0.0) {
+        return c * (bound / lum);
+    }
+    return c;
+}
+
+// Temporal outlier rejection: a batch whose mean luminance exceeds the
+// running mean by more than this many standard deviations is scaled
+// down to that bound before entering the accumulation statistics. Must
+// match WINSOR_K in src/bdpt.rs.
+const WINSOR_K: f32 = 3.0;
+// The second-moment memory, in samples: E[lum²] is an exponential
+// moving average over roughly this many samples, so one outlier can
+// only keep the rejection bound loose for a bounded time. Must match
+// MOMENT_WINDOW in src/bdpt.rs.
+const MOMENT_WINDOW: f32 = 16.0;
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let width = u32(uniforms.width);
@@ -1187,14 +1235,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let px = (u * 2.0 - 1.0) * uniforms.fov_h;
         let py = -(v * 2.0 - 1.0) * uniforms.fov_v;
         let dir = normalize3(uniforms.cam_right * px + uniforms.cam_up * py + uniforms.cam_forward);
-        color += bdpt_trace(uniforms.cam_origin, dir, &state);
+        color += clamp_sample(bdpt_trace(uniforms.cam_origin, dir, &state),
+                              uniforms.firefly_clamp);
     }
     color = color / f32(uniforms.spp);
 
-    // Temporal accumulation: running average weighted by sample counts, so
-    // mixing batch sizes (e.g. 1 spp preview + 8 spp batches) stays unbiased.
+    // Temporal accumulation with outlier rejection.
+    //
+    // The accumulation buffer's `.w` channel carries the running second
+    // moment of the sample luminance, E[lum²] — the channel was
+    // previously hard-coded to 1.0 and unused. σ = sqrt(E[lum²] − μ²)
+    // gives the per-pixel standard deviation; a batch whose mean
+    // luminance exceeds μ + WINSOR_K·σ is scaled down to that bound
+    // before entering the mean, so a firefly leaves no trace.
+    //
+    // The statistic is an exponential moving average over roughly
+    // MOMENT_WINDOW samples, and it tracks the *raw* (pre-winsorization)
+    // luminance. Capping a full running average at the bound would
+    // deadlock a caustic pixel whose first samples are dark (σ = 0 pins
+    // the bound at μ, every bright batch is clamped to μ, and the
+    // moment never grows). The EMA keeps a genuine caustic — many
+    // bright batches — converging to its true value, while a single
+    // firefly's σ-poisoning decays within ~MOMENT_WINDOW samples. That
+    // asymmetry is exactly the statistic that tells a caustic from a
+    // firefly.
     let prev = accum[pixel];
     let n = f32(uniforms.samples);
-    let blended = select(color, (prev.xyz * n + color * f32(uniforms.spp)) / (n + f32(uniforms.spp)), uniforms.reset == 0u);
-    accum[pixel] = vec4<f32>(blended, 1.0);
+    let m = f32(uniforms.spp);
+    var batch = color;
+    if (n > 0.0 && uniforms.reset == 0u) {
+        let mu = luminance(prev.xyz);
+        let sigma = sqrt(max(prev.w - mu * mu, 0.0));
+        let bound = mu + WINSOR_K * sigma;
+        let lum = luminance(batch);
+        if (lum > bound && lum > 0.0) {
+            batch = batch * (bound / lum);
+        }
+    }
+    let blended = select(batch, (prev.xyz * n + batch * m) / (n + m), uniforms.reset == 0u);
+    // EMA of the raw luminance², batch weight ~m/window.
+    let alpha = clamp(m / MOMENT_WINDOW, 0.0, 1.0);
+    let raw_sq = luminance(color) * luminance(color);
+    let blended_sq = select(raw_sq, prev.w * (1.0 - alpha) + raw_sq * alpha, uniforms.reset == 0u);
+    accum[pixel] = vec4<f32>(blended, blended_sq);
 }

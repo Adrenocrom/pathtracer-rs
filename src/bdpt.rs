@@ -51,6 +51,83 @@ pub const BACKGROUND: Vec3 = Vec3 {
     z: 0.05,
 };
 
+// --- Firefly rejection ---
+//
+// Caustic and mirror paths are sampled by BDPT's specular-chain
+// strategies, which succeed rarely and carry a huge throughput when
+// they do. One lucky sample with radiance ~50 landing in a pixel whose
+// true mean is ~0.05 enters the running average at full weight and then
+// only dilutes as 1/n — a persistent white dot (everything at or above
+// the tone-map white point displays as pure white, so the dot is
+// saturated from the first frame it lands). Two complementary controls
+// remove it: the per-sample clamp below (bounds the magnitude) and the
+// temporal outlier rejection in the accumulation layer (stops it from
+// sticking; see `accumulate` in renderer.rs and the accumulation block
+// in shaders/bdpt.wgsl).
+
+/// Per-sample clamp: the bound is a multiple of the brightest
+/// emitter's luminance — a deliberately *loose*, physically motivated
+/// bound, not a statistical one.
+///
+/// Per-sample, a rare legitimate caustic sample is indistinguishable
+/// from a firefly: both are huge relative to the pixel's mean, because
+/// the caustic's estimator is a rare-event one (in the demo scene ~8%
+/// of the samples carry ~Le each, so the sample magnitude is ~Le, not
+/// ~the pixel mean). The only distinguisher is temporal persistence —
+/// many bright batches versus one — which is exactly what the
+/// mean-aware temporal outlier rejection measures. A tight per-sample
+/// clamp (e.g. at the tone-map white point) therefore destroys caustics:
+/// it caps the rare-event samples below the pixel's true mean and the
+/// caustic never appears (measured: clamping at 2W collapsed the demo
+/// caustic from ~85 to ~1.6 — *darker than the lit floor around it*).
+///
+/// What the loose bound does catch: a sample far above the brightest
+/// emitter is physically implausible (BSDF sample weights are <= 1,
+/// MIS weights are <= 1, and the Russian-roulette 1/q compensation
+/// exactly restores the decayed throughput), so it can only be a
+/// numerical outlier. The 8x headroom covers the eta^2 transmission
+/// factor and caustic concentration (measured: the demo caustic's
+/// samples peak at ~1.1x Le).
+///
+/// The clamp is biased, but only on implausible samples. Both backends
+/// apply it (the GPU through the `firefly_clamp` uniform) so the oracle
+/// compares like against like.
+pub const FIREFLY_LIGHT_MULT: f32 = 8.0;
+
+/// Temporal outlier rejection: a batch whose mean luminance exceeds
+/// the running mean by more than this many standard deviations is
+/// scaled down to that bound before it enters the accumulation
+/// statistics. Must match `WINSOR_K` in shaders/bdpt.wgsl.
+pub const WINSOR_K: f32 = 3.0;
+
+/// The second-moment memory, in samples. The rejection statistic
+/// E[lum²] is an exponential moving average over roughly this many
+/// samples rather than a full running average, so one outlier can
+/// only keep σ (and with it the rejection bound) loose for a bounded
+/// time. Must match `MOMENT_WINDOW` in shaders/bdpt.wgsl.
+pub const MOMENT_WINDOW: usize = 16;
+
+/// The per-sample luminance clamp bound for a scene whose brightest
+/// emitter has luminance `max_light_luminance` (0 = no lights, in which
+/// case the clamp is disabled — there is no physical bound to appeal
+/// to, and the temporal rejection alone handles outliers).
+pub fn firefly_clamp_bound(max_light_luminance: f32) -> f32 {
+    if max_light_luminance <= 0.0 {
+        return 0.0;
+    }
+    FIREFLY_LIGHT_MULT * max_light_luminance
+}
+
+/// Clamp one sample's luminance to `bound`, preserving its chroma.
+/// Shared shape with `clamp_sample` in shaders/bdpt.wgsl.
+pub fn clamp_sample(c: Vec3, bound: f32) -> Vec3 {
+    let lum = c.luminance();
+    if lum > bound && lum > 0.0 {
+        return c * (bound / lum);
+    }
+    c
+}
+
 /// Russian roulette: minimum survival probability. Bounds the variance the
 /// 1/q compensation can add (a surviving path never gains more than a 20x
 /// weight multiplier per bounce).
@@ -477,6 +554,14 @@ fn rr_prefix_products(path: &PathView, alpha_light0: Vec3) -> RrProducts {
 }
 
 /// Trace one camera ray with BDPT. Returns the estimated radiance.
+///
+/// The returned sample is firefly-clamped (see `firefly_clamp_bound`):
+/// a loose, physically motivated bound (a multiple of the brightest
+/// emitter's luminance) that removes only implausible samples. The
+/// tight, mean-aware firefly removal happens in the accumulation layer
+/// (`accumulate` in renderer.rs / the accumulation block in
+/// shaders/bdpt.wgsl), where temporal persistence separates a caustic
+/// from a firefly.
 pub fn bdpt_trace(
     ray: &Ray,
     scene: &dyn Intersectable,
@@ -486,6 +571,15 @@ pub fn bdpt_trace(
 ) -> Vec3 {
     let max_depth = max_depth.min(MAX_PATH_VERTICES);
     let mut total = VEC_ZERO;
+    // The clamp bound: a loose multiple of the brightest emitter's
+    // luminance (0 = no lights, clamp disabled). Computed once per
+    // call; the lights slice is tiny.
+    let clamp_bound = firefly_clamp_bound(
+        lights
+            .iter()
+            .map(|l| l.emission.luminance())
+            .fold(0.0f32, f32::max),
+    );
 
     // ---- Eye subpath: x_1 .. x_s ----
     let mut eye: Vec<PathVertex> = Vec::with_capacity(max_depth);
@@ -728,7 +822,7 @@ pub fn bdpt_trace(
         }
     }
 
-    total
+    clamp_sample(total, clamp_bound)
 }
 
 #[cfg(test)]
@@ -969,6 +1063,39 @@ mod tests {
         assert!((rr_survival(beta, RR_START) - 0.7).abs() < 1e-6);
         assert!((rr_survival(Vec3::new(2.0, 3.0, 1.0), RR_START) - 1.0).abs() < 1e-6);
         assert!((rr_survival(VEC_ZERO, RR_START) - RR_MIN).abs() < 1e-6);
+    }
+
+    /// The firefly clamp: luminance above the bound is scaled down with
+    /// the chroma preserved; below the bound nothing changes; the bound
+    /// is a loose multiple of the brightest emitter's luminance (a
+    /// tight bound would destroy rare-event caustic samples — see
+    /// `firefly_clamp_bound`).
+    #[test]
+    fn firefly_clamp_bounds_and_preserves_chroma() {
+        // clamp_sample: below the bound, unchanged.
+        let c = Vec3::new(0.5, 0.2, 0.1);
+        assert_eq!(clamp_sample(c, 10.0), c);
+        // Above the bound: scaled to the bound's luminance, chroma kept.
+        let hot = Vec3::new(50.0, 20.0, 10.0);
+        let clamped = clamp_sample(hot, 10.0);
+        assert!(
+            (clamped.luminance() - 10.0).abs() < 1e-3,
+            "luminance not at the bound: {clamped:?}"
+        );
+        // Same chroma: the channel ratios are preserved.
+        assert!((clamped.x / clamped.y - hot.x / hot.y).abs() < 1e-4);
+        assert!((clamped.y / clamped.z - hot.y / hot.z).abs() < 1e-4);
+        // Zero luminance (black) must not divide by zero.
+        assert_eq!(clamp_sample(VEC_ZERO, 10.0), VEC_ZERO);
+
+        // firefly_clamp_bound: no lights -> disabled (0); otherwise a
+        // loose multiple of the emitter luminance. The demo light
+        // (luminance 1000) clamps at 8000 — far above the caustic's
+        // rare-event samples (~1.1x Le), so a genuine caustic passes
+        // through untouched.
+        assert_eq!(firefly_clamp_bound(0.0), 0.0);
+        assert!((firefly_clamp_bound(1.0) - 8.0).abs() < 1e-6);
+        assert!((firefly_clamp_bound(1000.0) - 8000.0).abs() < 1e-6);
     }
 
     #[test]

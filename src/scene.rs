@@ -318,6 +318,25 @@ impl SceneData {
         self.lights.push(light);
     }
 
+    /// The highest luminance any physically valid sample can carry:
+    /// the brightest emitter's luminance. Radiance along a path is
+    /// bounded by the emitter's emission (albedo ≤ 1, MIS weights ≤ 1,
+    /// the eta² transmission factor is compensated by the BSDF's
+    /// 1/eta²), so a sample above this bound is a statistical outlier
+    /// — a firefly — and clamping it toward the bound is the standard
+    /// outlier-rejection trade (small bias on rare samples for a large
+    /// variance cut).
+    ///
+    /// Shared by both backends: the CPU clamps in `bdpt_trace`, the GPU
+    /// uploads it as a uniform so the WGSL clamp and the CPU clamp use
+    /// the same threshold.
+    pub fn max_light_luminance(&self) -> f32 {
+        self.lights
+            .iter()
+            .map(|l| l.emission.luminance())
+            .fold(0.0f32, f32::max)
+    }
+
     /// Build the trait-object scene (BVH) used by the CPU renderer.
     ///
     /// Emitter geometry is already part of `spheres`/`quads` (registered

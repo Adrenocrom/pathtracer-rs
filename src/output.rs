@@ -123,9 +123,18 @@ impl fmt::Display for PixelBuffer {
 
 /// Edge-preserving bilateral denoiser.
 ///
-/// A neighbor contributes with weight `exp(-|d|^2 / 2 sigma_r^2)` based on its
-/// color distance `d` from the center pixel, so flat regions are smoothed
-/// while silhouettes stay crisp. `sigma_r` is in linear-light units.
+/// A neighbor contributes with weight `exp(-|d|^2 / 2 sigma_r^2)` based
+/// on its color distance `d` from the center pixel, so flat regions are
+/// smoothed while silhouettes stay crisp.
+///
+/// `sigma_r` is *relative*: the weight uses the color distance scaled by
+/// the local mean, `d / max(mean, eps)`, so one sigma covers both a dark
+/// corner (values ~0.05) and the region right under a bright emitter
+/// (values ~10). The old absolute sigma_r = 0.15 in linear HDR made the
+/// filter a no-op near lights — exactly where fireflies live — because
+/// the noise there (±2) sat far outside 2σᵣ² = 0.045. A relative sigma
+/// of 0.15 keeps the old behavior in mid-tones (mean ~1) and scales up
+/// with brightness.
 fn bilateral(pixels: &[Vec3], width: usize, height: usize, radius: i32, sigma_r: f32) -> Vec<Vec3> {
     let inv_two_sigma_sq = 1.0 / (2.0 * sigma_r * sigma_r);
     let mut result = vec![VEC_ZERO; width * height];
@@ -133,6 +142,12 @@ fn bilateral(pixels: &[Vec3], width: usize, height: usize, radius: i32, sigma_r:
     for y in 0..height {
         for x in 0..width {
             let center = pixels[y * width + x];
+            // The local mean the relative distance is scaled by. The
+            // center alone suffices (the radius-1 window is 9 pixels);
+            // using it keeps the filter separable from the temporal
+            // statistics and identical between the CPU and WGSL paths.
+            let mean = (center.x + center.y + center.z).max(0.0) / 3.0;
+            let scale = 1.0 / mean.max(1e-3);
             let mut sum = VEC_ZERO;
             let mut weight_sum = 0.0f32;
 
@@ -144,7 +159,7 @@ fn bilateral(pixels: &[Vec3], width: usize, height: usize, radius: i32, sigma_r:
                         continue;
                     }
                     let neighbor = pixels[ny as usize * width + nx as usize];
-                    let d = neighbor - center;
+                    let d = (neighbor - center) * scale;
                     let dist_sq = d.dot(d);
                     let w = (-dist_sq * inv_two_sigma_sq).exp();
                     sum = sum + neighbor * w;
@@ -222,6 +237,28 @@ mod tests {
         // ...and its dark neighbor stays dark.
         let dark_edge = out[width + 2];
         assert!(dark_edge.x < 0.15, "edge leaked: {dark_edge:?}");
+    }
+
+    /// The relative sigma_r must keep the filter *working* in bright
+    /// regions — the failure mode the old absolute sigma_r = 0.15 had:
+    /// near a light (values ~10) the noise (±2) sat far outside
+    /// 2σᵣ² = 0.045, so every neighbor was rejected and the filter was a
+    /// no-op exactly where fireflies live.
+    #[test]
+    fn bilateral_smooths_noise_in_bright_regions() {
+        let width = 5;
+        let height = 5;
+        // A bright flat region (like the floor under the light) with one
+        // noisy pixel.
+        let mut pixels = vec![Vec3::new(10.0, 10.0, 10.0); width * height];
+        pixels[2 * width + 2] = Vec3::new(12.0, 12.0, 12.0);
+
+        let out = bilateral(&pixels, width, height, 1, 0.15);
+        let smoothed = out[2 * width + 2];
+        assert!(
+            smoothed.x < 11.0 && smoothed.x > 9.0,
+            "bright-region noise not smoothed: {smoothed:?}"
+        );
     }
 
     #[test]

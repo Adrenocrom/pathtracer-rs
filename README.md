@@ -2,7 +2,7 @@
 
 A high-performance, interactive path tracer rendered directly in the terminal using Rust. This project demonstrates the intersection of physically based rendering (PBR) and low-resolution terminal output.
 
-![Example render of the demo scene: a Cornell-box style room with red and green side walls, a glass sphere under the hanging light focusing its light into a bright caustic on the floor, a chrome sphere on the cube stack, and diffuse spheres and cubes.](example.png)
+![Example render of the demo scene: a Cornell-box style room with red and green side walls, a glass sphere under the ceiling light panel focusing its light into a bright caustic on the floor, a chrome sphere on the cube stack, and diffuse spheres and cubes.](example.png)
 
 *The demo scene rendered with bidirectional path tracing — a caustic focused through the glass sphere (a light path unidirectional tracing cannot find), reflections in the chrome sphere, indirect color bleeding from the red and green walls, and global illumination in the cube stack.*
 
@@ -13,9 +13,10 @@ A high-performance, interactive path tracer rendered directly in the terminal us
     - **Terminal (`--terminal`):** Interactive preview rendered using terminal half-blocks (`▀`) to double vertical resolution.
     - **Windowed (default, or `--window`):** A native winit window with a wgpu surface. The HDR accumulation buffer is post-processed (denoise + tone map + gamma) entirely in a fragment shader, so pixels never round-trip through the CPU while the camera is stationary. The window title shows accumulated samples and fps; `H` overlays the controls.
 - **Temporal Accumulation:** Progressive rendering that averages up to 128 frames while the camera remains stationary, cleaning up noise over time.
+- **Firefly Rejection:** Caustic and mirror paths occasionally produce rare, extremely bright samples ("fireflies") that would otherwise paint persistent white dots. Two complementary controls remove them: a per-sample luminance clamp (a loose multiple of the brightest emitter's luminance — a sample far above the brightest emitter is physically implausible, while a rare legitimate caustic sample is *not*, so the clamp stays loose and only removes the implausible tail) and temporal outlier rejection that winsorizes each batch against the pixel's own running statistics (mean + 3σ over an exponential second-moment window), so a firefly leaves no trace in the average while a genuine caustic — many bright batches — keeps converging to its true value.
 - **Interactive Exploration:** WASD-style navigation — forward/back, yaw, strafe and pitch (window frontend; the terminal frontend supports forward and yaw).
 - **Advanced Post-Processing:**
-    - **Bilateral Filtering:** Edge-preserving denoising on the linear HDR buffer to remove path-tracing grain while keeping silhouettes crisp.
+    - **Bilateral Filtering:** Edge-preserving denoising on the linear HDR buffer to remove path-tracing grain while keeping silhouettes crisp. The range sigma is *relative* (the color distance is scaled by the local mean), so one sigma covers both dark corners and the floor right under a bright emitter — where an absolute sigma in linear HDR would make the filter a no-op exactly where fireflies live.
     - **Extended Reinhard Tone Mapping:** Maps the scene white point to display white (`c(1+c/W²)/(1+c)`), so highlights roll off to pure white instead of plateauing below it.
     - **Gamma Correction:** Linear-to-sRGB conversion (γ = 2.2) for natural lighting.
 - **High-Quality Export:** Trigger a full FHD (1920×1080) render at 1024 samples per pixel with up to 8 bounces, saved as a PNG with a progress bar (terminal) or in background batches (window).
@@ -55,7 +56,7 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 - **Windowing:** `winit` 0.30 (`ApplicationHandler`) with a wgpu 30 surface; the display pass reads the accumulation buffer directly (no readback).
 - **Image Processing:** `image` crate for PNG export.
 - **Light Transport:** Bidirectional path tracing with BSDF-aware sampling (Lambertian diffuse, perfect mirror, and dielectric glass with exact Fresnel and Snell refraction), area-light sampling, and MIS power-heuristic weights computed by Veach's incremental-ratio walk over the actual per-edge pdfs. Delta (specular) BSDFs contribute a symbolic pdf that cancels between strategies, and connections through them are excluded from the MIS normalization — specular transport is handled purely by subpath sampling, which is what lets BDPT find caustics that unidirectional path tracing cannot.
-- **Scene:** A Cornell-box style room — red and green side walls, a diffuse sphere, a stack of white cubes with a chrome sphere on top, and a hanging emissive sphere light above a glass sphere that focuses its light into a caustic on the floor.
+- **Scene:** A Cornell-box style room — red and green side walls, a diffuse sphere, a stack of white cubes with a chrome sphere on top, and a ceiling light panel shining down on a glass sphere that focuses its light into a caustic on the floor.
 - **Complexity:** Implements a full orthonormal camera basis and a bidirectional path-tracing loop with vertex connection.
 
 ## 📦 Getting Started
@@ -84,4 +85,4 @@ cargo test
 The test suite covers the MIS weights (hand-computed values and sum-to-one), light-transport sanity checks (direct hits, shadows, energy bounds), geometry intersection, the bilateral denoiser, temporal accumulation, and offline WGSL validation of both shaders.
 
 ## 📈 Rendering Pipeline
-`Ray Generation` $\rightarrow$ `Intersection Testing (BVH, CPU tree / GPU flat-array traversal)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Temporal Accumulation` $\rightarrow$ `Bilateral Filtering` $\rightarrow$ `Extended Reinhard Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output / wgpu Surface`
+`Ray Generation` $\rightarrow$ `Intersection Testing (BVH, CPU tree / GPU flat-array traversal)` $\rightarrow$ `Bidirectional Path Tracing` $\rightarrow$ `Per-Sample Firefly Clamp` $\rightarrow$ `Temporal Accumulation (with Outlier Rejection)` $\rightarrow$ `Bilateral Filtering (relative σᵣ)` $\rightarrow$ `Extended Reinhard Tone Mapping` $\rightarrow$ `Gamma Correction` $\rightarrow$ `ANSI Terminal Output / wgpu Surface`

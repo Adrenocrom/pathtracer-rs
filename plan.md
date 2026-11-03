@@ -262,13 +262,26 @@ demo.
    ray). Acceptance: radius 0 reproduces today's output bit-for-bit
    (same seed); a focused sphere stays sharp while the background
    blurs.
-3. **Joint bilateral denoiser with G-buffers** — fixes the known
-   `sigma_r = 0.15`-in-linear-HDR problem (near the light, values ~10,
-   the filter stops working). Compute pass writes first-hit
-   normal/albedo buffers; the display shader and the CPU filter weight
-   neighbors by normal/albedo agreement too, which lets σᵣ scale with
-   local luminance without smearing silhouettes. Acceptance: a
+3. **Joint bilateral denoiser with G-buffers** — the *principled* upgrade
+   of the relative-σᵣ fix that has landed: the compute pass writes
+   first-hit normal/albedo buffers; the display shader and the CPU
+   filter weight neighbors by normal/albedo agreement too, which lets
+   σᵣ scale with local luminance without smearing silhouettes even at
+   geometric edges (the current relative σᵣ still over-smooths a
+   bright region that is also a geometric edge). Acceptance: a
    bright-region smoothing test that the current filter fails.
+   [Partially done 2026-11-03: the σᵣ-in-linear-HDR problem itself is
+   fixed — both bilateral filters now scale the color distance by the
+   local mean, so the filter works near lights. The firefly controls
+   (per-sample clamp + temporal outlier rejection) also landed; see
+   `bdpt.rs` and the accumulation blocks in `renderer.rs` /
+   `shaders/bdpt.wgsl`. The per-sample clamp is deliberately loose
+   (8x the brightest emitter): a tight bound at the tone-map white
+   point destroyed the demo caustic (rare-event samples ~Le clamped
+   below the pixel mean), so the clamp only removes the physically
+   implausible tail and the mean-aware temporal rejection does the
+   fine-grained firefly removal. What remains is the G-buffer
+   weighting.]
 4. **JSON scene format** — serde + loader; `build_scene()` becomes
    `scenes/demo.json` (embedded via `include_str!` for tests). This is
    the prerequisite that justifies bigger scenes — the WGSL BVH now

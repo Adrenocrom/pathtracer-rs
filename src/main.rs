@@ -130,7 +130,7 @@ fn build_scene() -> SceneData {
 
     // Chrome sphere resting on the cube stack (its bottom touches the top
     // face of the right upper cube at y = 1.2): reflects the red/green
-    // walls, the hanging light and the glass sphere — the mirror BSDF
+    // walls, the ceiling light and the glass sphere — the mirror BSDF
     // showcase.
     scene.add_sphere(
         Vec3::new(1.09, 1.45, 0.8),
@@ -138,12 +138,9 @@ fn build_scene() -> SceneData {
         MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
     );
 
-    // Hanging light (small emissive sphere). `add_light` registers the
-    // emitter as geometry too, so both backends can hit it. It hangs
-    // directly above the glass sphere so its light refracts through the
-    // ball and focuses into the caustic on the floor below — the Phase 1
-    // payoff (paper.md §6.2): a light path the unidirectional tracer
-    // cannot find.
+    // The old hanging light (small emissive sphere, directly above the
+    // glass sphere) is replaced by the ceiling panel below; kept here
+    // for reference. `add_light` registers the emitter as geometry too.
     //scene.add_light(LightData::from_sphere(
     //    Vec3::new(-0.4, 1.2, 0.1),
     //    0.2,
@@ -151,7 +148,13 @@ fn build_scene() -> SceneData {
     //));
 
     // Ceiling light panel (one-sided: emits along its normal, i.e.
-    // downward). `add_light` registers the quad as geometry too.
+    // downward). `add_light` registers the quad as geometry too. It
+    // shines down on the glass sphere at a shallow off-axis angle
+    // (~15°), so the ball lens focuses its light into a caustic on the
+    // floor beside the sphere's shadow — the Phase 1 payoff
+    // (paper.md §6.2): a light path the unidirectional tracer cannot
+    // find. (The old hanging sphere light sat directly overhead; the
+    // panel is the same showcase with a lamp that is not in frame.)
     scene.add_light(LightData::from_quad(
             Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     ));
@@ -575,12 +578,22 @@ mod tests {
         assert!(sum > 0.0);
     }
 
-    /// The caustic showcase (plan §2.7): the light must hang directly
-    /// above the glass sphere so its light refracts through the ball and
-    /// focuses onto the floor below, and both must be in frame from the
-    /// default camera. This pins the geometry the screenshot acceptance
-    /// criterion depends on — moving the light off-axis or the sphere
-    /// out of view silently kills the caustic.
+    /// The caustic showcase (plan §2.7): the light must illuminate the
+    /// glass sphere from above so its light refracts through the ball
+    /// and focuses onto the floor below, and the sphere plus the
+    /// caustic point must be in frame from the default camera. This
+    /// pins the geometry the screenshot acceptance criterion depends
+    /// on — moving the light off the sphere or the sphere out of view
+    /// silently kills the caustic.
+    ///
+    /// The scene's emitter is a one-sided ceiling quad panel (the
+    /// hanging sphere light it replaced sat directly overhead); it
+    /// shines down on the sphere at a shallow off-axis angle (~15°),
+    /// so the caustic lands on the floor near the sphere's shadow. The
+    /// lamp itself is *not* in frame from the default camera (it sits
+    /// above the top edge of the view) — the caustic is the showcase,
+    /// not the lamp, so the in-frame checks cover the sphere and the
+    /// caustic point (the light→sphere axis crossing on the floor).
     #[test]
     fn caustic_geometry_is_in_frame() {
         let scene = build_scene();
@@ -592,19 +605,19 @@ mod tests {
             .iter()
             .find(|s| s.mat.bsdf == crate::geometry::Bsdf::Glass { ior: 1.5 })
             .expect("demo scene must contain a glass sphere");
-        // The light hangs directly above the glass sphere (same x/z).
+        // The light shines down on the glass sphere from above, at a
+        // shallow enough off-axis angle that the sphere sits well inside
+        // its beam (the old hanging sphere light was directly overhead,
+        // horiz = 0; the ceiling panel is ~15° — both focus a caustic
+        // below the ball).
+        let to_sphere = glass.center - light.center;
+        assert!(to_sphere.y < 0.0, "light not above the glass sphere");
+        let horiz = (to_sphere.x * to_sphere.x + to_sphere.z * to_sphere.z).sqrt();
         assert!(
-            (light.center.x - glass.center.x).abs() < 1e-6
-                && (light.center.z - glass.center.z).abs() < 1e-6,
-            "light {:?} not above glass sphere {:?}",
-            light.center,
-            glass.center
-        );
-        // ...and above it, with room for the refracted beam to reach the
-        // floor between them (the sphere must not touch the light).
-        assert!(
-            light.center.y > glass.center.y + glass.radius + light.radius,
-            "light too close to the glass sphere"
+            horiz < to_sphere.y.abs() * 0.5,
+            "light too far off-axis to focus a caustic through the sphere \
+             (horiz {horiz}, height {})",
+            to_sphere.y.abs()
         );
         // The glass sphere floats above the floor (not touching it), so
         // refracted rays leaving the bottom cap can still hit the floor
@@ -614,17 +627,24 @@ mod tests {
             "glass sphere touches the floor"
         );
 
-        // Both must be in frame from the default camera. The camera looks
-        // at (0, 0.7, 0) from (0, 1, -1.5) with a 60° fov: a point is in
-        // frame when its angle from the forward axis is under the half
-        // fov (30°) in both the horizontal and vertical projection.
+        // The sphere and the caustic point must be in frame from the
+        // default camera. The camera looks at (0, 0.7, 0) from
+        // (0, 1, -1.5) with a 60° fov: a point is in frame when its
+        // angle from the forward axis is under the half fov (30°) in
+        // both the horizontal and vertical projection. The caustic
+        // point is the light→sphere axis crossing on the floor (a ball
+        // lens focuses on its axis; with the off-axis ceiling panel
+        // that is beside the sphere's shadow, not directly below the
+        // sphere).
         let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
         let forward = (cam.lookat - cam.origin).normalize();
         let world_up = Vec3::new(0.0, 1.0, 0.0);
         let right = world_up.cross(forward).normalize();
         let up = forward.cross(right).normalize();
         let half_fov = (cam.fov_deg * 0.5).to_radians().cos();
-        for (name, p) in [("light", light.center), ("glass", glass.center)] {
+        let axis = (glass.center - light.center).normalize();
+        let caustic = glass.center + axis * (-glass.center.y / axis.y);
+        for (name, p) in [("glass", glass.center), ("caustic", caustic)] {
             let rel = p - cam.origin;
             let f = rel.dot(forward);
             assert!(f > 0.0, "{name} is behind the camera");
@@ -635,24 +655,6 @@ mod tests {
                 "{name} out of frame (cos_h {cos_h}, cos_v {cos_v}, need >= {half_fov})"
             );
         }
-
-        // The caustic disc on the floor below the sphere must be in frame
-        // too: the ball-lens focus f = R*n/(2(n-1)) = 0.45 from the
-        // sphere center, so the floor (0.5 below the center) catches the
-        // beam still converging — the bright disc sits within roughly the
-        // sphere's shadow radius. The sphere floats above the floor so the
-        // caustic center is not hidden behind the sphere's own silhouette
-        // from the camera.
-        let caustic = Vec3::new(glass.center.x, 0.0, glass.center.z);
-        let rel = caustic - cam.origin;
-        let f = rel.dot(forward);
-        assert!(f > 0.0, "caustic is behind the camera");
-        let cos_h = f / (rel.dot(right).abs().hypot(f));
-        let cos_v = f / (rel.dot(up).abs().hypot(f));
-        assert!(
-            cos_h >= half_fov && cos_v >= half_fov,
-            "caustic out of frame (cos_h {cos_h}, cos_v {cos_v}, need >= {half_fov})"
-        );
 
         // The caustic center must be visible from the camera, not hidden
         // behind the glass sphere's own silhouette: the distance from the
@@ -678,13 +680,13 @@ mod tests {
     /// HDR buffer for the caustic: a bright spot on the floor near the
     /// glass sphere, brighter than the surrounding floor.
     ///
-    /// Ignored by default: it renders a full FHD image (minutes on the
-    /// CPU, seconds on the GPU). Run with
-    /// `cargo test -- --ignored regenerate_screenshot --nocapture`.
-    /// The `SCREENSHOT_SPP` env var overrides the sample count for quick
-    /// probe runs (e.g. `SCREENSHOT_SPP=16`).
+    /// Runs as part of the default suite: it prefers the GPU (the FHD
+    /// render takes seconds) and falls back to the CPU renderer, where
+    /// the full render takes minutes. The `SCREENSHOT_SPP` env var
+    /// overrides the sample count for quick probe runs (e.g.
+    /// `SCREENSHOT_SPP=16`); run it alone with
+    /// `cargo test regenerate_screenshot -- --nocapture`.
     #[test]
-    #[ignore]
     fn regenerate_screenshot() {
         let scene = build_scene();
         let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
@@ -706,23 +708,28 @@ mod tests {
         let buffer = render_fhd_with_spp(&scene, &cam, false, shared_device, spp);
 
         // --- Caustic probe: the floor around the glass sphere must show a
-        // bright focused spot. Project the expected caustic center (the
-        // floor point under the sphere) into the image and compare the
-        // mean HDR value in a small disc there against the mean over a
-        // surrounding floor annulus. The caustic must be brighter than
-        // the annulus by a clear margin — the focused light is several
-        // times the direct illumination there.
+        // bright focused spot. A ball lens focuses on its axis, so the
+        // caustic lands where the light→sphere axis crosses the floor —
+        // with the ceiling panel ~15° off vertical that point sits beside
+        // the sphere's shadow, not directly below the sphere (where the
+        // old overhead light focused it, and which is now the umbra).
+        // Compare the mean HDR value in a small disc at that axis
+        // crossing against a nearby fully-lit floor disc: the focused
+        // light must be brighter by a clear margin — several times the
+        // direct illumination there.
         let glass = scene
             .spheres
             .iter()
             .find(|s| s.mat.bsdf == crate::geometry::Bsdf::Glass { ior: 1.5 })
             .expect("glass sphere");
-        let caustic_world = Vec3::new(glass.center.x, 0.0, glass.center.z);
+        let light = &scene.lights[0];
+        let axis = (glass.center - light.center).normalize();
+        let caustic_world = glass.center + axis * (-glass.center.y / axis.y);
         let (cx, cy) = project_to_pixel(&cam, caustic_world, buffer.width, buffer.height);
         // The reference: fully-lit floor 1.2 to the +x of the caustic,
-        // outside the sphere's shadow (umbra ~0.44, penumbra ~1.0 for
+        // outside the sphere's shadow (umbra ~0.4, penumbra ~0.6 for
         // this light/sphere geometry) and away from every object.
-        let reference_world = Vec3::new(glass.center.x + 1.2, 0.0, glass.center.z);
+        let reference_world = caustic_world + Vec3::new(1.2, 0.0, 0.0);
         let (rx, ry) = project_to_pixel(&cam, reference_world, buffer.width, buffer.height);
         let disc_mean = |px: usize, py: usize| -> f32 {
             let mut sum = 0.0f32;

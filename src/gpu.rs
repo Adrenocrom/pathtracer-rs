@@ -37,7 +37,10 @@ struct Uniforms {
     spp: u32,
     /// Scene prims; 0 = empty scene, the shader skips traversal.
     n_prims: u32,
-    _pad1: u32,
+    /// Per-sample firefly clamp bound (0 = disable). Computed by
+    /// `bdpt::firefly_clamp_bound` as a loose multiple of the scene's
+    /// brightest emitter luminance.
+    firefly_clamp: f32,
     _pad2: u32,
 }
 
@@ -346,6 +349,9 @@ pub struct GpuRenderer {
     n_lights: u32,
     /// Scene prims; 0 = empty scene, the shader skips traversal.
     n_prims: u32,
+    /// Per-sample firefly clamp bound, uploaded as a uniform (0 = the
+    /// scene has no lights; the shader then disables the clamp).
+    firefly_clamp: f32,
     /// Number of samples accumulated in the current accumulation epoch.
     samples: u32,
     /// True when the accumulation buffer must be overwritten this frame.
@@ -518,6 +524,7 @@ impl GpuRenderer {
         let n_prims = prims.len() as u32;
         let bvh_nodes = build_bvh(&mut prims).unwrap_or_default();
         let lights: Vec<GpuLight> = scene.lights.iter().map(GpuLight::from_light_data).collect();
+        let firefly_clamp = crate::bdpt::firefly_clamp_bound(scene.max_light_luminance());
 
         // Storage buffers must be non-empty for WGSL arrayLength to be valid;
         // pad empty families to one zeroed element of the right stride.
@@ -640,6 +647,7 @@ impl GpuRenderer {
             height,
             n_lights: scene.lights.len() as u32,
             n_prims,
+            firefly_clamp,
             samples: 0,
             reset: true,
             adapter_info,
@@ -756,7 +764,7 @@ impl GpuRenderer {
             reset: if self.reset { 1 } else { 0 },
             spp: spp.max(1),
             n_prims: self.n_prims,
-            _pad1: 0,
+            firefly_clamp: self.firefly_clamp,
             _pad2: 0,
         };
         self.queue

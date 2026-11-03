@@ -17,7 +17,7 @@ pub const MAX_ACCUMULATED_FRAMES: usize = 128;
 /// 1024 samples per pixel.
 pub const FHD_WIDTH: u32 = 1920;
 pub const FHD_HEIGHT: u32 = 1080;
-pub const SAMPLES_FHD: u32 = 15000;
+pub const SAMPLES_FHD: u32 = 128;
 pub const MAX_DEPTH_FHD: u32 = 8;
 
 pub trait Renderer {
@@ -47,7 +47,15 @@ pub struct CpuRenderer {
     height: usize,
     samples: usize,
     accum: Option<Vec<crate::math::Vec3>>,
-    frames: usize,
+    /// Running second moment of the sample luminance per pixel,
+    /// E[lum²], the temporal-outlier-rejection statistic. Kept in lockstep
+    /// with `accum` (same length, same sample count); the GPU stores the
+    /// same statistic in the accumulation buffer's free `.w` channel.
+    moment2: Vec<f32>,
+    /// Samples accumulated in this epoch (each `render_frame` call adds
+    /// `samples` of them). The accumulation weights batches by sample
+    /// count, matching the GPU's `samples`/`spp` uniform pair.
+    samples_accumulated: usize,
 }
 
 impl CpuRenderer {
@@ -60,8 +68,71 @@ impl CpuRenderer {
             height,
             samples,
             accum: None,
-            frames: 0,
+            moment2: Vec::new(),
+            samples_accumulated: 0,
         }
+    }
+}
+
+/// Progressive temporal accumulation with outlier rejection.
+///
+/// The plain running mean is defenseless against fireflies: a sample
+/// with radiance ~50 in a pixel whose true mean is ~0.05 enters at full
+/// weight and then only dilutes as 1/n — a white dot that persists for
+/// hundreds of frames. The rejection winsorizes each *batch* against
+/// the pixel's own running statistics before it enters the mean: a
+/// batch whose mean luminance exceeds the running mean by more than
+/// `WINSOR_K` standard deviations is scaled down to that bound.
+///
+/// The statistic is E[lum²], an exponential moving average over
+/// roughly `MOMENT_WINDOW` samples (on the GPU it lives in the free
+/// `.w` channel of the accumulation buffer): σ = sqrt(E[lum²] − μ²).
+/// It is an EMA rather than a full running average for a subtle
+/// reason: capping the *running* second moment at the rejection bound
+/// would deadlock a caustic pixel whose first samples are dark (σ = 0
+/// keeps the bound at μ, every bright batch is clamped to μ, and the
+/// moment never grows). The EMA keeps the raw (pre-winsorization)
+/// luminance in the statistic, so a genuine caustic — many bright
+/// batches — keeps σ loose and converges to its true value, while a
+/// single firefly's σ-poisoning decays within ~MOMENT_WINDOW samples.
+/// That asymmetry is exactly the statistic that tells a caustic from
+/// a firefly.
+///
+/// `n` is the sample count already accumulated; the batch carries `m`
+/// samples per pixel (the same sample-count weighting as the GPU's
+/// accumulation block, which mixes 1-spp preview and 32-spp export
+/// batches).
+fn accumulate(
+    accum: &mut [Vec3],
+    moment2: &mut [f32],
+    frame: &[Vec3],
+    n: usize,
+    m: usize,
+) {
+    let n = n as f32;
+    let m = m as f32;
+    // EMA rate: the batch's weight in the statistic, ~m/window.
+    let alpha = (m / crate::bdpt::MOMENT_WINDOW as f32).clamp(0.0, 1.0);
+    for ((a, m2), f) in accum.iter_mut().zip(moment2.iter_mut()).zip(frame) {
+        // Winsorize the batch mean against the running statistics.
+        let mut batch = *f;
+        if n > 0.0 {
+            let mu = a.luminance();
+            let sigma = (*m2 - mu * mu).max(0.0).sqrt();
+            let bound = mu + crate::bdpt::WINSOR_K * sigma;
+            let lum = batch.luminance();
+            if lum > bound && lum > 0.0 {
+                batch = batch * (bound / lum);
+            }
+        }
+        if n + m > 0.0 {
+            *a = (*a * n + batch * m) / (n + m);
+        }
+        // The statistic tracks the *raw* luminance (pre-winsorization),
+        // so a genuine caustic keeps σ loose; the EMA bounds how long a
+        // single outlier can keep it loose.
+        let raw_sq = f.luminance() * f.luminance();
+        *m2 = *m2 * (1.0 - alpha) + raw_sq * alpha;
     }
 }
 
@@ -77,12 +148,23 @@ impl Renderer for CpuRenderer {
         );
         match &mut self.accum {
             Some(a) if a.len() == frame.pixels.len() => {
-                accumulate(a, &frame.pixels, self.frames);
-                self.frames += 1;
+                accumulate(
+                    a,
+                    &mut self.moment2,
+                    &frame.pixels,
+                    self.samples_accumulated,
+                    self.samples,
+                );
+                self.samples_accumulated += self.samples;
             }
             _ => {
+                // First frame: the mean is the batch itself; the EMA
+                // statistic starts at the batch's own raw luminance²
+                // (the same initialization the GPU's reset path
+                // performs).
+                self.moment2 = frame.pixels.iter().map(|p| p.luminance().powi(2)).collect();
                 self.accum = Some(frame.pixels);
-                self.frames = 1;
+                self.samples_accumulated = self.samples;
             }
         }
     }
@@ -104,7 +186,8 @@ impl Renderer for CpuRenderer {
 
     fn reset_accumulation(&mut self) {
         self.accum = None;
-        self.frames = 0;
+        self.moment2.clear();
+        self.samples_accumulated = 0;
     }
 
     /// The CPU renderer has no per-pixel GPU state; resizing just changes
@@ -120,15 +203,6 @@ impl Renderer for CpuRenderer {
     }
 }
 
-/// Progressive temporal accumulation: average the new frame into `accum`.
-/// `frame_count` is the number of frames already accumulated (>= 1).
-fn accumulate(accum: &mut [Vec3], frame: &[Vec3], frame_count: usize) {
-    let n = frame_count as f32;
-    for (a, f) in accum.iter_mut().zip(frame) {
-        *a = *a * (n / (n + 1.0)) + *f * (1.0 / (n + 1.0));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,15 +211,67 @@ mod tests {
     #[test]
     fn accumulate_converges_to_the_mean() {
         let mut accum = vec![Vec3::new(1.0, 1.0, 1.0); 4];
+        let mut moment2 = vec![1.0f32; 4];
         let frame = vec![Vec3::new(0.0, 0.0, 0.0); 4];
         // After one update the average must be exactly halfway.
-        accumulate(&mut accum, &frame, 1);
+        accumulate(&mut accum, &mut moment2, &frame, 1, 1);
         assert!((accum[0].x - 0.5).abs() < 1e-6);
         // After many updates it approaches the frame value.
         for n in 2..=100 {
-            accumulate(&mut accum, &frame, n);
+            accumulate(&mut accum, &mut moment2, &frame, n, 1);
         }
         assert!(accum[0].x < 0.02);
+    }
+
+    /// The outlier rejection: a batch far above the running mean+3σ must
+    /// be scaled down before entering the average, so a single firefly
+    /// cannot paint a persistent dot — while a *sequence* of bright
+    /// batches (a genuine caustic) raises the second moment, loosens the
+    /// cap, and converges to its true value.
+    #[test]
+    fn accumulate_rejects_temporal_outliers() {
+        // Steady state: mean 0.1, tiny variance.
+        let mut accum = vec![Vec3::new(0.1, 0.1, 0.1)];
+        let mut moment2 = vec![0.1f32 * 0.1 + 1e-6];
+        // One firefly batch: luminance 50 against mean 0.1, σ ~ 0.001.
+        let firefly = vec![Vec3::new(50.0, 50.0, 50.0)];
+        accumulate(&mut accum, &mut moment2, &firefly, 100, 1);
+        // The firefly must be winsorized to roughly mean + 3σ ≈ 0.103,
+        // so the new mean moves by ~0.0003, not 0.5.
+        assert!(
+            accum[0].x < 0.11,
+            "firefly not rejected: mean jumped to {accum:?}"
+        );
+
+        // A genuine caustic: many bright batches. The second moment
+        // grows with each, the cap loosens, and the mean converges
+        // toward the bright value.
+        let mut accum = vec![Vec3::new(0.1, 0.1, 0.1)];
+        let mut moment2 = vec![0.1f32 * 0.1 + 1e-6];
+        for n in 1..=200 {
+            let bright = vec![Vec3::new(2.0, 2.0, 2.0)];
+            accumulate(&mut accum, &mut moment2, &bright, n, 1);
+        }
+        assert!(
+            accum[0].x > 1.0,
+            "genuine bright region suppressed: {accum:?}"
+        );
+
+        // The deadlock case: a caustic pixel whose first samples are
+        // dark (σ = 0 pins the bound at μ). The EMA statistic must
+        // still let the bright batches through after a few frames —
+        // a capped running average would clamp every bright batch to
+        // μ forever and the caustic would never appear.
+        let mut accum = vec![Vec3::new(0.0, 0.0, 0.0)];
+        let mut moment2 = vec![0.0f32];
+        for n in 1..=64 {
+            let bright = vec![Vec3::new(2.0, 2.0, 2.0)];
+            accumulate(&mut accum, &mut moment2, &bright, n, 1);
+        }
+        assert!(
+            accum[0].x > 1.0,
+            "caustic from a dark start never converged: {accum:?}"
+        );
     }
 
     /// `read_pixels` before the first `render_frame` used to return an

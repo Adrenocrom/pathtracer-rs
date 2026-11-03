@@ -3,7 +3,8 @@
 // Reads the BDPT accumulation buffer (linear HDR, rgba32float, row-major
 // top-to-bottom — the same layout the compute shader writes) and applies
 // the same post-processing as the terminal path (src/output.rs): optional
-// bilateral denoise (radius 1, sigma_r 0.15) and Reinhard tone mapping.
+// bilateral denoise (radius 1, relative sigma_r 0.15) and Reinhard tone
+// mapping.
 //
 // Gamma: when the surface format is an sRGB variant the hardware applies
 // the transfer curve on store, so the shader outputs linear values. When
@@ -27,12 +28,21 @@ struct DisplayUniforms {
 @group(0) @binding(1) var<storage, read> accum: array<vec4<f32>>;
 @group(0) @binding(2) var overlay_tex: texture_2d<f32>;
 
+// Relative sigma_r: the color distance is scaled by the local mean, so
+// one sigma covers both a dark corner (values ~0.05) and the floor
+// under a bright emitter (values ~10). The old absolute sigma_r = 0.15
+// in linear HDR made the filter a no-op near lights — exactly where
+// fireflies live. Matches `bilateral` in output.rs.
 const SIGMA_R: f32 = 0.15;
 
 // Edge-preserving bilateral denoise, identical to `bilateral` in output.rs.
 fn bilateral(px: u32, py: u32) -> vec3<f32> {
     let center = accum[py * du.width + px].xyz;
     let inv_two_sigma_sq = 1.0 / (2.0 * SIGMA_R * SIGMA_R);
+    // The local mean the relative distance is scaled by (the center
+    // alone; the radius-1 window is 9 pixels).
+    let mean = max((center.x + center.y + center.z) / 3.0, 0.0);
+    let scale = 1.0 / max(mean, 1e-3);
     var sum = vec3<f32>(0.0);
     var weight_sum = 0.0;
 
@@ -44,7 +54,7 @@ fn bilateral(px: u32, py: u32) -> vec3<f32> {
                 continue;
             }
             let neighbor = accum[u32(ny) * du.width + u32(nx)].xyz;
-            let d = neighbor - center;
+            let d = (neighbor - center) * scale;
             let w = exp(-dot(d, d) * inv_two_sigma_sq);
             sum = sum + neighbor * w;
             weight_sum = weight_sum + w;
