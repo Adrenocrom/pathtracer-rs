@@ -65,14 +65,26 @@ pub enum Bsdf {
     /// falls back to reflection. `ior` is the interior index of refraction;
     /// the exterior is vacuum (ior = 1), so glass objects must be closed.
     Glass { ior: f32 },
+    /// Tag for a *laser emitter*: an emissive surface that radiates only
+    /// into a narrow cone of half-angle `acos(cos_theta)` around its
+    /// geometric normal (the beam). Not a scattering model at all — pure
+    /// emitters never scatter — but the BSDF slot is the one place the
+    /// emission cone can travel with the material, so the BDPT pdf/weight/
+    /// gate helpers can read it from any path vertex. Deliberately NOT
+    /// delta: the cone has a real (if tiny) solid angle, connections to
+    /// the aperture stay valid, and one-sided shading applies (the
+    /// aperture is dark from behind).
+    Laser { cos_theta: f32 },
 }
 
 impl Bsdf {
     /// True for BSDFs that scatter into a single direction (a delta
     /// distribution): they have no continuous density, so connections
     /// through them are invalid and their pdfs cancel in MIS ratios.
+    /// `Laser` is excluded: its cone is a continuous (if narrow)
+    /// distribution, so the aperture remains a valid connection endpoint.
     pub fn is_delta(&self) -> bool {
-        !matches!(self, Bsdf::Diffuse)
+        matches!(self, Bsdf::Mirror | Bsdf::Glass { .. })
     }
 }
 
@@ -127,6 +139,42 @@ impl Material {
             albedo: Vec3::new(1.0, 1.0, 1.0),
             emission: VEC_ZERO,
             bsdf: Bsdf::Glass { ior },
+        }
+    }
+
+    /// A laser emitter: radiates `emission` only into the cone of
+    /// half-angle `theta` around the geometric normal. The cone is
+    /// stored as its cosine so the gate is a single dot product.
+    pub fn laser(emission: Vec3, theta: f32) -> Self {
+        Self {
+            albedo: VEC_ZERO,
+            emission,
+            bsdf: Bsdf::Laser {
+                cos_theta: theta.cos(),
+            },
+        }
+    }
+
+    /// True when this material radiates into a cone (a laser aperture).
+    pub fn is_laser(&self) -> bool {
+        matches!(self.bsdf, Bsdf::Laser { .. })
+    }
+
+    /// True when the direction `p -> target` lies inside this laser
+    /// material's emission cone around `normal` (the beam). The cone is
+    /// closed: a direction exactly on the boundary counts as inside.
+    /// False for non-laser materials.
+    pub fn in_beam(&self, normal: Vec3, p: Vec3, target: Vec3) -> bool {
+        match self.bsdf {
+            Bsdf::Laser { cos_theta } => {
+                let d = target - p;
+                let len = d.length();
+                if len < 1e-8 {
+                    return true;
+                }
+                normal.dot(d * (1.0 / len)) >= cos_theta
+            }
+            _ => false,
         }
     }
 
@@ -272,6 +320,15 @@ impl Material {
                     }
                 }
             }
+            // A laser material is a pure emitter: it never scatters, so
+            // this arm is unreachable (the subpath walks stop at
+            // emissive surfaces). Zero weight keeps any hypothetical
+            // extension through such a vertex at zero contribution.
+            Bsdf::Laser { .. } => BsdfSample {
+                dir_out: normal,
+                pdf_omega: 0.0,
+                weight: VEC_ZERO,
+            },
         }
     }
 
@@ -343,7 +400,8 @@ impl Material {
                     None
                 }
             }
-            Bsdf::Diffuse => None,
+            // Pure emitters never scatter (see sample_bsdf).
+            Bsdf::Laser { .. } | Bsdf::Diffuse => None,
         }
     }
 }
@@ -658,6 +716,141 @@ impl Intersectable for Cube {
     }
 }
 
+// --- CYLINDER ---
+/// A closed cylinder: two flat caps plus the curved side. `axis` is the
+/// unit direction from the base cap to the top cap; `half_h` is the
+/// half-height along it. The caps are one-sided (they shade only from
+/// outside the cylinder), the curved side shades from both sides.
+#[derive(Clone)]
+pub struct Cylinder {
+    pub base: Vec3,
+    pub axis: Vec3,
+    pub radius: f32,
+    pub half_h: f32,
+    pub mat: Material,
+}
+
+impl Cylinder {
+    /// A cylinder centered at `center` with its axis along `axis` (any
+    /// length; normalized internally), total height `height` and the
+    /// given radius. Kept for API completeness (used by tests and future
+    /// scenes), like `Quad::new`/`Cube::new`.
+    #[allow(dead_code)]
+    pub fn new(center: Vec3, axis: Vec3, height: f32, radius: f32, mat: Material) -> Self {
+        let axis = axis.normalize();
+        Self {
+            base: center - axis * (height * 0.5),
+            axis,
+            radius,
+            half_h: height * 0.5,
+            mat,
+        }
+    }
+
+    /// The center of the top cap (base + axis * height). Used by tests
+    /// and future scenes to place the aperture.
+    #[allow(dead_code)]
+    pub fn top_center(&self) -> Vec3 {
+        self.base + self.axis * (2.0 * self.half_h)
+    }
+}
+
+impl Intersectable for Cylinder {
+    fn intersect(&self, ray: &Ray) -> Option<HitRecord> {
+        // Work in the cylinder's local frame: origin at the base cap,
+        // z along the axis. The ray is decomposed into its axial part
+        // (z) and its radial part (x, y); the side test is then a 2D
+        // circle intersection in the radial plane.
+        let oc = ray.origin - self.base;
+        let d = ray.direction;
+        let a = self.axis;
+        let d_perp = d - a * d.dot(a); // radial component of the direction
+        let oc_perp = oc - a * oc.dot(a); // radial component of the offset
+        let dz = d.dot(a);
+        let oz = oc.dot(a);
+
+        let mut best_t = f32::INFINITY;
+        let mut best_normal = VEC_ZERO;
+
+        // --- Curved side: |oc_perp + t * d_perp| = radius ---
+        // The axial coordinate z is measured from the base cap, so the
+        // cylinder spans z in [0, 2 * half_h].
+        let aa = d_perp.length_squared();
+        if aa > 1e-12 {
+            let bb = 2.0 * oc_perp.dot(d_perp);
+            let cc = oc_perp.length_squared() - self.radius * self.radius;
+            let disc = bb * bb - 4.0 * aa * cc;
+            if disc >= 0.0 {
+                let sqrt_d = disc.sqrt();
+                for t in [(-bb - sqrt_d) / (2.0 * aa), (-bb + sqrt_d) / (2.0 * aa)] {
+                    if t < EPS_NEAR || t >= best_t {
+                        continue;
+                    }
+                    let z = oz + t * dz;
+                    if z < 0.0 || z > 2.0 * self.half_h {
+                        continue; // outside the side's height range
+                    }
+                    let p = ray.at(t);
+                    let n = (p - self.base - a * z).normalize();
+                    best_t = t;
+                    best_normal = n;
+                }
+            }
+        }
+
+        // --- Caps: two one-sided discs at z = 0 (base) and z = 2*half_h (top) ---
+        for (cap_z, cap_n) in [(0.0, a * -1.0), (2.0 * self.half_h, a)] {
+            let cap_point = self.base + a * cap_z;
+            let denom = cap_n.dot(d);
+            if denom.abs() < 1e-6 {
+                continue;
+            }
+            let t = (cap_point - ray.origin).dot(cap_n) / denom;
+            if t < EPS_NEAR || t >= best_t {
+                continue;
+            }
+            let p = ray.at(t);
+            let radial = p - cap_point;
+            if radial.length_squared() > self.radius * self.radius {
+                continue;
+            }
+            best_t = t;
+            best_normal = cap_n;
+        }
+
+        if best_t.is_infinite() {
+            return None;
+        }
+        Some(HitRecord {
+            t: best_t,
+            p: ray.at(best_t),
+            normal: best_normal,
+            mat: self.mat,
+        })
+    }
+
+    fn bounding_box(&self) -> BBox {
+        // Exact box via the support function: along world axis e_k the
+        // cylinder's extent is |a_k| * half_h (the caps) plus
+        // r * sqrt(1 - a_k²) (the disc radius projected onto e_k),
+        // where a is the unit axis. Centered on the cylinder's midpoint.
+        let mid = self.base + self.axis * self.half_h;
+        let r = self.radius;
+        let mut min = [0.0f32; 3];
+        let mut max = [0.0f32; 3];
+        for k in 0..3 {
+            let a_k = self.axis[k];
+            let extent = a_k.abs() * self.half_h + r * (1.0 - a_k * a_k).sqrt();
+            min[k] = mid[k] - extent;
+            max[k] = mid[k] + extent;
+        }
+        BBox {
+            min: Vec3::new(min[0], min[1], min[2]),
+            max: Vec3::new(max[0], max[1], max[2]),
+        }
+    }
+}
+
 // --- AREA LIGHTS ---
 /// A sampleable emitter surface. The shape parameters must match an emissive
 /// object in the scene so that BDPT can connect paths to real geometry.
@@ -674,6 +867,16 @@ pub enum LightShape {
         bitangent: Vec3,
         half_w: f32,
         half_h: f32,
+    },
+    /// A laser aperture: a disc of radius `radius` centered at `center`
+    /// with outward normal `normal`, radiating only into the cone of
+    /// half-angle `theta` around `normal`. The disc is the top cap of
+    /// the laser's cylinder housing.
+    Laser {
+        center: Vec3,
+        normal: Vec3,
+        radius: f32,
+        theta: f32,
     },
 }
 
@@ -708,10 +911,27 @@ impl AreaLight {
         }
     }
 
+    /// A laser aperture light: a disc of `radius` centered at `center`
+    /// with outward normal `normal`, radiating into the cone of
+    /// half-angle `theta` around the normal. The disc is the emitting
+    /// cap of the laser's cylinder housing (see `SceneData::add_laser`).
+    pub fn from_laser(center: Vec3, normal: Vec3, radius: f32, theta: f32, emission: Vec3) -> Self {
+        Self {
+            shape: LightShape::Laser {
+                center,
+                normal: normal.normalize(),
+                radius,
+                theta,
+            },
+            emission,
+        }
+    }
+
     pub fn area(&self) -> f32 {
         match &self.shape {
             LightShape::Sphere { radius, .. } => 4.0 * PI * radius * radius,
             LightShape::Quad { half_w, half_h, .. } => 4.0 * half_w * half_h,
+            LightShape::Laser { radius, .. } => PI * radius * radius,
         }
     }
 
@@ -739,6 +959,56 @@ impl AreaLight {
                 let p = *center + *tangent * (u * half_w) + *bitangent * (v * half_h);
                 (p, *normal)
             }
+            LightShape::Laser {
+                center,
+                normal,
+                radius,
+                ..
+            } => {
+                // Uniform point on the aperture disc; the normal is the
+                // aperture's outward normal (the beam axis). The
+                // departure direction is sampled separately by
+                // `sample_dir` — uniformly in the cone — because the
+                // vertex normal and the departure direction are
+                // different vectors for a cone emitter.
+                let r = radius * rng.gen::<f32>().sqrt();
+                let phi = 2.0 * PI * rng.gen::<f32>();
+                let a = if normal.x.abs() > 0.9 {
+                    Vec3::new(0.0, 1.0, 0.0)
+                } else {
+                    Vec3::new(1.0, 0.0, 0.0)
+                };
+                let t = a.cross(*normal).normalize();
+                let b = normal.cross(t);
+                let p = *center + t * (r * phi.cos()) + b * (r * phi.sin());
+                (p, *normal)
+            }
+        }
+    }
+
+    /// Sample the direction a light subpath leaves the sampled point in,
+    /// around the normal `sample` returned: cosine-weighted for ordinary
+    /// emitters (pdf cos/π), uniform in the cone for a laser aperture
+    /// (pdf 1/(2π(1 − cos θ))). Split from `sample` because a cone
+    /// emitter's departure direction is not its normal.
+    pub fn sample_dir(&self, normal: Vec3, rng: &mut impl Rng) -> Vec3 {
+        match &self.shape {
+            LightShape::Laser { theta, .. } => {
+                let a = if normal.x.abs() > 0.9 {
+                    Vec3::new(0.0, 1.0, 0.0)
+                } else {
+                    Vec3::new(1.0, 0.0, 0.0)
+                };
+                let t = a.cross(normal).normalize();
+                let b = normal.cross(t);
+                let cos_theta = theta.cos();
+                // Uniform in the cone: cos φ uniform in [cos θ, 1].
+                let u = 1.0 - rng.gen::<f32>() * (1.0 - cos_theta);
+                let phi = 2.0 * PI * rng.gen::<f32>();
+                let sin_theta = (1.0 - u * u).sqrt();
+                t * (sin_theta * phi.cos()) + b * (sin_theta * phi.sin()) + normal * u
+            }
+            _ => cosine_hemisphere(normal, rng),
         }
     }
 
@@ -761,6 +1031,71 @@ impl AreaLight {
                     && local.dot(*tangent).abs() <= half_w + 1e-3
                     && local.dot(*bitangent).abs() <= half_h + 1e-3
             }
+            LightShape::Laser {
+                center,
+                normal,
+                radius,
+                ..
+            } => {
+                let local = p - *center;
+                local.dot(*normal).abs() < 1e-3
+                    && local.length_squared() <= radius * radius + 1e-3
+            }
+        }
+    }
+
+    /// True when this light is a laser aperture (cone emission) rather
+    /// than an ordinary hemisphere emitter.
+    pub fn shape_is_laser(&self) -> bool {
+        matches!(self.shape, LightShape::Laser { .. })
+    }
+
+    /// The laser cone's half-angle. Only meaningful for laser lights.
+    pub fn cone_theta(&self) -> f32 {
+        match &self.shape {
+            LightShape::Laser { theta, .. } => *theta,
+            _ => 0.0,
+        }
+    }
+
+    /// The cosine of the laser cone's half-angle. Only meaningful for
+    /// laser lights.
+    pub fn cone_cos(&self) -> f32 {
+        self.cone_theta().cos()
+    }
+
+    /// True when the direction `p -> target` lies inside this laser's
+    /// emission cone. Always true for non-laser lights (they radiate
+    /// into the whole hemisphere). For a laser, `p` must also lie on
+    /// the aperture disc — the rest of the housing is dark.
+    pub fn in_beam(&self, p: Vec3, target: Vec3) -> bool {
+        match &self.shape {
+            LightShape::Laser {
+                center,
+                normal,
+                radius,
+                theta,
+            } => {
+                // p must lie on the aperture disc (the curved side of
+                // the housing is dark): the same plane/extent test as
+                // `contains`. A distance-from-*center* test here would
+                // wrongly reject every off-center point of the disc.
+                let local = p - *center;
+                if local.dot(*normal).abs() > 1e-3
+                    || local.length_squared() > radius * radius + 1e-3
+                {
+                    return false;
+                }
+                // ...and the direction p -> target must lie inside the
+                // cone (closed: exactly on the boundary counts).
+                let d = target - p;
+                let len = d.length();
+                if len < 1e-8 {
+                    return true;
+                }
+                normal.dot(d * (1.0 / len)) >= theta.cos()
+            }
+            _ => true,
         }
     }
 }
@@ -836,6 +1171,107 @@ mod tests {
 
         let miss = q.intersect(&ray(Vec3::new(5.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)));
         assert!(miss.is_none());
+    }
+
+    /// The cylinder: side hits, cap hits, misses outside the radius, and
+    /// the correct outward normals on all three surface families.
+    #[test]
+    fn cylinder_intersects_sides_and_caps_with_correct_normals() {
+        // A vertical cylinder: base at y=0, height 2, radius 0.5.
+        let c = Cylinder::new(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            2.0,
+            0.5,
+            diffuse(Vec3::new(1.0, 1.0, 1.0)),
+        );
+        // Side hit from +x: normal +x, t = 0.5.
+        let side = c
+            .intersect(&ray(Vec3::new(3.0, 1.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)))
+            .unwrap();
+        assert!((side.t - 2.5).abs() < 1e-4);
+        assert_eq!(side.normal, Vec3::new(1.0, 0.0, 0.0));
+        // Top cap hit from above: normal +y.
+        let top = c
+            .intersect(&ray(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.0, -1.0, 0.0)))
+            .unwrap();
+        assert!((top.t - 3.0).abs() < 1e-4);
+        assert_eq!(top.normal, Vec3::new(0.0, 1.0, 0.0));
+        // Base cap hit from below: normal -y.
+        let base = c
+            .intersect(&ray(Vec3::new(0.0, -5.0, 0.0), Vec3::new(0.0, 1.0, 0.0)))
+            .unwrap();
+        assert_eq!(base.normal, Vec3::new(0.0, -1.0, 0.0));
+        // A ray above the top cap misses (outside the height range).
+        let above = c.intersect(&ray(Vec3::new(3.0, 2.5, 0.0), Vec3::new(-1.0, 0.0, 0.0)));
+        assert!(above.is_none());
+        // A ray outside the radius misses the caps.
+        let beside = c.intersect(&ray(Vec3::new(2.0, 5.0, 0.0), Vec3::new(0.0, -1.0, 0.0)));
+        assert!(beside.is_none());
+        // A ray through the cap plane but outside the disc misses.
+        let off_disc = c.intersect(&ray(Vec3::new(0.0, 5.0, 2.0), Vec3::new(0.0, -1.0, 0.0)));
+        assert!(off_disc.is_none());
+        // A tilted axis: the same tests must hold after rotation. The
+        // cylinder points along +x now.
+        let t = Cylinder::new(
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            2.0,
+            0.5,
+            diffuse(Vec3::new(1.0, 1.0, 1.0)),
+        );
+        let side_t = t
+            .intersect(&ray(Vec3::new(1.0, 3.0, 0.0), Vec3::new(0.0, -1.0, 0.0)))
+            .unwrap();
+        assert_eq!(side_t.normal, Vec3::new(0.0, 1.0, 0.0));
+        let cap_t = t
+            .intersect(&ray(Vec3::new(5.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)))
+            .unwrap();
+        assert_eq!(cap_t.normal, Vec3::new(1.0, 0.0, 0.0));
+        // The bounding box must be exact: the cylinder is centered at the
+        // origin with height 2 along x, so it spans x in [-1, 1] (the
+        // cap discs extend radially, in y/z, not along the axis) and
+        // y, z in [-0.5, 0.5].
+        let bb = t.bounding_box();
+        assert!((bb.min.x + 1.0).abs() < 1e-4, "bb.min.x: {}", bb.min.x);
+        assert!((bb.max.x - 1.0).abs() < 1e-4, "bb.max.x: {}", bb.max.x);
+        assert!((bb.min.y + 0.5).abs() < 1e-4 && (bb.max.y - 0.5).abs() < 1e-4);
+        assert!((bb.min.z + 0.5).abs() < 1e-4 && (bb.max.z - 0.5).abs() < 1e-4);
+    }
+
+    /// The laser aperture light: samples lie on the disc, the departure
+    /// directions lie in the cone, and the cone gate accepts/rejects
+    /// directions correctly.
+    #[test]
+    fn laser_light_samples_disc_and_cone() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(77);
+        let light = AreaLight::from_laser(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.5,
+            0.1, // ~5.7° half-angle
+            Vec3::new(100.0, 100.0, 100.0),
+        );
+        assert!(light.shape_is_laser());
+        assert!((light.area() - PI * 0.25).abs() < 1e-5);
+        for _ in 0..200 {
+            let (p, n) = light.sample(&mut rng);
+            assert!(light.contains(p));
+            assert_eq!(n, Vec3::new(0.0, 1.0, 0.0));
+            let d = light.sample_dir(n, &mut rng);
+            // Every departure direction lies in the cone (dot with the
+            // axis >= cos θ) and is unit length.
+            assert!(d.dot(n) >= light.cone_cos() - 1e-5);
+            assert!((d.length() - 1.0).abs() < 1e-5);
+        }
+        // The beam gate: a direction along the axis is inside, one far
+        // off-axis is outside.
+        let p = Vec3::new(0.0, 1.0, 0.0);
+        assert!(light.in_beam(p, p + Vec3::new(0.0, 1.0, 0.0)));
+        assert!(!light.in_beam(p, p + Vec3::new(1.0, 0.0, 0.0)));
+        // A point off the aperture is not "in beam" (guards the direct
+        // hit on the dark housing side).
+        assert!(!light.in_beam(Vec3::new(0.0, 0.5, 0.0), p));
     }
 
     #[test]

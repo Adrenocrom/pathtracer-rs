@@ -46,10 +46,12 @@ struct Uniforms {
 
 /// One scene primitive in GPU form (matches `Prim` in shaders/bdpt.wgsl).
 ///
-/// All four families (sphere/quad/cube/plane) share this layout, kind-
-/// tagged, so a single array — and a single BVH leaf range — can hold
+/// All five families (sphere/quad/cube/plane/cylinder) share this layout,
+/// kind-tagged, so a single array — and a single BVH leaf range — can hold
 /// them all. The families share slots: the cube's min/max live in
-/// `center`/`normal`, the quad's `half_w` lives in `radius`.
+/// `center`/`normal`, the quad's `half_w` lives in `radius`, the
+/// cylinder's base lives in `center`, its axis in `tangent`, its radius in
+/// `radius` and its half-height in `half_h`.
 ///
 /// Layout rule: every `vec3<f32>` is immediately followed by an `f32` so
 /// WGSL's implicit 16-byte alignment never inserts padding that Rust's
@@ -93,6 +95,11 @@ struct GpuBvhNode {
     count: u32,
 }
 
+/// One sampleable emitter surface in GPU form (matches `GpuLight` in
+/// shaders/bdpt.wgsl). `shape` is 0 = sphere, 1 = quad, 2 = laser
+/// aperture (disc + cone). For a laser, `half_w` carries the cone
+/// half-angle `theta` (the slot is unused by the disc) — the same
+/// piggyback the CPU-side `LightData` uses.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuLight {
@@ -145,12 +152,16 @@ const MAT_DIFFUSE: u32 = 0;
 const MAT_EMISSIVE: u32 = 1;
 const MAT_MIRROR: u32 = 2;
 const MAT_GLASS: u32 = 3;
+/// A laser aperture: emissive, but radiating only into a cone. The cone's
+/// cosine rides in the prim's `ior` slot (unused by emitters).
+const MAT_LASER: u32 = 4;
 
 // Prim kind tags, shared with shaders/bdpt.wgsl.
 const KIND_SPHERE: u32 = 0;
 const KIND_QUAD: u32 = 1;
 const KIND_CUBE: u32 = 2;
 const KIND_PLANE: u32 = 3;
+const KIND_CYLINDER: u32 = 4;
 
 /// Compile-time layout checks: the Rust structs must match the WGSL
 /// structs byte-for-byte. WGSL aligns vec3<f32> to 16 bytes, so every
@@ -204,6 +215,26 @@ fn prim_bbox(p: &GpuPrim) -> ([f32; 3], [f32; 3]) {
             (bmin, bmax)
         }
         KIND_CUBE => (p.center, p.normal),
+        KIND_CYLINDER => {
+            // Exact box via the support function (same rule as
+            // geometry.rs's Cylinder::bounding_box): along world axis
+            // e_k the extent is |a_k| * half_h + r * sqrt(1 - a_k²).
+            let a = p.tangent;
+            let mid = [
+                p.center[0] + a[0] * p.half_h,
+                p.center[1] + a[1] * p.half_h,
+                p.center[2] + a[2] * p.half_h,
+            ];
+            let r = p.radius;
+            let mut bmin = [0.0f32; 3];
+            let mut bmax = [0.0f32; 3];
+            for k in 0..3 {
+                let extent = a[k].abs() * p.half_h + r * (1.0 - a[k] * a[k]).sqrt();
+                bmin[k] = mid[k] - extent;
+                bmax[k] = mid[k] + extent;
+            }
+            (bmin, bmax)
+        }
         _ => {
             // Planes are infinite; a ±1e6 box matches geometry.rs's
             // Plane::bounding_box (and makes the root box huge, exactly
@@ -309,21 +340,28 @@ fn build_bvh_rec(
 
 fn mat_type_u32(m: &crate::scene::MaterialData) -> u32 {
     if m.is_emissive() {
-        MAT_EMISSIVE
+        if m.is_laser() {
+            MAT_LASER
+        } else {
+            MAT_EMISSIVE
+        }
     } else {
         match m.bsdf {
             crate::geometry::Bsdf::Diffuse => MAT_DIFFUSE,
             crate::geometry::Bsdf::Mirror => MAT_MIRROR,
             crate::geometry::Bsdf::Glass { .. } => MAT_GLASS,
+            crate::geometry::Bsdf::Laser { .. } => MAT_DIFFUSE, // unreachable
         }
     }
 }
 
 /// The ior of a glass material (1.0 for everything else, so the shader can
-/// read the field unconditionally).
+/// read the field unconditionally). For a laser material the slot carries
+/// the emission cone's cosine instead (see `MAT_LASER`).
 fn mat_ior(m: &crate::scene::MaterialData) -> f32 {
     match m.bsdf {
         crate::geometry::Bsdf::Glass { ior } => ior,
+        crate::geometry::Bsdf::Laser { cos_theta } => cos_theta,
         _ => 1.0,
     }
 }
@@ -518,6 +556,26 @@ impl GpuRenderer {
                 albedo: vec3s(p.mat.albedo),
                 _pad3: 0.0,
                 emission: vec3s(p.mat.emission),
+                _pad4: 0.0,
+            });
+        }
+        for c in &scene.cylinders {
+            prims.push(GpuPrim {
+                kind: KIND_CYLINDER,
+                ior: mat_ior(&c.mat),
+                mat_type: mat_type_u32(&c.mat),
+                _pad0: 0.0,
+                center: vec3s(c.base),
+                radius: c.radius,
+                normal: [0.0; 3],
+                half_h: c.half_h,
+                tangent: vec3s(c.axis),
+                _pad1: 0.0,
+                bitangent: [0.0; 3],
+                _pad2: 0.0,
+                albedo: vec3s(c.mat.albedo),
+                _pad3: 0.0,
+                emission: vec3s(c.mat.emission),
                 _pad4: 0.0,
             });
         }
@@ -1345,6 +1403,19 @@ mod tests {
                 0.2,
                 crate::math::Vec3::new(10.0, 10.0, 4.0),
             ));
+            // A laser: the oracle must exercise the cylinder intersection
+            // and the cone-emission paths (the aperture direct hit, the
+            // cone-gated connections, the cone pdf in the MIS weights),
+            // not just the diffuse reduction. Aimed across the room at
+            // the green wall, in view of the camera.
+            s.add_laser(
+                crate::math::Vec3::new(-1.8, 0.5, 1.8),
+                crate::math::Vec3::new(0.9, 0.15, -0.4),
+                0.6,
+                0.1,
+                0.05,
+                crate::math::Vec3::new(200.0, 20.0, 20.0),
+            );
             s
         };
 

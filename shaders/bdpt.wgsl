@@ -54,26 +54,28 @@ struct Uniforms {
 };
 
 // One scene primitive, whichever kind — the GPU shape of the scene's
-// spheres/quads/cubes/planes, kind-tagged so a single array (and a single
-// BVH leaf range) can hold them all. The families share slots: the cube's
-// min/max live in center/normal, the quad's half_w lives in radius, and
-// tangent/bitangent exist only for quads. mat_type is 0 diffuse / 1
-// emissive / 2 mirror / 3 glass; ior carries the glass interior index
-// (1.0 otherwise).
+// spheres/quads/cubes/planes/cylinders, kind-tagged so a single array
+// (and a single BVH leaf range) can hold them all. The families share
+// slots: the cube's min/max live in center/normal, the quad's half_w
+// lives in radius, the cylinder's base lives in center, its axis in
+// tangent, its radius in radius and its half-height in half_h.
+// mat_type is 0 diffuse / 1 emissive / 2 mirror / 3 glass / 4 laser;
+// ior carries the glass interior index (1.0 otherwise), or the laser
+// emission cone's cosine for mat_type 4.
 //
 // Layout rule: every vec3<f32> is immediately followed by an f32/u32 so
 // WGSL's implicit 16-byte alignment never inserts padding that Rust's
 // #[repr(C)] doesn't have. Stride 112, matching GpuPrim in gpu.rs.
 struct Prim {
-    kind: u32,              // KIND_SPHERE / KIND_QUAD / KIND_CUBE / KIND_PLANE
+    kind: u32,              // KIND_SPHERE / KIND_QUAD / KIND_CUBE / KIND_PLANE / KIND_CYLINDER
     ior: f32,
     mat_type: u32,
     _pad0: f32,
-    center: vec3<f32>,      // sphere/quad center, plane point, cube min
-    radius: f32,            // sphere radius, quad half_w
+    center: vec3<f32>,      // sphere/quad center, plane point, cube min, cylinder base
+    radius: f32,            // sphere radius, quad half_w, cylinder radius
     normal: vec3<f32>,      // quad/plane normal, cube max
-    half_h: f32,            // quad half_h
-    tangent: vec3<f32>,     // quad tangent
+    half_h: f32,            // quad half_h, cylinder half-height
+    tangent: vec3<f32>,     // quad tangent, cylinder axis
     _pad1: f32,
     bitangent: vec3<f32>,   // quad bitangent
     _pad2: f32,
@@ -183,6 +185,9 @@ const MAT_DIFFUSE: u32 = 0u;
 const MAT_EMISSIVE: u32 = 1u;
 const MAT_MIRROR: u32 = 2u;
 const MAT_GLASS: u32 = 3u;
+// A laser aperture: emissive, radiating only into the cone whose cosine
+// rides in the prim's `ior` slot.
+const MAT_LASER: u32 = 4u;
 // Which quantity a subpath transports: the two agree for reflection but
 // differ for transmission (radiance picks up (eta_t/eta_i)^2 crossing a
 // refractive boundary, importance does not). The eye subpath carries
@@ -229,6 +234,7 @@ const KIND_SPHERE: u32 = 0u;
 const KIND_QUAD: u32 = 1u;
 const KIND_CUBE: u32 = 2u;
 const KIND_PLANE: u32 = 3u;
+const KIND_CYLINDER: u32 = 4u;
 // The builder caps the tree depth at MAX_BVH_DEPTH; a pop-based
 // traversal of a depth-d binary tree holds at most d+1 pending nodes,
 // so a 32-entry stack can never overflow (the guards below make it
@@ -350,6 +356,71 @@ fn intersect_prim(p: Prim, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function
         (*best).t = t;
         (*best).p = hp;
         (*best).normal = normal;
+        (*best).albedo = p.albedo;
+        (*best).emission = p.emission;
+        (*best).mat_type = p.mat_type;
+        (*best).ior = p.ior;
+        return;
+    }
+    if (p.kind == KIND_CYLINDER) {
+        // Closed cylinder: base cap at `center`, axis `tangent`,
+        // half-height `half_h`, radius `radius`. Same decomposition as
+        // geometry.rs: split the ray into axial and radial parts; the
+        // side test is a 2D circle intersection in the radial plane.
+        let a = p.tangent;
+        let oc = origin - p.center;
+        let d_perp = dir - a * dot(dir, a);
+        let oc_perp = oc - a * dot(oc, a);
+        let dz = dot(dir, a);
+        let oz = dot(oc, a);
+
+        var best_t = 3.4e38;
+        var best_normal = vec3<f32>(0.0, 1.0, 0.0);
+
+        // Curved side: |oc_perp + t * d_perp| = radius. The axial
+        // coordinate z is measured from the base cap, so the cylinder
+        // spans z in [0, 2 * half_h].
+        let aa = dot(d_perp, d_perp);
+        if (aa > 1e-12) {
+            let bb = 2.0 * dot(oc_perp, d_perp);
+            let cc = dot(oc_perp, oc_perp) - p.radius * p.radius;
+            let disc = bb * bb - 4.0 * aa * cc;
+            if (disc >= 0.0) {
+                let sqrt_d = sqrt(disc);
+                for (var k = 0u; k < 2u; k = k + 1u) {
+                    var t = (-bb - sqrt_d) / (2.0 * aa);
+                    if (k == 1u) { t = (-bb + sqrt_d) / (2.0 * aa); }
+                    if (t < EPS_NEAR || t >= best_t) { continue; }
+                    let z = oz + t * dz;
+                    if (z < 0.0 || z > 2.0 * p.half_h) { continue; }
+                    let hp = origin + dir * t;
+                    best_t = t;
+                    best_normal = normalize3(hp - p.center - a * z);
+                }
+            }
+        }
+
+        // Caps: two one-sided discs at z = 0 (base) and z = 2*half_h (top).
+        for (var k = 0u; k < 2u; k = k + 1u) {
+            let cap_z = select(0.0, 2.0 * p.half_h, k == 1u);
+            let cap_n = select(a * -1.0, a, k == 1u);
+            let cap_point = p.center + a * cap_z;
+            let denom = dot(cap_n, dir);
+            if (abs(denom) < 1e-6) { continue; }
+            let t = dot(cap_point - origin, cap_n) / denom;
+            if (t < EPS_NEAR || t >= best_t) { continue; }
+            let hp = origin + dir * t;
+            let radial = hp - cap_point;
+            if (dot(radial, radial) > p.radius * p.radius) { continue; }
+            best_t = t;
+            best_normal = cap_n;
+        }
+
+        if (best_t >= (*best).t || best_t >= 3.4e38) { return; }
+        let hp = origin + dir * best_t;
+        (*best).t = best_t;
+        (*best).p = hp;
+        (*best).normal = best_normal;
         (*best).albedo = p.albedo;
         (*best).emission = p.emission;
         (*best).mat_type = p.mat_type;
@@ -741,7 +812,9 @@ fn pv_pdf_eye(eye: ptr<function, array<PathVertex, 8>>,
 // m-1 — the light-direction sampling a^l(e_m). m = k+1 is the light
 // position sample (pdf 1/(n.A)); m = k is the emitter event, which has
 // no incoming direction: the emitter scatters cosine-weighted around
-// its stored (emission-side) normal with f = 1.
+// its stored (emission-side) normal with f = 1 — except a laser
+// aperture, whose emission is uniform in its cone (pdf
+// 1/(2π(1 - cos θ)) inside the beam, 0 outside).
 fn pv_pdf_light(eye: ptr<function, array<PathVertex, 8>>,
                 light_path: ptr<function, array<PathVertex, 8>>,
                 view: PathView, m: u32) -> f32 {
@@ -750,8 +823,17 @@ fn pv_pdf_light(eye: ptr<function, array<PathVertex, 8>>,
     var pdf_omega = 0.0;
     if (m == view.k) {
         let d_out = pv_dir(eye, light_path, view, m, m - 1u);
-        let cos = dot(pv_vertex(eye, light_path, view, m).normal, d_out);
-        if (cos > 0.0) { pdf_omega = cos / PI; }
+        let v = pv_vertex(eye, light_path, view, m);
+        let cos = dot(v.normal, d_out);
+        if (v.mat_type == MAT_LASER) {
+            // Uniform in the cone: pdf 1/(2π(1 - cos θ)) inside, 0 out.
+            let cos_theta = v.ior;
+            if (cos >= cos_theta) {
+                pdf_omega = 1.0 / (2.0 * PI * (1.0 - cos_theta));
+            }
+        } else {
+            if (cos > 0.0) { pdf_omega = cos / PI; }
+        }
     } else {
         pdf_omega = pv_event_pdf(eye, light_path, view, m, m + 1u, m - 1u);
     }
@@ -929,14 +1011,29 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
     // Light-side sweep: the roll at y_j governs the extension to y_{j+1},
     // whose factor is the sample weight of the event at y_j = x_{k-j}
     // toward y_{j+1} = x_{k-j-1}. The first extension has no BSDF at the
-    // emitter (f = 1, cosine sampling), hence the PI weight. The light
-    // subpath carries importance.
+    // emitter (f = 1): cosine sampling gives the weight PI, a laser
+    // aperture's uniform cone sampling gives cos0 * 2*PI*(1 - cos theta)
+    // (0 outside the beam). The light subpath carries importance.
     var alpha_l = alpha_light0;
     (*ql)[0u] = 1.0;
     for (var j = 0u; j < k - min(k, 2u); j = j + 1u) {
         var factor: vec3<f32>;
         if (j == 0u) {
-            factor = vec3<f32>(PI);
+            // The emitter event at x_k = y_0, scattering toward x_{k-1}.
+            let v = pv_vertex(eye, light_path, view, k);
+            let d_out = pv_dir(eye, light_path, view, k, k - 1u);
+            let cos0 = dot(v.normal, d_out);
+            if (v.mat_type == MAT_LASER) {
+                let cos_theta = v.ior;
+                if (cos0 >= cos_theta) {
+                    let f = cos0 * 2.0 * PI * (1.0 - cos_theta);
+                    factor = vec3<f32>(f);
+                } else {
+                    factor = vec3<f32>(0.0);
+                }
+            } else {
+                factor = vec3<f32>(PI);
+            }
         } else {
             factor = pv_event_weight(eye, light_path, view, k - j, k - j + 1u, k - j - 1u,
                                      TRANSPORT_IMPORTANCE);
@@ -950,6 +1047,15 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
 
 // --- Light sampling (uniform surface sample, pdf = 1/area) ---
 
+// Build an orthonormal frame around `normal` (the same helper-axis rule
+// as cosine_hemisphere).
+fn frame(normal: vec3<f32>) -> mat3x3<f32> {
+    let a = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) > 0.9);
+    let t = normalize3(cross(a, normal));
+    let b = cross(normal, t);
+    return mat3x3<f32>(t, b, normal);
+}
+
 fn sample_light(l: GpuLight, state: ptr<function, u32>) -> vec3<f32> {
     if (l.shape == 0u) {
         let z = 1.0 - 2.0 * pcg(state);
@@ -957,14 +1063,43 @@ fn sample_light(l: GpuLight, state: ptr<function, u32>) -> vec3<f32> {
         let r = sqrt(max(0.0, 1.0 - z * z));
         return l.center + vec3<f32>(r * cos(phi), r * sin(phi), z) * l.radius;
     }
+    if (l.shape == 2u) {
+        // Laser aperture: uniform point on the disc.
+        let f = frame(l.normal);
+        let r = l.radius * sqrt(pcg(state));
+        let phi = 2.0 * PI * pcg(state);
+        return l.center + f[0] * (r * cos(phi)) + f[1] * (r * sin(phi));
+    }
     let u = pcg(state) * 2.0 - 1.0;
     let v = pcg(state) * 2.0 - 1.0;
     return l.center + l.tangent * (u * l.half_w) + l.bitangent * (v * l.half_h);
 }
 
+// The direction the light subpath leaves the sampled point in: uniform
+// in the laser's cone (pdf 1/(2π(1 - cos θ))), cosine-weighted around
+// the normal otherwise. The CPU's AreaLight::sample returns this as the
+// second tuple element; WGSL returns it separately because the cone
+// sampling needs its own random numbers.
+fn sample_light_dir(l: GpuLight, p: vec3<f32>, state: ptr<function, u32>) -> vec3<f32> {
+    if (l.shape == 2u) {
+        let f = frame(l.normal);
+        let cos_theta = cos(l.half_w);
+        let u = 1.0 - pcg(state) * (1.0 - cos_theta);
+        let phi = 2.0 * PI * pcg(state);
+        let sin_theta = sqrt(max(0.0, 1.0 - u * u));
+        return f[0] * (sin_theta * cos(phi)) + f[1] * (sin_theta * sin(phi)) + l.normal * u;
+    }
+    return cosine_hemisphere(light_normal(l, p), state);
+}
+
 fn light_contains(l: GpuLight, p: vec3<f32>) -> bool {
     if (l.shape == 0u) {
         return abs(vlen(p - l.center) - l.radius) < 1e-3;
+    }
+    if (l.shape == 2u) {
+        let local = p - l.center;
+        return abs(dot(local, l.normal)) < 1e-3
+            && dot(local, local) <= l.radius * l.radius + 1e-3;
     }
     let local = p - l.center;
     return abs(dot(local, l.normal)) < 1e-3
@@ -974,6 +1109,7 @@ fn light_contains(l: GpuLight, p: vec3<f32>) -> bool {
 
 fn light_area(l: GpuLight) -> f32 {
     if (l.shape == 0u) { return 4.0 * PI * l.radius * l.radius; }
+    if (l.shape == 2u) { return PI * l.radius * l.radius; }
     return 4.0 * l.half_w * l.half_h;
 }
 
@@ -1013,7 +1149,9 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         let front_face = dot(hit.normal, cur_dir) < 0.0;
         if (!front_face && !is_delta_type(hit.mat_type)) { break; }
         let normal = select(hit.normal * -1.0, hit.normal, front_face);
-        let on_light = hit.mat_type == MAT_EMISSIVE;
+        // MAT_LASER is an emitter too (a laser aperture): the walk stops
+        // there, exactly like MAT_EMISSIVE.
+        let on_light = hit.mat_type == MAT_EMISSIVE || hit.mat_type == MAT_LASER;
         eye[eye_len] = PathVertex(hit.p, normal, front_face, hit.albedo, hit.emission,
                                   hit.mat_type, hit.ior, throughput, on_light);
         eye_len = eye_len + 1u;
@@ -1045,46 +1183,70 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         inv_light_pdf = f32(uniforms.n_lights) * light_area(light);
         let p0 = sample_light(light, state);
         let n0 = light_normal(light, p0);
-        var ltp = light.emission * inv_light_pdf;
-        light_path[0] = PathVertex(p0, n0, true, vec3<f32>(0.0), light.emission,
-                                   MAT_EMISSIVE, 1.0, ltp, true);
-        light_len = 1u;
-
+        // The direction the subpath leaves the aperture in: uniform in
+        // the laser's cone, cosine-weighted otherwise. The CPU's
+        // AreaLight::sample_dir returns this.
+        let d0 = sample_light_dir(light, p0, state);
+        let is_laser = light.shape == 2u;
         // The first light extension (y_0 -> y_1) is unconditional
         // (RR_START >= 2). The emitter has no BSDF (f = 1) and scatters
-        // cosine-weighted, so the edge contributes a factor PI.
-        ltp = ltp * PI;
-        cur_origin = p0 + n0 * EPS_NEAR;
-        cur_dir = cosine_hemisphere(n0, state);
-        // The connection strategies need k = i + j + 2 <= max_depth, so the
-        // last light vertex (j = max_depth - 1) could never be connected.
-        // Building one vertex fewer avoids a wasted intersection.
-        let steps = max_depth - min(max_depth, 2u);
-        for (var bounce = 0u; bounce < steps; bounce = bounce + 1u) {
-            let hit = intersect_scene(cur_origin, cur_dir);
-            if (!has_hit(hit)) { break; }
-            // Pure emitters do not reflect.
-            if (hit.mat_type == MAT_EMISSIVE) { break; }
-            let front_face = dot(hit.normal, cur_dir) < 0.0;
-            if (!front_face && !is_delta_type(hit.mat_type)) { break; }
-            let normal = select(hit.normal * -1.0, hit.normal, front_face);
-            light_path[light_len] = PathVertex(hit.p, normal, front_face, hit.albedo,
-                                               hit.emission, hit.mat_type, hit.ior,
-                                               ltp, false);
-            light_len = light_len + 1u;
-            // Russian roulette for the extension y_j -> y_{j+1}
-            // (j = light_len - 1 >= 1, number j + 1). Surviving divides
-            // ltp by q, which also applies the factor for the next vertex.
-            let j = light_len - 1u;
-            let s = bsdf_sample(hit.albedo, hit.mat_type, hit.ior, normal, front_face,
-                               cur_dir, TRANSPORT_IMPORTANCE, state);
-            let beta = ltp * s.weight;
-            let q = rr_survival(beta, j + 1u);
-            if (q < 1.0 && pcg(state) >= q) { break; }
-            ltp = beta * (1.0 / q);
-            let offset = select(normal * -1.0, normal, dot(s.dir_out, normal) > 0.0);
-            cur_origin = hit.p + offset * EPS_NEAR;
-            cur_dir = s.dir_out;
+        // cosine-weighted, so the edge factor is cos0 * PI. A laser
+        // aperture samples uniformly in its cone, so the edge factor is
+        // cos0 * 2*PI*(1 - cos theta) — and the direction must lie
+        // inside the beam, where the emitter's radiance is nonzero.
+        let cos0 = dot(n0, d0);
+        var edge_factor = PI;
+        if (is_laser) {
+            let cos_theta = cos(light.half_w);
+            if (cos0 >= cos_theta) {
+                edge_factor = cos0 * 2.0 * PI * (1.0 - cos_theta);
+            } else {
+                edge_factor = 0.0;
+            }
+        }
+        var ltp = light.emission * inv_light_pdf;
+        // The y_0 vertex material carries the emission cone so the MIS
+        // pdf machinery (pv_pdf_light at m = k) can see it.
+        let y0_mat = select(MAT_EMISSIVE, MAT_LASER, is_laser);
+        let y0_ior = select(1.0, cos(light.half_w), is_laser);
+        light_path[0] = PathVertex(p0, n0, true, vec3<f32>(0.0), light.emission,
+                                   y0_mat, y0_ior, ltp, true);
+        light_len = 1u;
+
+        if (edge_factor > 0.0) {
+            ltp = ltp * edge_factor;
+            cur_origin = p0 + n0 * EPS_NEAR;
+            cur_dir = d0;
+            // The connection strategies need k = i + j + 2 <= max_depth, so the
+            // last light vertex (j = max_depth - 1) could never be connected.
+            // Building one vertex fewer avoids a wasted intersection.
+            let steps = max_depth - min(max_depth, 2u);
+            for (var bounce = 0u; bounce < steps; bounce = bounce + 1u) {
+                let hit = intersect_scene(cur_origin, cur_dir);
+                if (!has_hit(hit)) { break; }
+                // Pure emitters do not reflect.
+                if (hit.mat_type == MAT_EMISSIVE || hit.mat_type == MAT_LASER) { break; }
+                let front_face = dot(hit.normal, cur_dir) < 0.0;
+                if (!front_face && !is_delta_type(hit.mat_type)) { break; }
+                let normal = select(hit.normal * -1.0, hit.normal, front_face);
+                light_path[light_len] = PathVertex(hit.p, normal, front_face, hit.albedo,
+                                                   hit.emission, hit.mat_type, hit.ior,
+                                                   ltp, false);
+                light_len = light_len + 1u;
+                // Russian roulette for the extension y_j -> y_{j+1}
+                // (j = light_len - 1u >= 1, number j + 1). Surviving divides
+                // ltp by q, which also applies the factor for the next vertex.
+                let j = light_len - 1u;
+                let s = bsdf_sample(hit.albedo, hit.mat_type, hit.ior, normal, front_face,
+                                   cur_dir, TRANSPORT_IMPORTANCE, state);
+                let beta = ltp * s.weight;
+                let q = rr_survival(beta, j + 1u);
+                if (q < 1.0 && pcg(state) >= q) { break; }
+                ltp = beta * (1.0 / q);
+                let offset = select(normal * -1.0, normal, dot(s.dir_out, normal) > 0.0);
+                cur_origin = hit.p + offset * EPS_NEAR;
+                cur_dir = s.dir_out;
+            }
         }
     }
 
@@ -1092,23 +1254,41 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
     if (eye_len > 0u && eye[eye_len - 1u].on_light) {
         let last = eye[eye_len - 1u];
         let k = eye_len;
-        var w = 1.0;
+        // Default 0: a hit on emissive geometry that is no sampleable
+        // light surface (the dark curved side of a laser housing)
+        // carries no emission. A found light overwrites this.
+        var w = 0.0;
         if (uniforms.n_lights > 0u) {
             var found = false;
             for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
                 if (!found && light_contains(lights[li], last.p)) {
                     found = true;
-                    let inv_pdf = f32(uniforms.n_lights) * light_area(lights[li]);
-                    let view = PathView(k, k, inv_pdf, ray_dir);
-                    var qe = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-                    var ql = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-                    // The hypothetical light subpath of the other
-                    // strategies starts at this hit point with the
-                    // emitter's throughput (emission * n * A, the
-                    // inverse light-sampling pdf).
-                    rr_prefix_products(&eye, &light_path, view,
-                                       lights[li].emission * inv_pdf, &qe, &ql);
-                    w = mis_weight(&eye, &light_path, view, &qe, &ql, k);
+                    // A laser aperture radiates only into its cone: a hit
+                    // outside the beam (the dark side of the housing, or
+                    // the aperture seen from behind) carries no emission.
+                    // The eye vertex's stored normal is the aperture's
+                    // outward normal; the incoming direction is the
+                    // camera ray's.
+                    var in_beam = true;
+                    if (last.mat_type == MAT_LASER) {
+                        let cos_theta = last.ior;
+                        in_beam = dot(last.normal, ray_dir * -1.0) >= cos_theta;
+                    }
+                    if (in_beam) {
+                        let inv_pdf = f32(uniforms.n_lights) * light_area(lights[li]);
+                        let view = PathView(k, k, inv_pdf, ray_dir);
+                        var qe = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                        var ql = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                        // The hypothetical light subpath of the other
+                        // strategies starts at this hit point with the
+                        // emitter's throughput (emission * n * A, the
+                        // inverse light-sampling pdf).
+                        rr_prefix_products(&eye, &light_path, view,
+                                           lights[li].emission * inv_pdf, &qe, &ql);
+                        w = mis_weight(&eye, &light_path, view, &qe, &ql, k);
+                    } else {
+                        w = 0.0;
+                    }
                 }
             }
         }
@@ -1141,6 +1321,22 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                                   d_in_eye, d_conn);
             var f_light = vec3<f32>(1.0);
             var n_light_end = light_path[j].normal;
+            if (j == 0u) {
+                // y_0 is the emitter itself: no BSDF applies there — but
+                // a laser aperture radiates only into its cone, so the
+                // connection direction must lie inside the beam. The
+                // emission direction is y_0 -> x_{i+1}, i.e. -d_conn
+                // (d_conn points from the eye vertex to the light
+                // vertex); testing d_conn itself inverts the gate and
+                // zeroes every connection to the aperture.
+                let y0 = light_path[0u];
+                if (y0.mat_type == MAT_LASER) {
+                    let cos_theta = y0.ior;
+                    if (dot(y0.normal, d_conn * -1.0) < cos_theta) {
+                        f_light = vec3<f32>(0.0);
+                    }
+                }
+            }
             if (j > 0u) {
                 let d_in_light = d_conn * -1.0;
                 let d_out_light = pv_dir(&eye, &light_path, view, i + 2u, i + 3u);

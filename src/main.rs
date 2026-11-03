@@ -159,13 +159,44 @@ fn build_scene() -> SceneData {
             Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     ));
 
-    //scene.add_light(LightData::from_quad(
-    //        Vec3::new(-15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
-    //));
-
-    //scene.add_light(LightData::from_quad(
-    //        Vec3::new(15.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
-    //));
+    // Laser light source: a cylinder housing whose top cap (the circular
+    // face) is the aperture, emitting a narrow beam along the cylinder's
+    // axis. The housing hangs from the ceiling (its base cap sunk 1 cm
+    // into the ceiling plane, so the ceiling quad always shades the mount
+    // patch — a base cap exactly coplanar with the ceiling would tie at
+    // the same t, and the winner would depend on BVH ordering); the beam
+    // exits the bottom circular face and paints a bright red disc on the
+    // open floor left of the glass sphere and the cube stack. Both the
+    // housing and the spot are in frame from the default camera, and the
+    // sight lines to both clear every object — the first placement, at
+    // (0.8, ·, 1.5), painted the floor *behind* the cube stack, so the
+    // spot was occluded and the beam invisible.
+    //
+    // The whole cylinder carries the laser material: the curved side and
+    // the base cap are dark (their normals point outside the beam cone,
+    // so the emission gate zeroes them), only the aperture radiates. The
+    // aperture is dark from the camera too — physically correct: the
+    // emission cone is ±1.1° around the downward normal and the camera
+    // sits ~85° off-axis, so the aperture glows only when viewed from
+    // inside the beam (e.g. a floor-level camera near the spot). The
+    // visible showcase is the dark housing silhouette plus the blazing
+    // red floor spot.
+    // The radiance is enormous on purpose. The cone is so narrow that a
+    // floor point sees only a tiny central patch of the aperture inside
+    // the beam: the spot's irradiance is L·π·tan²θ, ~50 W/m² here —
+    // at the old emission (8000, 160, 160) the spot's radiance was
+    // ~2.6 against ~1.8 of ambient floor, an invisible ~20% bump. A
+    // real laser's radiance is astronomically high; 5× the emission
+    // (same chromaticity) is what makes the narrow beam deposit a
+    // clearly visible spot.
+    scene.add_laser(
+        Vec3::new(-1.2, room_height - 0.34, 1.0), // housing center, base sunk into the ceiling
+        Vec3::new(0.0, -1.0, 0.0),                // beam straight down
+        0.2,                                      // housing height
+        0.12,                                    // aperture radius
+        0.02,                                    // beam half-angle (radians, ~1.1°)
+        Vec3::new(40000.0, 800.0, 800.0),        // red laser
+    );
 
     scene
 }
@@ -493,7 +524,9 @@ mod tests {
     #[test]
     fn scene_builds_and_is_sampleable() {
         let scene = build_scene();
-        assert_eq!(scene.lights.len(), 1);
+        // The demo scene has two emitters: the ceiling panel and the
+        // laser aperture.
+        assert_eq!(scene.lights.len(), 2);
         for light in &scene.lights {
             assert!(light.area() > 0.0);
             assert!(light.emission.x > 0.0 || light.emission.y > 0.0 || light.emission.z > 0.0);
@@ -505,7 +538,44 @@ mod tests {
             direction: Vec3::new(0.0, 0.0, 1.0),
         };
         assert!(cpu_scene.intersect(&ray).is_some());
-        assert_eq!(lights.len(), 1);
+        assert_eq!(lights.len(), 2);
+    }
+
+    /// The laser light source: a cylinder housing whose top cap is the
+    /// aperture. The scene must register it as real geometry (a cylinder
+    /// with the laser material) on both backends, and the aperture disc
+    /// must be the cylinder's top cap.
+    #[test]
+    fn laser_is_a_cylinder_with_an_emitting_top_cap() {
+        let scene = build_scene();
+        // Exactly one cylinder, carrying the laser material.
+        assert_eq!(scene.cylinders.len(), 1);
+        let cyl = &scene.cylinders[0];
+        assert!(cyl.mat.is_laser());
+        assert!(cyl.mat.is_emissive());
+        // The light's aperture is the cylinder's top cap center.
+        let laser_light = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("the laser must be registered as a light");
+        let top = cyl.base + cyl.axis * (2.0 * cyl.half_h);
+        assert!((laser_light.center - top).length() < 1e-5);
+        assert!((laser_light.normal - cyl.axis).length() < 1e-5);
+        assert!((laser_light.radius - cyl.radius).abs() < 1e-5);
+        // The CPU scene must contain the cylinder as intersectable
+        // geometry: a ray along the axis from beyond the top cap hits it.
+        let (cpu_scene, _) = scene.build_cpu_scene();
+        let along_axis = crate::geometry::Ray {
+            origin: top + cyl.axis * 0.5,
+            direction: cyl.axis * -1.0,
+        };
+        let hit = cpu_scene
+            .intersect(&along_axis)
+            .expect("the laser housing must be intersectable");
+        assert!(hit.mat.is_emissive());
+        // ...and the hit is the aperture (the top cap), in the beam.
+        assert!((hit.p - top).length() < 1e-4);
     }
 
     /// The room must be closed: the six walls actually cover the full
@@ -673,6 +743,73 @@ mod tests {
         );
     }
 
+    /// The laser showcase: the housing (a cylinder hanging from the
+    /// ceiling) and the beam's floor spot must both be in frame from the
+    /// default camera, and the spot must be on open floor (not hidden
+    /// behind an object). This pins the geometry the visual acceptance
+    /// depends on — a laser that is out of frame or whose spot is
+    /// occluded silently produces no visible beam.
+    #[test]
+    fn laser_housing_and_spot_are_in_frame() {
+        let scene = build_scene();
+        // The laser: the only shape-2 light.
+        let laser = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("demo scene must contain a laser");
+        let cyl = &scene.cylinders[0];
+        let aperture = laser.center;
+
+        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+        let forward = (cam.lookat - cam.origin).normalize();
+        let world_up = Vec3::new(0.0, 1.0, 0.0);
+        let right = world_up.cross(forward).normalize();
+        let up = forward.cross(right).normalize();
+        let half_fov = (cam.fov_deg * 0.5).to_radians().cos();
+        let in_frame = |name: &str, p: Vec3| {
+            let rel = p - cam.origin;
+            let f = rel.dot(forward);
+            assert!(f > 0.0, "{name} is behind the camera");
+            let cos_h = f / (rel.dot(right).abs().hypot(f));
+            let cos_v = f / (rel.dot(up).abs().hypot(f));
+            assert!(
+                cos_h >= half_fov && cos_v >= half_fov,
+                "{name} out of frame (cos_h {cos_h}, cos_v {cos_v}, need >= {half_fov})"
+            );
+        };
+
+        // The housing's midpoint and the aperture must be in frame.
+        let mid = cyl.base + cyl.axis * cyl.half_h;
+        in_frame("laser housing", mid);
+        in_frame("laser aperture", aperture);
+
+        // The beam spot: where the beam axis crosses the floor. The beam
+        // points straight down in the demo, so the spot is directly
+        // below the aperture.
+        let spot = aperture + laser.normal * (-aperture.y / laser.normal.y);
+        in_frame("laser spot", spot);
+
+        // The spot must be visible from the camera, not hidden behind
+        // the housing itself: the segment camera -> spot must not pass
+        // through the cylinder.
+        let (cpu_scene, _) = scene.build_cpu_scene();
+        let seg = spot - cam.origin;
+        let len = seg.length();
+        let ray = crate::geometry::Ray {
+            origin: cam.origin,
+            direction: seg * (1.0 / len),
+        };
+        if let Some(hit) = cpu_scene.intersect(&ray) {
+            assert!(
+                hit.t + 1e-3 >= len,
+                "laser spot occluded at t {} (spot at {})",
+                hit.t,
+                len
+            );
+        }
+    }
+
     /// Regenerate `screenshot.png` headlessly through the exact production
     /// path (`render_fhd` → `save_as_png`), so the Phase 1 acceptance
     /// artifact (the caustic visible in the screenshot) can be produced
@@ -767,6 +904,42 @@ mod tests {
         assert!(
             center_mean > reference_mean * 1.5,
             "no caustic visible: center {center_mean} vs reference {reference_mean}"
+        );
+
+        // --- Laser spot probe: the beam's floor disc must be clearly
+        // brighter (and redder) than the surrounding floor — the visual
+        // acceptance of the laser showcase, pinned the same way as the
+        // caustic. The spot sits directly below the aperture (the beam
+        // points straight down); the reference is the floor disc 0.6 to
+        // the +x, outside the beam disc (radius ~0.03) and away from
+        // every object.
+        let laser = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("demo scene must contain a laser");
+        let spot_world = laser.center + laser.normal * (-laser.center.y / laser.normal.y);
+        let (sx, sy) = project_to_pixel(&cam, spot_world, buffer.width, buffer.height);
+        let spot_ref_world = spot_world + Vec3::new(0.6, 0.0, 0.0);
+        let (srx, sry) = project_to_pixel(&cam, spot_ref_world, buffer.width, buffer.height);
+        let spot_mean = disc_mean(sx, sy);
+        let spot_ref_mean = disc_mean(srx, sry);
+        std::fs::write(
+            "target/laser_probe.txt",
+            format!(
+                "laser spot ({sx},{sy}) mean {spot_mean}\nreference ({srx},{sry}) mean {spot_ref_mean}\nratio {}\n",
+                spot_mean / spot_ref_mean
+            ),
+        )
+        .ok();
+        // The beam concentrates the aperture's power into a tiny disc:
+        // the spot must be several times brighter than the ambient-lit
+        // floor around it. 2x is a conservative floor for "clearly
+        // visible" (the caustic probe uses 1.5x; the laser's narrower
+        // concentration warrants the higher bar).
+        assert!(
+            spot_mean > spot_ref_mean * 2.0,
+            "no laser spot visible: spot {spot_mean} vs reference {spot_ref_mean}"
         );
 
         buffer

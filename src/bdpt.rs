@@ -33,7 +33,7 @@
 //! where it stopped are exactly reproducible.
 
 use crate::geometry::{
-    AreaLight, Intersectable, Material, Ray, Transport, cosine_hemisphere,
+    AreaLight, Bsdf, Intersectable, Material, Ray, Transport,
 };
 use crate::math::{Vec3, EPS_NEAR, VEC_ZERO};
 use rand::Rng;
@@ -293,7 +293,9 @@ impl<'a> PathView<'a> {
     /// m-1 — the light-direction sampling a^l(e_m). m = k+1 is the light
     /// position sample (pdf 1/(n·A)); m = k is the emitter event, which
     /// has no incoming direction: the emitter scatters cosine-weighted
-    /// around its stored (emission-side) normal with f = 1.
+    /// around its stored (emission-side) normal with f = 1 — except a
+    /// laser aperture, whose emission is uniform in its cone (pdf
+    /// 1/(2π(1 - cos θ)) inside the beam, 0 outside).
     fn pdf_light(&self, m: usize) -> f64 {
         if m == self.k + 1 {
             return 1.0 / self.inv_light_pdf;
@@ -303,11 +305,23 @@ impl<'a> PathView<'a> {
         }
         let pdf_omega = if m == self.k {
             let d_out = self.dir(m, m - 1);
-            let cos = self.vertex(m).normal.dot(d_out);
-            if cos <= 0.0 {
-                0.0
-            } else {
-                cos / PI
+            let v = self.vertex(m);
+            let cos = v.normal.dot(d_out);
+            match v.mat.bsdf {
+                Bsdf::Laser { cos_theta } => {
+                    if cos >= cos_theta {
+                        1.0 / (2.0 * PI * (1.0 - cos_theta))
+                    } else {
+                        0.0
+                    }
+                }
+                _ => {
+                    if cos <= 0.0 {
+                        0.0
+                    } else {
+                        cos / PI
+                    }
+                }
             }
         } else {
             self.event_pdf(m, m + 1, m - 1) as f32
@@ -534,13 +548,28 @@ fn rr_prefix_products(path: &PathView, alpha_light0: Vec3) -> RrProducts {
     // Light-side sweep: the roll at y_j governs the extension to y_{j+1},
     // whose factor is the sample weight of the event at y_j = x_{k-j}
     // toward y_{j+1} = x_{k-j-1}. The first extension has no BSDF at the
-    // emitter (f = 1, cosine sampling), hence the PI weight. The light
-    // subpath carries importance.
+    // emitter (f = 1): cosine sampling gives the weight π, a laser
+    // aperture's uniform cone sampling gives cos0 · 2π(1 − cos θ) (0
+    // outside the beam). The light subpath carries importance.
     let mut alpha_l = alpha_light0;
     out.ql[0] = 1.0;
     for j in 0..k.saturating_sub(2) {
         let factor = if j == 0 {
-            Vec3::new(PI, PI, PI)
+            // The emitter event at x_k = y_0, scattering toward x_{k-1}.
+            let v = path.vertex(k);
+            let d_out = path.dir(k, k - 1);
+            let cos0 = v.normal.dot(d_out);
+            match v.mat.bsdf {
+                Bsdf::Laser { cos_theta } => {
+                    if cos0 >= cos_theta {
+                        let f = cos0 * 2.0 * PI * (1.0 - cos_theta);
+                        Vec3::new(f, f, f)
+                    } else {
+                        VEC_ZERO
+                    }
+                }
+                _ => Vec3::new(PI, PI, PI),
+            }
         } else {
             path.event_weight(k - j, k - j + 1, k - j - 1, Transport::Importance)
         };
@@ -653,77 +682,106 @@ pub fn bdpt_trace(
         let light = &lights[rng.gen_range(0..n_lights)];
         inv_light_pdf = n_lights as f64 * light.area() as f64;
         let (p0, n0) = light.sample(rng);
+        let d0 = light.sample_dir(n0, rng);
+        // The first light extension (y_0 -> y_1) is unconditional
+        // (RR_START >= 2). The emitter has no BSDF (f = 1) and scatters
+        // cosine-weighted, so the edge factor is cos0 * π (the G of the
+        // edge cancels against the direction pdf, leaving the cosine
+        // integral π). A laser aperture instead samples uniformly in its
+        // cone, so the edge factor is cos0 * 2π(1 - cos θ) — and the
+        // direction must lie inside the beam, where the emitter's
+        // radiance is nonzero.
+        let is_laser = light.shape_is_laser();
+        let cos0 = n0.dot(d0);
+        let first_edge_factor = if !is_laser {
+            Vec3::new(PI, PI, PI)
+        } else if cos0 >= light.cone_cos() {
+            Vec3::new(
+                cos0 * 2.0 * PI * (1.0 - light.cone_cos()),
+                cos0 * 2.0 * PI * (1.0 - light.cone_cos()),
+                cos0 * 2.0 * PI * (1.0 - light.cone_cos()),
+            )
+        } else {
+            VEC_ZERO
+        };
         let mut ltp = light.emission * inv_light_pdf as f32;
         light_path.push(PathVertex {
             p: p0,
             normal: n0,
             front_face: true,
-            mat: Material::emissive(light.emission),
+            // The y_0 vertex material carries the emission cone so the
+            // MIS pdf machinery (pdf_light at m = k) can see it. For
+            // ordinary emitters the diffuse material reproduces the old
+            // cosine-weighted pdf.
+            mat: if is_laser {
+                Material::laser(light.emission, light.cone_theta())
+            } else {
+                Material::emissive(light.emission)
+            },
             throughput: ltp,
             on_light: true,
         });
 
-        // The first light extension (y_0 -> y_1) is unconditional
-        // (RR_START >= 2). The emitter has no BSDF (f = 1) and scatters
-        // cosine-weighted, so the edge contributes a factor PI.
-        ltp = ltp * PI;
-        let mut cur = Ray {
-            origin: p0 + n0 * EPS_NEAR,
-            direction: cosine_hemisphere(n0, rng),
-        };
-        // The connection strategies need k = i + j + 2 <= max_depth, so the
-        // last light vertex (j = max_depth - 1) could never be connected.
-        // Building one vertex fewer avoids a wasted intersection.
-        for _ in 1..max_depth.saturating_sub(1) {
-            let Some(hit) = scene.intersect(&cur) else {
-                break;
+        if first_edge_factor != VEC_ZERO {
+            ltp = ltp * first_edge_factor;
+            let mut cur = Ray {
+                origin: p0 + n0 * EPS_NEAR,
+                direction: d0,
             };
-            // Pure emitters do not reflect.
-            if hit.mat.is_emissive() {
-                break;
+            // The connection strategies need k = i + j + 2 <= max_depth, so the
+            // last light vertex (j = max_depth - 1) could never be connected.
+            // Building one vertex fewer avoids a wasted intersection.
+            for _ in 1..max_depth.saturating_sub(1) {
+                let Some(hit) = scene.intersect(&cur) else {
+                    break;
+                };
+                // Pure emitters do not reflect.
+                if hit.mat.is_emissive() {
+                    break;
+                }
+                let front_face = hit.normal.dot(cur.direction) < 0.0;
+                if !front_face && !hit.mat.bsdf.is_delta() {
+                    break;
+                }
+                let normal = if front_face {
+                    hit.normal
+                } else {
+                    hit.normal * -1.0
+                };
+                light_path.push(PathVertex {
+                    p: hit.p,
+                    normal,
+                    front_face,
+                    mat: hit.mat,
+                    throughput: ltp,
+                    on_light: false,
+                });
+                // Russian roulette for the extension y_j -> y_{j+1}
+                // (j = light_path.len() - 1 >= 1, number j + 1).
+                let j = light_path.len() - 1;
+                let s = hit.mat.sample_bsdf(
+                    normal,
+                    front_face,
+                    cur.direction,
+                    Transport::Importance,
+                    rng,
+                );
+                let beta = ltp * s.weight;
+                let q = rr_survival(beta, j + 1);
+                if q < 1.0 && rng.gen::<f32>() >= q {
+                    break;
+                }
+                ltp = beta * (1.0 / q);
+                let offset = if s.dir_out.dot(normal) > 0.0 {
+                    normal
+                } else {
+                    normal * -1.0
+                };
+                cur = Ray {
+                    origin: hit.p + offset * EPS_NEAR,
+                    direction: s.dir_out,
+                };
             }
-            let front_face = hit.normal.dot(cur.direction) < 0.0;
-            if !front_face && !hit.mat.bsdf.is_delta() {
-                break;
-            }
-            let normal = if front_face {
-                hit.normal
-            } else {
-                hit.normal * -1.0
-            };
-            light_path.push(PathVertex {
-                p: hit.p,
-                normal,
-                front_face,
-                mat: hit.mat,
-                throughput: ltp,
-                on_light: false,
-            });
-            // Russian roulette for the extension y_j -> y_{j+1}
-            // (j = light_path.len() - 1 >= 1, number j + 1).
-            let j = light_path.len() - 1;
-            let s = hit.mat.sample_bsdf(
-                normal,
-                front_face,
-                cur.direction,
-                Transport::Importance,
-                rng,
-            );
-            let beta = ltp * s.weight;
-            let q = rr_survival(beta, j + 1);
-            if q < 1.0 && rng.gen::<f32>() >= q {
-                break;
-            }
-            ltp = beta * (1.0 / q);
-            let offset = if s.dir_out.dot(normal) > 0.0 {
-                normal
-            } else {
-                normal * -1.0
-            };
-            cur = Ray {
-                origin: hit.p + offset * EPS_NEAR,
-                direction: s.dir_out,
-            };
         }
     }
 
@@ -732,22 +790,35 @@ pub fn bdpt_trace(
         let k = eye.len();
         let w = match lights.iter().find(|l| l.contains(last.p)) {
             Some(light) => {
-                let inv_pdf = n_lights as f64 * light.area() as f64;
-                let path = PathView {
-                    eye: &eye,
-                    light_path: &light_path,
-                    k,
-                    n_eye: k,
-                    cam_dir: ray.direction,
-                    inv_light_pdf: inv_pdf,
-                };
-                // The hypothetical light subpath of the other strategies
-                // starts at this hit point with the emitter's throughput
-                // (emission * n * A, the inverse light-sampling pdf).
-                let rr = rr_prefix_products(&path, light.emission * inv_pdf as f32);
-                mis_weight(&path, &rr.qe, &rr.ql, k)
+                // A laser aperture radiates only into its cone: a hit
+                // outside the beam (the dark side of the housing, or the
+                // aperture seen from behind) carries no emission. The
+                // eye vertex's stored normal is the aperture's outward
+                // normal; the incoming direction is the camera ray's.
+                let in_beam = light.in_beam(last.p, last.p - ray.direction);
+                if in_beam {
+                    let inv_pdf = n_lights as f64 * light.area() as f64;
+                    let path = PathView {
+                        eye: &eye,
+                        light_path: &light_path,
+                        k,
+                        n_eye: k,
+                        cam_dir: ray.direction,
+                        inv_light_pdf: inv_pdf,
+                    };
+                    // The hypothetical light subpath of the other strategies
+                    // starts at this hit point with the emitter's throughput
+                    // (emission * n * A, the inverse light-sampling pdf).
+                    let rr = rr_prefix_products(&path, light.emission * inv_pdf as f32);
+                    mis_weight(&path, &rr.qe, &rr.ql, k)
+                } else {
+                    0.0
+                }
             }
-            None => 1.0,
+            // The hit is on no sampleable light (e.g. the dark curved
+            // side of a laser housing, which is emissive-tagged
+            // geometry but not the aperture): no emission there.
+            None => 0.0,
         };
         total = total + last.throughput * last.mat.emission * w;
     }
@@ -791,8 +862,18 @@ pub fn bdpt_trace(
                 .mat
                 .eval_bsdf(n_eye_end, d_in_eye, d_conn);
             let (f_light, n_light_end) = if j == 0 {
-                // y_0 is the emitter itself: no BSDF applies there.
-                (Vec3::new(1.0, 1.0, 1.0), path.vertex(k).normal)
+                // y_0 is the emitter itself: no BSDF applies there — but
+                // a laser aperture radiates only into its cone, so the
+                // connection direction must lie inside the beam.
+                let in_beam = !light_path[0].mat.is_laser()
+                    || light_path[0]
+                        .mat
+                        .in_beam(path.vertex(k).normal, path.vertex(k).p, path.vertex(i + 1).p);
+                if in_beam {
+                    (Vec3::new(1.0, 1.0, 1.0), path.vertex(k).normal)
+                } else {
+                    (VEC_ZERO, path.vertex(k).normal)
+                }
             } else {
                 let d_in_light = d_conn * -1.0;
                 let d_out_light = path.dir(i + 2, i + 3);
@@ -828,7 +909,7 @@ pub fn bdpt_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{Cube, Material, Plane, Quad, Sphere};
+    use crate::geometry::{Cube, Cylinder, Material, Plane, Quad, Sphere, cosine_hemisphere};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
@@ -1391,6 +1472,108 @@ mod tests {
         let r = ray(Vec3::new(0.0, 0.5, 2.0), Vec3::new(0.0, 1.0, -1.0));
         let c = bdpt_trace(&r, &*scene, 4, &lights, &mut rng);
         assert!((c.x - 4.0).abs() < 1e-3, "got {c:?}");
+    }
+
+    /// The laser: a cylinder housing whose top cap emits a narrow cone.
+    /// Three checks pin the physics:
+    /// 1. A camera ray straight down the beam axis sees the aperture at
+    ///    full emission (the direct-hit strategy, cone-gated).
+    /// 2. A floor point inside the beam is lit; a point outside the cone
+    ///    (but at the same distance) stays dark — the beam is a cone,
+    ///    not a hemisphere.
+    /// 3. The dark side of the housing (the curved wall) does not glow.
+    #[test]
+    fn laser_beam_lights_only_inside_the_cone() {
+        // A laser pointing straight down at the floor from height 2,
+        // cone half-angle ~5.7°: the beam disc on the floor has radius
+        // 2 * tan(5.7°) ≈ 0.2.
+        let theta = 0.1f32;
+        let le = Vec3::new(50.0, 50.0, 50.0);
+        let housing = Cylinder::new(
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            0.4,
+            0.1,
+            Material::laser(le, theta),
+        );
+        let objects: Vec<Box<dyn Intersectable>> = vec![
+            Box::new(Plane {
+                point: Vec3::new(0.0, 0.0, 0.0),
+                normal: Vec3::new(0.0, 1.0, 0.0),
+                mat: diffuse(Vec3::new(0.8, 0.8, 0.8)),
+            }),
+            Box::new(housing.clone()),
+        ];
+        let lights = vec![AreaLight::from_laser(
+            housing.top_center(),
+            housing.axis,
+            housing.radius,
+            theta,
+            le,
+        )];
+        let scene = crate::bvh::BVHNode::build(objects).unwrap();
+
+        // 1. Straight up the beam axis at the aperture (from below, the
+        // side the cone opens to): full emission.
+        let mut rng = StdRng::seed_from_u64(21);
+        let r = ray(Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        let c = bdpt_trace(&r, &*scene, 4, &lights, &mut rng);
+        assert!((c.x - le.x).abs() < 1e-3, "beam-axis view: {c:?}");
+
+        // 1b. An off-center aperture hit: the disc has radius 0.1, and a
+        // ray striking it 0.05 off the axis is still a front-face hit
+        // inside the cone, so it must see the same full emission. (The
+        // beam gate once measured the distance from the disc *center*,
+        // which blacked out every off-center point of the aperture.)
+        let mut rng = StdRng::seed_from_u64(25);
+        let off_center = ray(Vec3::new(0.05, 0.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        let c = bdpt_trace(&off_center, &*scene, 4, &lights, &mut rng);
+        assert!((c.x - le.x).abs() < 1e-3, "off-center aperture view: {c:?}");
+
+        // 2. Inside vs outside the beam on the floor. The beam disc has
+        // radius 2 * tan(0.1) ≈ 0.2 centered at the origin; the camera
+        // looks straight down at a floor point inside it, then at one
+        // far outside (same geometry, only the cone gate differs).
+        let mut rng = StdRng::seed_from_u64(22);
+        let inside = ray(Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, -1.0, 0.0));
+        let mut mean_in = VEC_ZERO;
+        for _ in 0..512 {
+            mean_in = mean_in + bdpt_trace(&inside, &*scene, 6, &lights, &mut rng);
+        }
+        mean_in = mean_in * (1.0 / 512.0);
+
+        let mut rng = StdRng::seed_from_u64(23);
+        let outside = ray(Vec3::new(1.5, 0.5, 0.0), Vec3::new(0.0, -1.0, 0.0));
+        let mut mean_out = VEC_ZERO;
+        for _ in 0..512 {
+            mean_out = mean_out + bdpt_trace(&outside, &*scene, 6, &lights, &mut rng);
+        }
+        mean_out = mean_out * (1.0 / 512.0);
+
+        assert!(
+            mean_in.x > mean_out.x * 10.0 + 1e-4,
+            "beam does not concentrate light: in {mean_in:?} out {mean_out:?}"
+        );
+        // The outside point receives nothing direct; with a dark room
+        // (no other lights) it must be essentially black.
+        assert!(
+            mean_out.x < 1e-3,
+            "light leaks outside the cone: {mean_out:?}"
+        );
+
+        // 3. The dark side of the housing: a camera ray at the curved
+        // wall must not see emission (the cone gate zeroes it).
+        let mut rng = StdRng::seed_from_u64(24);
+        let side = ray(Vec3::new(3.0, 2.0, 0.0), Vec3::new(-1.0, 0.0, 0.0));
+        let mut mean_side = VEC_ZERO;
+        for _ in 0..256 {
+            mean_side = mean_side + bdpt_trace(&side, &*scene, 4, &lights, &mut rng);
+        }
+        mean_side = mean_side * (1.0 / 256.0);
+        assert!(
+            mean_side.x < 1e-3,
+            "dark housing side glows: {mean_side:?}"
+        );
     }
 
     /// The white furnace: a closed room where every surface has albedo 1

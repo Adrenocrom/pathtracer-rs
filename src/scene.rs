@@ -6,7 +6,7 @@
 //! of truth for the scene guarantees both backends trace identical geometry.
 
 use crate::geometry::{
-    AreaLight, Bsdf, Cube, Intersectable, Material, Plane, Quad, Sphere,
+    AreaLight, Bsdf, Cube, Cylinder, Intersectable, Material, Plane, Quad, Sphere,
 };
 use crate::math::Vec3;
 
@@ -52,6 +52,23 @@ impl MaterialData {
         }
     }
 
+    /// A laser emitter: radiates `emission` only into the cone of
+    /// half-angle `theta` around the geometric normal (the beam).
+    pub fn laser(emission: Vec3, theta: f32) -> Self {
+        Self {
+            albedo: Vec3::new(0.0, 0.0, 0.0),
+            emission,
+            bsdf: Bsdf::Laser {
+                cos_theta: theta.cos(),
+            },
+        }
+    }
+
+    /// True when this material radiates into a cone (a laser aperture).
+    pub fn is_laser(&self) -> bool {
+        matches!(self.bsdf, Bsdf::Laser { .. })
+    }
+
     /// Pure emitters do not scatter; the BSDF is ignored for them.
     pub fn is_emissive(&self) -> bool {
         self.emission != Vec3::new(0.0, 0.0, 0.0)
@@ -77,7 +94,7 @@ impl MaterialData {
 /// A sampleable emitter surface, mirroring `geometry::AreaLight` in flat form.
 #[derive(Clone, Copy)]
 pub struct LightData {
-    /// 0 = sphere, 1 = quad.
+    /// 0 = sphere, 1 = quad, 2 = laser aperture (disc + cone).
     pub shape: u32,
     pub center: Vec3,
     /// Sphere radius (unused for quads).
@@ -131,12 +148,41 @@ impl LightData {
         }
     }
 
+    /// A laser aperture light: a disc of `radius` centered at `center`
+    /// with outward normal `normal`, radiating only into the cone of
+    /// half-angle `theta` around the normal. The disc is the emitting
+    /// cap of the laser's cylinder housing (see `SceneData::add_laser`);
+    /// `height` is the housing's total height, carried so `add_light`
+    /// can register the housing as geometry.
+    pub fn from_laser(
+        center: Vec3,
+        normal: Vec3,
+        radius: f32,
+        theta: f32,
+        height: f32,
+        emission: Vec3,
+    ) -> Self {
+        Self {
+            shape: 2,
+            center,
+            radius,
+            normal: normal.normalize(),
+            tangent: Vec3::new(0.0, 0.0, 0.0),
+            bitangent: Vec3::new(0.0, 0.0, 0.0),
+            half_w: theta,   // the cone half-angle rides in the unused slot
+            half_h: height, // the housing height rides in the unused slot
+            emission,
+        }
+    }
+
     /// Surface area (used by tests; the GPU shader computes it inline).
     #[allow(dead_code)]
     pub fn area(&self) -> f32 {
         const PI: f32 = std::f32::consts::PI;
         if self.shape == 0 {
             4.0 * PI * self.radius * self.radius
+        } else if self.shape == 2 {
+            PI * self.radius * self.radius
         } else {
             4.0 * self.half_w * self.half_h
         }
@@ -150,6 +196,7 @@ pub struct SceneData {
     pub quads: Vec<QuadData>,
     pub cubes: Vec<CubeData>,
     pub planes: Vec<PlaneData>,
+    pub cylinders: Vec<CylinderData>,
     pub lights: Vec<LightData>,
 }
 
@@ -185,6 +232,18 @@ pub struct PlaneData {
     pub mat: MaterialData,
 }
 
+/// A closed cylinder in flat form: `base` is the center of the base cap,
+/// `axis` the unit direction from base to top, `half_h` the half-height.
+/// The top cap carries the material (for a laser: the emitting aperture).
+#[derive(Clone, Copy)]
+pub struct CylinderData {
+    pub base: Vec3,
+    pub axis: Vec3,
+    pub radius: f32,
+    pub half_h: f32,
+    pub mat: MaterialData,
+}
+
 impl SceneData {
     pub fn new() -> Self {
         Self {
@@ -192,6 +251,7 @@ impl SceneData {
             quads: Vec::new(),
             cubes: Vec::new(),
             planes: Vec::new(),
+            cylinders: Vec::new(),
             lights: Vec::new(),
         }
     }
@@ -287,8 +347,8 @@ impl SceneData {
 
     /// Register an emitter. The light is stored in two places, by design:
     ///
-    /// * as real intersectable geometry (`spheres`/`quads`), so eye
-    ///   subpaths can hit it on *both* backends — the GPU's
+    /// * as real intersectable geometry (`spheres`/`quads`/`cylinders`),
+    ///   so eye subpaths can hit it on *both* backends — the GPU's
     ///   `intersect_scene` reads only the geometry buffers, never the
     ///   light buffer;
     /// * as a sampleable `LightData`, which drives the light subpath and
@@ -304,6 +364,22 @@ impl SceneData {
                 radius: light.radius,
                 mat,
             });
+        } else if light.shape == 2 {
+            // A laser aperture: the disc is the top cap of a cylinder
+            // housing, whose material carries the emission cone. The
+            // housing is registered here so the aperture is real
+            // geometry on both backends.
+            let theta = light.half_w; // the cone half-angle rides in half_w
+            let height = light.half_h; // the housing height rides in half_h
+            let axis = light.normal;
+            let base = light.center - axis * height;
+            self.cylinders.push(CylinderData {
+                base,
+                axis,
+                radius: light.radius,
+                half_h: height * 0.5,
+                mat: MaterialData::laser(light.emission, theta),
+            });
         } else {
             self.quads.push(QuadData {
                 center: light.center,
@@ -316,6 +392,33 @@ impl SceneData {
             });
         }
         self.lights.push(light);
+    }
+
+    /// Add a laser light source: a cylinder housing whose top cap is the
+    /// aperture, emitting a beam along `axis` (the cylinder's axis, so
+    /// the beam exits the circular face) into a cone of half-angle
+    /// `theta`. `height` is the cylinder's total height; the aperture
+    /// disc sits at `center + axis * height/2`.
+    ///
+    /// The whole cylinder carries the laser material: the curved side
+    /// and the base cap are dark (their normals point outside the beam
+    /// cone, so the emission gate zeroes them), while the top cap — the
+    /// aperture — radiates into the cone. One primitive, one material,
+    /// no separate housing mesh needed.
+    pub fn add_laser(
+        &mut self,
+        center: Vec3,
+        axis: Vec3,
+        height: f32,
+        radius: f32,
+        theta: f32,
+        emission: Vec3,
+    ) {
+        let axis = axis.normalize();
+        let aperture = center + axis * (height * 0.5);
+        self.add_light(LightData::from_laser(
+            aperture, axis, radius, theta, height, emission,
+        ));
     }
 
     /// The highest luminance any physically valid sample can carry:
@@ -376,6 +479,15 @@ impl SceneData {
                 mat: p.mat.to_material(),
             }));
         }
+        for c in &self.cylinders {
+            objects.push(Box::new(Cylinder {
+                base: c.base,
+                axis: c.axis,
+                radius: c.radius,
+                half_h: c.half_h,
+                mat: c.mat.to_material(),
+            }));
+        }
         // Emitter geometry is already part of `spheres`/`quads` —
         // `add_light` registers it — so it must not be added again here.
         let scene = crate::bvh::BVHNode::build(objects).expect("scene is non-empty");
@@ -390,6 +502,8 @@ impl SceneData {
                 radius: l.radius,
                 mat: Material::emissive(l.emission),
             })
+        } else if l.shape == 2 {
+            AreaLight::from_laser(l.center, l.normal, l.radius, l.half_w, l.emission)
         } else {
             AreaLight::from_quad(&Quad {
                 center: l.center,
