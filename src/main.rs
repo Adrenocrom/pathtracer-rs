@@ -39,6 +39,8 @@ fn build_scene() -> SceneData {
     let red = MaterialData::diffuse(Vec3::new(0.75, 0.25, 0.25));
     let green = MaterialData::diffuse(Vec3::new(0.25, 0.75, 0.25));
 
+    let brown = MaterialData::diffuse(Vec3::new(0.2, 0.25, 0.25));
+
     let mut scene = SceneData::new();
 
     // The room: finite quads, not infinite planes. Planes get a ±1e6
@@ -190,13 +192,43 @@ fn build_scene() -> SceneData {
     // (same chromaticity) is what makes the narrow beam deposit a
     // clearly visible spot.
     scene.add_laser(
-        Vec3::new(-1.2, 0.4, 1.0), // housing center, base sunk into the ceiling
-        Vec3::new(0.0, 0.0, 1.0),                // beam straight down
+        Vec3::new(-1.3, 0.62, 1.8), // housing center, base sunk into the ceiling
+        Vec3::new(-0.1, 0.0, -1.0),                // beam straight down
         0.2,                                      // housing height
-        0.02,                                    // aperture radius
-        0.02,                                    // beam half-angle (radians, ~1.1°)
-        Vec3::new(40000.0, 800.0, 800.0),        // red laser
+        0.01,                                    // aperture radius
+        0.01,                                    // beam half-angle (radians, ~1.1°)
+        Vec3::new(400000000.0, 800.0, 800.0),        // green laser
     );
+
+    scene.add_laser(
+        Vec3::new(-1.6, 0.62, 1.9), // housing center, base sunk into the ceiling
+        Vec3::new(-1.0, 0.0, -0.5),                // beam straight down
+        0.2,                                      // housing height
+        0.01,                                    // aperture radius
+        0.01,                                    // beam half-angle (radians, ~1.1°)
+        Vec3::new(800.0, 400000000.0, 800.0),        // green laser
+    );
+
+    scene.add_box( Vec3::new(-1.4, 0.65, 1.5), Vec3::new(0.1, 0.1, 0.1), MaterialData::glass(1.5));
+    scene.add_box( Vec3::new(-1.9, 0.65, 1.7), Vec3::new(0.001, 0.1, 0.2), white);
+    scene.add_box( Vec3::new(-1.7, 0.65, 1.6), Vec3::new(0.001, 0.1, 0.4), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
+
+    scene.add_quad(
+        Vec3::new(0.0, 1.0, room_size - 0.01),
+        Vec3::new(0.0, 0.0, -1.0),
+        1.5,
+        0.5,
+        //white
+        MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
+    );
+
+    let pos = Vec3::new(-1.7, 0.6, 1.7);
+    let dim = Vec3::new(1.0, 0.02, 0.7);
+    scene.add_box(pos, dim, white);
+    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
 
     scene
 }

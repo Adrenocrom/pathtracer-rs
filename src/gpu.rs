@@ -790,7 +790,7 @@ impl GpuRenderer {
     /// GPU. Does not block on the GPU; call `read_pixels` when pixels are
     /// needed.
     pub fn render_frame(&mut self, cam: &crate::camera::Cam, max_depth: u32) {
-        self.render_frame_spp(cam, max_depth, 1);
+        self.render_frame_spp(cam, max_depth, 2);
     }
 
     /// Render one frame with `spp` samples per pixel (traced in a single
