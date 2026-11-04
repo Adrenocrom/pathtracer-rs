@@ -107,48 +107,6 @@ fn build_scene() -> SceneData {
         white,
     );
 
-    // Central spheres: one diffuse at the left edge, and the glass sphere
-    // dead center — the caustic showcase (see the light below).
-    scene.add_sphere(Vec3::new(-0.9, 0.4, -0.9), 0.4, white);
-    // The glass sphere floats 0.2 above the floor instead of touching it:
-    // at exact contact, a ray refracted out of the bottom cap would start
-    // (after the EPS_NEAR ray offset) below the floor plane and miss it,
-    // punching a hole in the center of the caustic. The height also keeps
-    // the caustic center visible from the default camera: a sphere resting
-    // on the floor hides the floor point directly beneath it behind its
-    // own silhouette.
-    scene.add_sphere(Vec3::new(-0.4, 0.5, 0.1), 0.3, MaterialData::glass(1.5));
-
-    scene.add_cube(Vec3::new(1.0, 0.3, -0.8), 0.6, white);
-    scene.add_sphere(Vec3::new(1.0, 1.0, -0.8), 0.4, white);
-
-    // Stacked cubes for interesting shadows
-    scene.add_cube(Vec3::new(0.3, 0.3, 0.8), 0.6, white);
-    scene.add_cube(Vec3::new(0.94, 0.3, 0.8), 0.6, white);
-    scene.add_cube(Vec3::new(1.58, 0.3, 0.8), 0.6, white);
-
-    scene.add_cube(Vec3::new(0.45, 0.9, 0.8), 0.6, white);
-    scene.add_cube(Vec3::new(1.09, 0.9, 0.8), 0.6, white);
-
-    // Chrome sphere resting on the cube stack (its bottom touches the top
-    // face of the right upper cube at y = 1.2): reflects the red/green
-    // walls, the ceiling light and the glass sphere — the mirror BSDF
-    // showcase.
-    scene.add_sphere(
-        Vec3::new(1.09, 1.45, 0.8),
-        0.25,
-        MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
-    );
-
-    // The old hanging light (small emissive sphere, directly above the
-    // glass sphere) is replaced by the ceiling panel below; kept here
-    // for reference. `add_light` registers the emitter as geometry too.
-    //scene.add_light(LightData::from_sphere(
-    //    Vec3::new(-0.4, 1.2, 0.1),
-    //    0.2,
-    //    emission,
-    //));
-
     // Ceiling light panel (one-sided: emits along its normal, i.e.
     // downward). `add_light` registers the quad as geometry too. It
     // shines down on the glass sphere at a shallow off-axis angle
@@ -161,74 +119,25 @@ fn build_scene() -> SceneData {
             Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     ));
 
-    // Laser light source: a cylinder housing whose top cap (the circular
-    // face) is the aperture, emitting a narrow beam along the cylinder's
-    // axis. The housing hangs from the ceiling (its base cap sunk 1 cm
-    // into the ceiling plane, so the ceiling quad always shades the mount
-    // patch — a base cap exactly coplanar with the ceiling would tie at
-    // the same t, and the winner would depend on BVH ordering); the beam
-    // exits the bottom circular face and paints a bright red disc on the
-    // open floor left of the glass sphere and the cube stack. Both the
-    // housing and the spot are in frame from the default camera, and the
-    // sight lines to both clear every object — the first placement, at
-    // (0.8, ·, 1.5), painted the floor *behind* the cube stack, so the
-    // spot was occluded and the beam invisible.
-    //
-    // The housing carries a normal diffuse material, so it shades like
-    // any other object; the aperture is a thin puck of laser material
-    // whose top cap radiates into the cone (the rest of the puck is
-    // hidden inside the housing). The aperture is dark from the camera
-    // too — physically correct: the emission cone is ±1.1° around the
-    // downward normal and the camera sits ~85° off-axis, so the
-    // aperture glows only when viewed from inside the beam (e.g. a
-    // floor-level camera near the spot). The visible showcase is the
-    // shaded housing plus the blazing red floor spot.
-    // The radiance is enormous on purpose. The cone is so narrow that a
-    // floor point sees only a tiny central patch of the aperture inside
-    // the beam: the spot's irradiance is L·π·tan²θ, ~50 W/m² here —
-    // at the old emission (8000, 160, 160) the spot's radiance was
-    // ~2.6 against ~1.8 of ambient floor, an invisible ~20% bump. A
-    // real laser's radiance is astronomically high; 5× the emission
-    // (same chromaticity) is what makes the narrow beam deposit a
-    // clearly visible spot.
-    scene.add_laser(
-        Vec3::new(-1.3, 0.62, 1.8), // housing center, base sunk into the ceiling
-        Vec3::new(-0.1, 0.0, -1.0),                // beam straight down
-        0.2,                                      // housing height
-        0.01,                                    // aperture radius
-        0.01,                                    // beam half-angle (radians, ~1.1°)
-        Vec3::new(400000000.0, 800.0, 800.0),        // green laser
-    );
+    // objects
+    scene.add_box( Vec3::new(room_size/2.0, 1.0, 1.0), Vec3::new(room_size, room_height, 0.02), white);
 
     scene.add_laser(
-        Vec3::new(-1.6, 0.62, 1.9), // housing center, base sunk into the ceiling
-        Vec3::new(-1.0, 0.0, -0.5),                // beam straight down
+        Vec3::new(-0.5, 1.0, 2.0), // housing center, base sunk into the ceiling
+        Vec3::new(1.0, 0.0, 1.0),                // beam straight down
         0.2,                                      // housing height
         0.01,                                    // aperture radius
         0.01,                                    // beam half-angle (radians, ~1.1°)
         Vec3::new(800.0, 400000000.0, 800.0),        // green laser
     );
 
-    scene.add_box( Vec3::new(-1.4, 0.65, 1.5), Vec3::new(0.1, 0.1, 0.1), MaterialData::glass(1.5));
-    scene.add_box( Vec3::new(-1.9, 0.65, 1.7), Vec3::new(0.001, 0.1, 0.2), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
-    scene.add_box( Vec3::new(-1.7, 0.65, 1.6), Vec3::new(0.001, 0.1, 0.4), white);
-
     scene.add_quad(
         Vec3::new(0.0, 1.0, room_size - 0.01),
         Vec3::new(0.0, 0.0, -1.0),
         1.5,
         0.5,
-        //white
         MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
     );
-
-    let pos = Vec3::new(-1.7, 0.6, 1.7);
-    let dim = Vec3::new(1.0, 0.02, 0.7);
-    scene.add_box(pos, dim, white);
-    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
 
     scene
 }
