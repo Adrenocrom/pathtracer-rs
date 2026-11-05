@@ -115,101 +115,101 @@ fn build_scene() -> SceneData {
             Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     ));
 
-    //// The mirror tile: 0.6 × 0.6, lying on the floor under the laser,
-    //// tilted 30° (its lower edge 2 mm above the floor). The normal
-    //// (0, cos 30°, sin 30°) points up and toward the front wall, so the
-    //// downward beam reflects up the wall at 60° from vertical.
-    //// Added *before* the laser: `add_laser` traces the beam's axis ray
-    //// through the scene to build the specular bridge (the aperture's
-    //// mirror image), so the mirror must already be registered.
-    //let mirror_tilt = 30.0f32.to_radians();
-    //scene.add_quad(
-    //    Vec3::new(-0.9, 0.3 * mirror_tilt.sin() + 0.002, 0.6),
-    //    Vec3::new(0.0, mirror_tilt.cos(), mirror_tilt.sin()),
-    //    0.6,
-    //    0.6,
-    //    MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
-    //);
-
-    //// The laser showcase: a green laser hanging from the ceiling, aimed
-    //// straight down at the mirror tile, which bounces the beam up onto
-    //// the front wall — the wall the default camera faces. (A
-    //// wall-mounted flat mirror cannot do this: it flips the beam's
-    //// z-travel, so the beam can never land back on the wall it is
-    //// mounted on. The floor tilt is what turns the downward beam into
-    //// an upward one.)
-    ////
-    //// The beam's spot on the wall is *transported light*, not a decal:
-    //// `add_laser` traces the beam's axis ray, and when it hits the
-    //// mirror it registers the aperture's mirror image as a "specular
-    //// bridge" — a sampling technique the BDPT eye walk uses at diffuse
-    //// vertices (with probability BRIDGE_PROB it aims at the image disc,
-    //// so the path camera → wall → mirror → aperture is carried by
-    //// ordinary subpath walking; the direct-hit strategy then credits
-    //// the aperture's emission, cone-gated). No BDPT connection can
-    //// sample that path (the mirror is a delta endpoint) and no light
-    //// subpath can reach the aperture (a ~1 cm disc behind the mirror),
-    //// so without the bridge the spot is invisible — the estimator's
-    //// blind spot. There is deliberately no beam in flight: in clean air
-    //// a laser beam is invisible from the side; only the spot is real.
-    //scene.add_laser(
-    //    Vec3::new(-0.9, 1.899, 0.6), // housing base cap 1 mm below the ceiling
-    //    Vec3::new(0.0, -1.0, 0.0),  // beam straight down at the floor mirror
-    //    0.2,                        // housing height
-    //    0.01,                       // aperture radius
-    //    0.01,                       // beam half-angle (radians, ~0.57°)
-    //    Vec3::new(0.8, 4.0e8, 0.8), // green laser
-    //);
-
-    scene.add_box( Vec3::new(room_size/2.0, 1.0, 1.0), Vec3::new(room_size, room_height, 0.02), white);
+    // The mirror tile: 0.6 × 0.6, lying on the floor under the laser,
+    // tilted 30° (its lower edge 2 mm above the floor). The normal
+    // (0, cos 30°, sin 30°) points up and toward the front wall, so the
+    // downward beam reflects up the wall at 60° from vertical.
+    // Added *before* the laser: `add_laser` traces the beam's axis ray
+    // through the scene to build the specular bridge (the aperture's
+    // mirror image), so the mirror must already be registered.
+    let mirror_tilt = 30.0f32.to_radians();
     scene.add_quad(
-        Vec3::new(0.0, 1.0, room_size - 0.01),
-        Vec3::new(0.0, 0.0, -1.0),
-        1.5,
-        0.5,
-        //white
+        Vec3::new(-0.9, 0.3 * mirror_tilt.sin() + 0.002, 0.6),
+        Vec3::new(0.0, mirror_tilt.cos(), mirror_tilt.sin()),
+        0.6,
+        0.6,
         MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
     );
 
-
-    scene.add_box( Vec3::new(-1.4, 0.65, 1.5), Vec3::new(0.1, 0.1, 0.1), MaterialData::glass(1.5));
-    scene.add_box( Vec3::new(-1.9, 0.65, 1.7), Vec3::new(0.001, 0.1, 0.2), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
-    scene.add_box( Vec3::new(-1.7, 0.65, 1.6), Vec3::new(0.001, 0.1, 0.4), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
-
-    let pos = Vec3::new(-1.7, 0.6, 1.7);
-    let dim = Vec3::new(1.0, 0.02, 0.7);
-    scene.add_box(pos, dim, white);
-    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-
+    // The laser showcase: a green laser hanging from the ceiling, aimed
+    // straight down at the mirror tile, which bounces the beam up onto
+    // the front wall — the wall the default camera faces. (A
+    // wall-mounted flat mirror cannot do this: it flips the beam's
+    // z-travel, so the beam can never land back on the wall it is
+    // mounted on. The floor tilt is what turns the downward beam into
+    // an upward one.)
+    //
+    // The beam's spot on the wall is *transported light*, not a decal:
+    // `add_laser` traces the beam's axis ray, and when it hits the
+    // mirror it registers the aperture's mirror image as a "specular
+    // bridge" — a sampling technique the BDPT eye walk uses at diffuse
+    // vertices (with probability BRIDGE_PROB it aims at the image disc,
+    // so the path camera → wall → mirror → aperture is carried by
+    // ordinary subpath walking; the direct-hit strategy then credits
+    // the aperture's emission, cone-gated). No BDPT connection can
+    // sample that path (the mirror is a delta endpoint) and no light
+    // subpath can reach the aperture (a ~1 cm disc behind the mirror),
+    // so without the bridge the spot is invisible — the estimator's
+    // blind spot. There is deliberately no beam in flight: in clean air
+    // a laser beam is invisible from the side; only the spot is real.
     scene.add_laser(
-        Vec3::new(-1.0, 1.0, 1.8), // housing center, base sunk into the ceiling
-        Vec3::new(1.0, 0.0, 1.0),                // beam straight down
-        0.2,                                      // housing height
-        0.01,                                    // aperture radius
-        0.01,                                    // beam half-angle (radians, ~1.1°)
-        Vec3::new(800.0, 800.0, 40.0e8),        // green laser
+        Vec3::new(-0.9, 1.899, 0.6), // housing base cap 1 mm below the ceiling
+        Vec3::new(0.0, -1.0, 0.0),  // beam straight down at the floor mirror
+        0.2,                        // housing height
+        0.01,                       // aperture radius
+        0.01,                       // beam half-angle (radians, ~0.57°)
+        Vec3::new(0.8, 4.0e8, 0.8), // green laser
     );
 
-    scene.add_laser(
-        Vec3::new(-1.3, 0.62, 1.8), // housing center, base sunk into the ceiling
-        Vec3::new(-0.1, 0.0, -1.0),                // beam straight down
-        0.2,                                      // housing height
-        0.01,                                    // aperture radius
-        0.01,                                    // beam half-angle (radians, ~1.1°)
-        Vec3::new(4.0e8, 800.0, 800.0),        // green laser
-    );
-    // objects
-    scene.add_laser(
-        Vec3::new(-1.6, 0.62, 1.9), // housing center, base sunk into the ceiling
-        Vec3::new(-1.0, 0.0, -0.5),                // beam straight down
-        0.2,                                      // housing height
-        0.01,                                    // aperture radius
-        0.01,                                    // beam half-angle (radians, ~1.1°)
-        Vec3::new(800.0, 4.0e8, 800.0),        // green laser
-    );
+    //scene.add_box( Vec3::new(room_size/2.0, 1.0, 1.0), Vec3::new(room_size, room_height, 0.02), white);
+    //scene.add_quad(
+    //    Vec3::new(0.0, 1.0, room_size - 0.01),
+    //    Vec3::new(0.0, 0.0, -1.0),
+    //    1.5,
+    //    0.5,
+    //    //white
+    //    MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
+    //);
+
+
+    //scene.add_box( Vec3::new(-1.4, 0.65, 1.5), Vec3::new(0.1, 0.1, 0.1), MaterialData::glass(1.5));
+    //scene.add_box( Vec3::new(-1.9, 0.65, 1.7), Vec3::new(0.001, 0.1, 0.2), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
+    //scene.add_box( Vec3::new(-1.7, 0.65, 1.6), Vec3::new(0.001, 0.1, 0.4), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
+
+    //let pos = Vec3::new(-1.7, 0.6, 1.7);
+    //let dim = Vec3::new(1.0, 0.02, 0.7);
+    //scene.add_box(pos, dim, white);
+    //scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    //scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    //scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    //scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+
+    //scene.add_laser(
+    //    Vec3::new(-1.0, 1.0, 1.8), // housing center, base sunk into the ceiling
+    //    Vec3::new(1.0, 0.0, 1.0),                // beam straight down
+    //    0.2,                                      // housing height
+    //    0.01,                                    // aperture radius
+    //    0.01,                                    // beam half-angle (radians, ~1.1°)
+    //    Vec3::new(800.0, 800.0, 40.0e8),        // green laser
+    //);
+
+    //scene.add_laser(
+    //    Vec3::new(-1.3, 0.62, 1.8), // housing center, base sunk into the ceiling
+    //    Vec3::new(-0.1, 0.0, -1.0),                // beam straight down
+    //    0.2,                                      // housing height
+    //    0.01,                                    // aperture radius
+    //    0.01,                                    // beam half-angle (radians, ~1.1°)
+    //    Vec3::new(4.0e8, 800.0, 800.0),        // green laser
+    //);
+    //// objects
+    //scene.add_laser(
+    //    Vec3::new(-1.6, 0.62, 1.9), // housing center, base sunk into the ceiling
+    //    Vec3::new(-1.0, 0.0, -0.5),                // beam straight down
+    //    0.2,                                      // housing height
+    //    0.01,                                    // aperture radius
+    //    0.01,                                    // beam half-angle (radians, ~1.1°)
+    //    Vec3::new(800.0, 4.0e8, 800.0),        // green laser
+    //);
 
     scene
 }
