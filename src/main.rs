@@ -217,8 +217,8 @@ fn build_scene_with(laser_aim_y: f32) -> SceneData {
     // partition, and the derived ladder follows.
     let laser_pos = Vec3::new(-1.3, 0.62, 1.8);
     let back_mirror_center = Vec3::new(0.0, 1.0, -(room_size - 0.01));
-    let aim_point = Vec3::new(0.0, laser_aim_y, -(room_size - 0.01));
-    let aim = (aim_point - laser_pos).normalize();
+    //let aim_point = Vec3::new(0.0, laser_aim_y, -(room_size - 0.01));
+    let aim = Vec3::new(1.0, 0.0, -room_size).normalize();
     scene.add_laser(
         laser_pos,
         aim,
@@ -230,8 +230,8 @@ fn build_scene_with(laser_aim_y: f32) -> SceneData {
     scene.add_quad(
         back_mirror_center,
         Vec3::new(0.0, 0.0, 1.0),
-        1.5,
-        0.5,
+        2.0,
+        1.0,
         MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
     );
 
@@ -259,7 +259,7 @@ fn build_scene_with(laser_aim_y: f32) -> SceneData {
         Vec3::new(-1.0, 0.0, -0.5),
         0.2,
         0.01,
-        0.05,
+        0.01,
         Vec3::new(800.0, 4.0e8, 800.0),
     );
 
