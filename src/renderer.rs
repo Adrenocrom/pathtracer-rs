@@ -43,6 +43,8 @@ pub trait Renderer {
 pub struct CpuRenderer {
     scene: Box<dyn crate::geometry::Intersectable>,
     lights: Vec<crate::geometry::AreaLight>,
+    /// The specular bridges (the eye walk's diffuse sampling mixture).
+    bridges: Vec<crate::bdpt::Bridge>,
     width: usize,
     height: usize,
     samples: usize,
@@ -61,9 +63,11 @@ pub struct CpuRenderer {
 impl CpuRenderer {
     pub fn new(scene_data: &SceneData, width: usize, height: usize, samples: usize) -> Self {
         let (scene, lights) = scene_data.build_cpu_scene();
+        let bridges = scene_data.bridges();
         Self {
             scene,
             lights,
+            bridges,
             width,
             height,
             samples,
@@ -111,8 +115,15 @@ fn accumulate(
 ) {
     let n = n as f32;
     let m = m as f32;
-    // EMA rate: the batch's weight in the statistic, ~m/window.
-    let alpha = (m / crate::bdpt::MOMENT_WINDOW as f32).clamp(0.0, 1.0);
+    // EMA rate: the batch's weight in the statistic. Per-sample, not
+    // per-batch: a batch of m samples moves the statistic by
+    // 1 − (1 − 1/window)^m, so a large batch (the 32-spp export) can
+    // never *replace* the statistic — the per-batch form m/window
+    // clamps to 1 there, and a batch whose spot pixel drew zero bridge
+    // directions (probability (1 − p)³² ≈ 19% at BRIDGE_PROB = 0.05)
+    // would collapse σ to ~0 and winsorize the next bright batch down
+    // to μ, erasing the laser's spot from the accumulation.
+    let alpha = 1.0 - (1.0 - 1.0 / crate::bdpt::MOMENT_WINDOW as f32).powf(m);
     for ((a, m2), f) in accum.iter_mut().zip(moment2.iter_mut()).zip(frame) {
         // Winsorize the batch mean against the running statistics.
         let mut batch = *f;
@@ -145,6 +156,7 @@ impl Renderer for CpuRenderer {
             self.samples,
             max_depth,
             &self.lights,
+            &self.bridges,
         );
         match &mut self.accum {
             Some(a) if a.len() == frame.pixels.len() => {

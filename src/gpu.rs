@@ -121,6 +121,12 @@ struct GpuLight {
     _pad7: f32,
     emission: [f32; 3],
     _pad8: f32,
+    /// The specular bridge (a laser only): the aperture's mirror image —
+    /// a disc of `bridge_radius` centered at `bridge_center`. The
+    /// estimator's eye walk aims at it at diffuse vertices (see
+    /// `bdpt::Bridge`). `bridge_radius` < 0 marks "no bridge".
+    bridge_center: [f32; 3],
+    bridge_radius: f32,
 }
 
 impl GpuLight {
@@ -144,6 +150,11 @@ impl GpuLight {
             _pad7: 0.0,
             emission: [l.emission.x, l.emission.y, l.emission.z],
             _pad8: 0.0,
+            bridge_center: match l.bridge {
+                Some(b) => [b.image_center.x, b.image_center.y, b.image_center.z],
+                None => [0.0, 0.0, 0.0],
+            },
+            bridge_radius: l.bridge.map_or(-1.0, |b| b.radius),
         }
     }
 }
@@ -169,7 +180,7 @@ const KIND_CYLINDER: u32 = 4;
 const _: () = {
     assert!(std::mem::size_of::<GpuPrim>() == 112);
     assert!(std::mem::size_of::<GpuBvhNode>() == 32);
-    assert!(std::mem::size_of::<GpuLight>() == 112);
+    assert!(std::mem::size_of::<GpuLight>() == 128);
     assert!(std::mem::size_of::<Uniforms>() == 96);
 };
 

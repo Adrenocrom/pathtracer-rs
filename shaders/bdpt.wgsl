@@ -120,6 +120,12 @@ struct GpuLight {
     _pad7: f32,
     emission: vec3<f32>,
     _pad8: f32,
+    // The specular bridge (a laser only): the aperture's mirror image —
+    // a disc of `bridge_radius` centered at `bridge_center`. The eye
+    // walk aims at it at diffuse vertices (see bdpt::Bridge).
+    // bridge_radius < 0 marks "no bridge".
+    bridge_center: vec3<f32>,
+    bridge_radius: f32,
 };
 
 struct Hit {
@@ -636,6 +642,135 @@ fn bsdf_sample(albedo: vec3<f32>, mat_type: u32, ior: f32, normal: vec3<f32>,
     return BsdfSample(dir_out, dot(dir_out, normal) / PI, albedo);
 }
 
+// --- Specular bridges (the eye walk's diffuse sampling mixture) ---
+//
+// A specular bridge is the aperture's mirror image — a disc. At a
+// diffuse eye vertex the walk draws a direction toward the image disc
+// with probability BRIDGE_PROB, so the path camera → wall → mirror →
+// aperture — which no BDPT connection can sample (the mirror is a
+// delta endpoint) and no light subpath can reach (the aperture is a
+// ~1 cm disc behind the mirror) — is carried by ordinary subpath
+// walking. The beam's spot on the wall then emerges from real light
+// transport. See bdpt.rs::Bridge for the full story.
+
+const BRIDGE_PROB: f32 = 0.25;
+
+// The solid-angle pdf of the bridge direction `dir` from `p`: uniform
+// over the cone subtended by the image disc. 0 when `p` lies within
+// the image sphere (degenerate) or `dir` points outside the cone.
+fn bridge_pdf(center: vec3<f32>, radius: f32, p: vec3<f32>, dir: vec3<f32>) -> f32 {
+    let d = center - p;
+    let len_sq = dot(d, d);
+    if (len_sq <= radius * radius) { return 0.0; }
+    // Inside the cone iff d·dir ≥ sqrt(len² − r²) — both sides scaled
+    // by len, i.e. cos(angle) ≥ cos(θ_c). No trig needed.
+    let cos_cone = sqrt(len_sq - radius * radius);
+    if (dot(d, dir) < cos_cone) { return 0.0; }
+    let omega = 2.0 * PI * (1.0 - cos_cone / sqrt(len_sq));
+    return 1.0 / omega;
+}
+
+// Sample a direction uniformly over the cone subtended by the image
+// disc at `p`. Returns vec3(0) when `p` lies within the image sphere
+// (degenerate; the caller falls back to the cosine draw).
+fn bridge_sample_dir(center: vec3<f32>, radius: f32, p: vec3<f32>,
+                     state: ptr<function, u32>) -> vec3<f32> {
+    let d = center - p;
+    let len_sq = dot(d, d);
+    if (len_sq <= radius * radius) { return vec3<f32>(0.0); }
+    let len = sqrt(len_sq);
+    let axis = d * (1.0 / len);
+    let cos_cone = sqrt(len_sq - radius * radius) / len;
+    let a = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(axis.x) > 0.9);
+    let t = normalize3(cross(a, axis));
+    let b = cross(axis, t);
+    // Uniform in the cone: cos φ uniform in [cos θ_c, 1].
+    let cos_phi = 1.0 - pcg(state) * (1.0 - cos_cone);
+    let sin_phi = sqrt(max(0.0, 1.0 - cos_phi * cos_phi));
+    let phi = 2.0 * PI * pcg(state);
+    return t * (sin_phi * cos(phi)) + b * (sin_phi * sin(phi)) + axis * cos_phi;
+}
+
+// The number of bridges that qualify at a diffuse vertex `p` with
+// normal `normal`: the image disc's axis lies in the vertex's
+// hemisphere and the cone is non-degenerate. (The demo scene has at
+// most one laser, so this is 0 or 1; the loop keeps the general form
+// for parity with the CPU.)
+fn qualifying_bridge_count(p: vec3<f32>, normal: vec3<f32>) -> u32 {
+    var count = 0u;
+    for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
+        let l = lights[li];
+        if (l.bridge_radius >= 0.0) {
+            let d = l.bridge_center - p;
+            if (dot(d, normal) > 0.0 && dot(d, d) > l.bridge_radius * l.bridge_radius) {
+                count = count + 1u;
+            }
+        }
+    }
+    return count;
+}
+
+// The eye walk's diffuse sampling density at a diffuse vertex: the
+// cosine–bridge mixture. Must match sample_diffuse_mixture exactly —
+// realized and hypothetical eye extensions both query it.
+fn mixture_pdf(p: vec3<f32>, normal: vec3<f32>, dir_in: vec3<f32>, dir_out: vec3<f32>) -> f32 {
+    let cos_i = -dot(normal, dir_in);
+    let cos_o = dot(normal, dir_out);
+    if (cos_i <= 0.0 || cos_o <= 0.0) { return 0.0; }
+    let n_qual = qualifying_bridge_count(p, normal);
+    if (n_qual == 0u) { return cos_o / PI; }
+    var bridge_density = 0.0;
+    for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
+        let l = lights[li];
+        if (l.bridge_radius >= 0.0) {
+            let d = l.bridge_center - p;
+            if (dot(d, normal) > 0.0 && dot(d, d) > l.bridge_radius * l.bridge_radius) {
+                bridge_density += bridge_pdf(l.bridge_center, l.bridge_radius, p, dir_out);
+            }
+        }
+    }
+    return (1.0 - BRIDGE_PROB) * cos_o / PI + BRIDGE_PROB * bridge_density / f32(n_qual);
+}
+
+// The eye walk's diffuse sampling: a mixture of the cosine distribution
+// (weight 1 − BRIDGE_PROB) and the specular-bridge cones (weight
+// BRIDGE_PROB, split uniformly over the qualifying bridges). The
+// realized direction's pdf is the full mixture density — the direction
+// could have been drawn by either branch — and the sample weight is
+// f·cos/pdf under that density, so the estimator stays unbiased for
+// every direction the mixture can propose.
+fn sample_diffuse_mixture(albedo: vec3<f32>, p: vec3<f32>, normal: vec3<f32>,
+                          dir_in: vec3<f32>, state: ptr<function, u32>) -> BsdfSample {
+    let n_qual = qualifying_bridge_count(p, normal);
+    var dir_out = cosine_hemisphere(normal, state);
+    if (n_qual > 0u && pcg(state) < BRIDGE_PROB) {
+        // Pick a qualifying bridge uniformly. (The demo scene has at
+        // most one; the loop keeps the general form for parity.)
+        let pick = u32(f32(n_qual) * pcg(state));
+        var seen = 0u;
+        var chosen = -1i;
+        for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
+            let l = lights[li];
+            if (l.bridge_radius >= 0.0) {
+                let d = l.bridge_center - p;
+                if (dot(d, normal) > 0.0 && dot(d, d) > l.bridge_radius * l.bridge_radius) {
+                    if (seen == pick) { chosen = i32(li); }
+                    seen = seen + 1u;
+                }
+            }
+        }
+        if (chosen >= 0) {
+            let l = lights[u32(chosen)];
+            let d = bridge_sample_dir(l.bridge_center, l.bridge_radius, p, state);
+            // A degenerate cone (unreachable for a qualifying bridge)
+            // falls back to the cosine draw already made.
+            if (dot(d, d) > 0.0) { dir_out = d; }
+        }
+    }
+    let pdf = mixture_pdf(p, normal, dir_in, dir_out);
+    return BsdfSample(dir_out, pdf, albedo * dot(normal, dir_out) / (PI * pdf));
+}
+
 // f (the raw BSDF, no cosine) and the solid-angle pdf of `dir_out`
 // under the BSDF's sampling distribution, for an arbitrary direction
 // pair. Delta BSDFs return (0, 0) — exactly what invalidates
@@ -743,10 +878,16 @@ fn pv_oriented(eye: ptr<function, array<PathVertex, 8>>,
 // The solid-angle pdf of the scattering event at position m — arriving
 // from `arrival`, scattering toward `to` (adjacent positions) — under
 // the BSDF's own sampling distribution. Delta BSDFs: the symbolic 1
-// when the pair is the specular pair, 0 otherwise.
+// when the pair is the specular pair, 0 otherwise. Diffuse events on
+// the eye side use the cosine–bridge mixture density (the eye walk's
+// own distribution); on the light side, plain cosine.
+// WALK_EYE / WALK_LIGHT select the walk (see bdpt.rs::Walk).
+const WALK_EYE: u32 = 0u;
+const WALK_LIGHT: u32 = 1u;
+
 fn pv_event_pdf(eye: ptr<function, array<PathVertex, 8>>,
                 light_path: ptr<function, array<PathVertex, 8>>,
-                view: PathView, m: u32, arrival: u32, to: u32) -> f32 {
+                view: PathView, m: u32, arrival: u32, to: u32, walk: u32) -> f32 {
     let v = pv_vertex(eye, light_path, view, m);
     let d_in = pv_dir(eye, light_path, view, arrival, m);
     let d_out = pv_dir(eye, light_path, view, m, to);
@@ -756,17 +897,21 @@ fn pv_event_pdf(eye: ptr<function, array<PathVertex, 8>>,
                                  d_in, d_out, TRANSPORT_RADIANCE);
         return select(0.0, 1.0, sw.valid);
     }
+    if (walk == WALK_EYE && v.mat_type == MAT_DIFFUSE) {
+        return mixture_pdf(v.p, o.normal, d_in, d_out);
+    }
     return eval_bsdf(v.albedo, v.mat_type, o.normal, d_in, d_out).pdf;
 }
 
 // The sample weight (f.|cos|/pdf) of the scattering event at position m
 // — arriving from `arrival`, scattering toward `to` — under
 // `transport`. Delta BSDFs return the deterministic specular weight;
-// impossible events return 0.
+// impossible events return 0. Diffuse events on the eye side use the
+// cosine–bridge mixture density.
 fn pv_event_weight(eye: ptr<function, array<PathVertex, 8>>,
                    light_path: ptr<function, array<PathVertex, 8>>,
                    view: PathView, m: u32, arrival: u32, to: u32,
-                   transport: u32) -> vec3<f32> {
+                   transport: u32, walk: u32) -> vec3<f32> {
     let v = pv_vertex(eye, light_path, view, m);
     let d_in = pv_dir(eye, light_path, view, arrival, m);
     let d_out = pv_dir(eye, light_path, view, m, to);
@@ -775,6 +920,13 @@ fn pv_event_weight(eye: ptr<function, array<PathVertex, 8>>,
         let sw = specular_weight(v.albedo, v.mat_type, v.ior, o.normal, o.front_face,
                                  d_in, d_out, transport);
         return select(vec3<f32>(0.0), sw.weight, sw.valid);
+    }
+    if (walk == WALK_EYE && v.mat_type == MAT_DIFFUSE) {
+        let pdf = mixture_pdf(v.p, o.normal, d_in, d_out);
+        if (pdf <= 0.0) { return vec3<f32>(0.0); }
+        // f·cos/pdf with f = albedo/π (the diffuse BSDF); only the
+        // sampling distribution changed, not the BSDF.
+        return v.albedo * (1.0 / PI) * (dot(o.normal, d_out) / pdf);
     }
     let e = eval_bsdf(v.albedo, v.mat_type, o.normal, d_in, d_out);
     if (e.pdf <= 0.0) { return vec3<f32>(0.0); }
@@ -803,7 +955,7 @@ fn pv_pdf_eye(eye: ptr<function, array<PathVertex, 8>>,
               light_path: ptr<function, array<PathVertex, 8>>,
               view: PathView, m: u32) -> f32 {
     if (m < 2u || m > view.k) { return 0.0; }
-    let pdf_omega = pv_event_pdf(eye, light_path, view, m - 1u, m - 2u, m);
+    let pdf_omega = pv_event_pdf(eye, light_path, view, m - 1u, m - 2u, m, WALK_EYE);
     if (pdf_omega <= 0.0) { return 0.0; }
     return pv_convert_to_area(eye, light_path, view, pdf_omega, m - 1u, m);
 }
@@ -835,7 +987,7 @@ fn pv_pdf_light(eye: ptr<function, array<PathVertex, 8>>,
             if (cos > 0.0) { pdf_omega = cos / PI; }
         }
     } else {
-        pdf_omega = pv_event_pdf(eye, light_path, view, m, m + 1u, m - 1u);
+        pdf_omega = pv_event_pdf(eye, light_path, view, m, m + 1u, m - 1u, WALK_LIGHT);
     }
     if (pdf_omega <= 0.0) { return 0.0; }
     return pv_convert_to_area(eye, light_path, view, pdf_omega, m, m - 1u);
@@ -1001,7 +1153,7 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
     (*qe)[1u] = 1.0;
     for (var l = 1u; l < k; l = l + 1u) {
         let factor = pv_event_weight(eye, light_path, view, l, l - 1u, l + 1u,
-                                      TRANSPORT_RADIANCE);
+                                      TRANSPORT_RADIANCE, WALK_EYE);
         let beta = alpha * factor;
         let q = rr_survival(beta, l);
         (*qe)[l + 1u] = (*qe)[l] * q;
@@ -1036,7 +1188,7 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
             }
         } else {
             factor = pv_event_weight(eye, light_path, view, k - j, k - j + 1u, k - j - 1u,
-                                     TRANSPORT_IMPORTANCE);
+                                     TRANSPORT_IMPORTANCE, WALK_LIGHT);
         }
         let beta = alpha_l * factor;
         let q = rr_survival(beta, j + 1u);
@@ -1159,8 +1311,16 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         // Sample the BSDF, then roll the roulette on the post-scatter
         // throughput: survive with probability q and divide by q, which
         // keeps the expected contribution of the subpath unchanged.
-        let s = bsdf_sample(hit.albedo, hit.mat_type, hit.ior, normal, front_face,
-                           cur_dir, TRANSPORT_RADIANCE, state);
+        // At a diffuse vertex the eye walk uses the cosine–bridge
+        // mixture (see sample_diffuse_mixture): with probability
+        // BRIDGE_PROB it aims at a laser aperture's mirror image, so
+        // the beam's path camera → wall → mirror → aperture is carried
+        // by ordinary subpath walking.
+        var s = bsdf_sample(hit.albedo, hit.mat_type, hit.ior, normal, front_face,
+                            cur_dir, TRANSPORT_RADIANCE, state);
+        if (hit.mat_type == MAT_DIFFUSE) {
+            s = sample_diffuse_mixture(hit.albedo, hit.p, normal, cur_dir, state);
+        }
         let beta = throughput * s.weight;
         let q = rr_survival(beta, eye_len);
         if (q < 1.0 && pcg(state) >= q) { break; }
@@ -1268,11 +1428,18 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                     // the aperture seen from behind) carries no emission.
                     // The eye vertex's stored normal is the aperture's
                     // outward normal; the incoming direction is the
-                    // camera ray's.
+                    // direction of the *last* segment — the segment that
+                    // actually arrives at the aperture (the primary ray
+                    // for a direct hit, the wall -> mirror segment for a
+                    // bridged path).
+                    var d_in = ray_dir;
+                    if (k >= 2u) {
+                        d_in = normalize3(last.p - eye[k - 2u].p);
+                    }
                     var in_beam = true;
                     if (last.mat_type == MAT_LASER) {
                         let cos_theta = last.ior;
-                        in_beam = dot(last.normal, ray_dir * -1.0) >= cos_theta;
+                        in_beam = dot(last.normal, d_in * -1.0) >= cos_theta;
                     }
                     if (in_beam) {
                         let inv_pdf = f32(uniforms.n_lights) * light_area(lights[li]);
@@ -1469,8 +1636,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let blended = select(batch, (prev.xyz * n + batch * m) / (n + m), uniforms.reset == 0u);
-    // EMA of the raw luminance², batch weight ~m/window.
-    let alpha = clamp(m / MOMENT_WINDOW, 0.0, 1.0);
+    // EMA of the raw luminance², per-sample rate: a batch of m samples
+    // moves the statistic by 1 − (1 − 1/window)^m, so a large batch (the
+    // 32-spp export) can never *replace* the statistic — the per-batch
+    // form m/window clamps to 1 there, and a batch whose spot pixel drew
+    // zero bridge directions (probability (1 − p)³² ≈ 19% at
+    // BRIDGE_PROB = 0.05) would collapse σ to ~0 and winsorize the next
+    // bright batch down to μ, erasing the laser's spot.
+    let alpha = 1.0 - pow(1.0 - 1.0 / MOMENT_WINDOW, m);
     let raw_sq = luminance(color) * luminance(color);
     let blended_sq = select(raw_sq, prev.w * (1.0 - alpha) + raw_sq * alpha, uniforms.reset == 0u);
     accum[pixel] = vec4<f32>(blended, blended_sq);

@@ -6,9 +6,10 @@
 //! of truth for the scene guarantees both backends trace identical geometry.
 
 use crate::geometry::{
-    AreaLight, Bsdf, Cube, Cylinder, Intersectable, Material, Plane, Quad, Sphere,
+    fresnel_dielectric, reflect_dir, refract_dir, AreaLight, Bsdf, Cube, Cylinder, Intersectable,
+    Material, Plane, Quad, Ray, Sphere,
 };
-use crate::math::Vec3;
+use crate::math::{EPS_NEAR, Vec3};
 
 /// The laser housing's material: a normal diffuse surface, so the
 /// cylinder shades like any other object in the scene (the laser
@@ -29,7 +30,7 @@ const LASER_PUCK_FRACTION: f32 = 0.1;
 
 /// A surface material in flat, GPU-friendly form. `emission != 0` marks a
 /// pure emitter: the BSDF is ignored and the surface does not scatter.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct MaterialData {
     pub albedo: Vec3,
     pub emission: Vec3,
@@ -126,6 +127,12 @@ pub struct LightData {
     pub half_w: f32,
     pub half_h: f32,
     pub emission: Vec3,
+    /// The specular bridge (a laser only): the aperture's mirror image —
+    /// the analytic one-bounce specular path from a diffuse vertex to
+    /// this aperture. `None` when the beam never hits a mirror (the
+    /// bridge is then meaningless) or for non-laser lights. See
+    /// `bdpt::Bridge`.
+    pub bridge: Option<crate::bdpt::Bridge>,
 }
 
 impl LightData {
@@ -140,6 +147,7 @@ impl LightData {
             half_w: 0.0,
             half_h: 0.0,
             emission,
+            bridge: None,
         }
     }
 
@@ -162,6 +170,7 @@ impl LightData {
             half_w,
             half_h,
             emission,
+            bridge: None,
         }
     }
 
@@ -189,6 +198,7 @@ impl LightData {
             half_w: theta,   // the cone half-angle rides in the unused slot
             half_h: height, // the housing height rides in the unused slot
             emission,
+            bridge: None,
         }
     }
 
@@ -215,6 +225,29 @@ pub struct SceneData {
     pub planes: Vec<PlaneData>,
     pub cylinders: Vec<CylinderData>,
     pub lights: Vec<LightData>,
+}
+
+/// The traced path of a laser beam: the legs (aperture → hit₁ → hit₂ →
+/// … → spot) and, when the beam reaches a diffuse surface, the spot.
+#[derive(Clone, Debug)]
+pub struct BeamTrace {
+    /// One (start, end) pair per leg. The last leg's end is the spot
+    /// (or the escape point when the beam leaves the scene).
+    pub legs: Vec<(Vec3, Vec3)>,
+    /// The beam's final stop on a diffuse surface.
+    pub spot: Option<BeamSpot>,
+}
+
+/// Where a traced laser beam lands: the point, the surface normal
+/// (oriented toward the beam's arrival side), the surface material, and
+/// the beam's color throughput across the specular chain (mirror
+/// albedos, glass Fresnel transmittances).
+#[derive(Clone, Copy, Debug)]
+pub struct BeamSpot {
+    pub p: Vec3,
+    pub normal: Vec3,
+    pub mat: MaterialData,
+    pub throughput: Vec3,
 }
 
 #[derive(Clone, Copy)]
@@ -515,9 +548,47 @@ impl SceneData {
     ) {
         let axis = axis.normalize();
         let aperture = center + axis * (height * 0.5);
-        self.add_light(LightData::from_laser(
-            aperture, axis, radius, theta, height, emission,
-        ));
+        let mut light = LightData::from_laser(aperture, axis, radius, theta, height, emission);
+        // Build the specular bridge: trace the beam's axis ray; if the
+        // first delta surface it hits is a mirror, the aperture's mirror
+        // image is the analytic description of the one-bounce specular
+        // path from any diffuse vertex to this aperture. The trace runs
+        // against the scene *without* this light's geometry (the light
+        // is not yet registered), so the beam's first hit is the mirror
+        // itself, not the housing.
+        let (cpu_scene, _) = self.build_cpu_scene();
+        let mut origin = aperture + axis * EPS_NEAR;
+        let mut dir = axis;
+        for _ in 0..4 {
+            let ray = Ray { origin, direction: dir };
+            let Some(hit) = cpu_scene.intersect(&ray) else { break };
+            if hit.mat.bsdf == Bsdf::Mirror {
+                // Orient the normal toward the side the beam arrives from.
+                let front_face = hit.normal.dot(dir) < 0.0;
+                let normal = if front_face { hit.normal } else { hit.normal * -1.0 };
+                // The aperture's mirror image: reflect the aperture
+                // center across the mirror plane (the plane is the
+                // perpendicular bisector of aperture ↔ image, so a ray
+                // aimed at the image reflects onto the aperture).
+                let d = aperture - hit.p;
+                let image = aperture - normal * (2.0 * d.dot(normal));
+                light.bridge = Some(crate::bdpt::Bridge {
+                    image_center: image,
+                    radius,
+                });
+                break;
+            }
+            // Not a mirror: continue the specular chain (glass) or stop
+            // (a diffuse surface ends the beam; no bridge exists).
+            if !hit.mat.bsdf.is_delta() {
+                break;
+            }
+            let front_face = hit.normal.dot(dir) < 0.0;
+            let normal = if front_face { hit.normal } else { hit.normal * -1.0 };
+            dir = reflect_dir(dir, normal);
+            origin = hit.p + normal * EPS_NEAR;
+        }
+        self.add_light(light);
     }
 
     /// The highest luminance any physically valid sample can carry:
@@ -537,6 +608,114 @@ impl SceneData {
             .iter()
             .map(|l| l.emission.luminance())
             .fold(0.0f32, f32::max)
+    }
+
+    /// Trace the laser beam through the scene: follow the aperture's
+    /// axis ray across every specular (delta) surface it hits — mirrors
+    /// reflect it, glass refracts it — until it reaches a non-delta
+    /// surface (a diffuse wall: the spot) or escapes.
+    ///
+    /// This is the *analytic* transport of the beam's central ray. The
+    /// beam is a narrow cone around it, so the spot is the cone's
+    /// footprint on the final surface; the caller accounts for the
+    /// spread (a decal's half-width from the path length and cone
+    /// angle). The `throughput` is the beam's color power fraction
+    /// across the delta chain: a mirror multiplies by its albedo, a
+    /// glass interface by its albedo times the Fresnel transmittance
+    /// (or reflectance, under total internal reflection) — so the
+    /// power the beam deposits at the spot is
+    /// `emission · A_aperture · Ω_cone · throughput`.
+    ///
+    /// `max_bounces` bounds the specular chain (a beam caught in a
+    /// mirror loop must not spin forever).
+    pub fn trace_laser_beam(&self, laser: &LightData, max_bounces: usize) -> BeamTrace {
+        debug_assert!(laser.shape == 2, "not a laser light");
+        let mut legs: Vec<(Vec3, Vec3)> = Vec::new();
+        let (cpu_scene, _) = self.build_cpu_scene();
+        // Start just off the aperture, along the beam axis.
+        let mut origin = laser.center + laser.normal * EPS_NEAR;
+        let mut dir = laser.normal;
+        let mut throughput = Vec3::new(1.0, 1.0, 1.0);
+        for _ in 0..=max_bounces {
+            let ray = Ray {
+                origin,
+                direction: dir,
+            };
+            let Some(hit) = cpu_scene.intersect(&ray) else {
+                // Escaped the scene (should not happen in a closed room).
+                legs.push((origin, origin + dir));
+                return BeamTrace { legs, spot: None };
+            };
+            legs.push((origin, hit.p));
+            let mat = MaterialData {
+                albedo: hit.mat.albedo,
+                emission: hit.mat.emission,
+                bsdf: hit.mat.bsdf,
+            };
+            // Orient the normal toward the side the beam arrives from
+            // (mirrors reflect the same from both sides; glass needs the
+            // orientation to pick its eta pair).
+            let front_face = hit.normal.dot(dir) < 0.0;
+            let normal = if front_face {
+                hit.normal
+            } else {
+                hit.normal * -1.0
+            };
+            if !mat.bsdf.is_delta() {
+                // A non-delta surface: the beam's final stop. The spot's
+                // material is what a decal's emission derives from.
+                return BeamTrace {
+                    legs,
+                    spot: Some(BeamSpot {
+                        p: hit.p,
+                        normal,
+                        mat,
+                        throughput,
+                    }),
+                };
+            }
+            // Delta surface: continue the specular chain deterministically,
+            // bookkeeping the power fraction the traced branch carries.
+            let cos_i = -normal.dot(dir);
+            dir = match mat.bsdf {
+                Bsdf::Mirror => {
+                    throughput = throughput * mat.albedo;
+                    reflect_dir(dir, normal)
+                }
+                Bsdf::Glass { ior } => {
+                    let (eta_i, eta_t) = if front_face { (1.0, ior) } else { (ior, 1.0) };
+                    let r = fresnel_dielectric(cos_i, eta_i, eta_t);
+                    match refract_dir(dir, normal, eta_i, eta_t) {
+                        Some(refracted) => {
+                            // The refracted branch carries T = 1 - R of the
+                            // power (the eta^2 factor is a radiance
+                            // artifact; power transport sees only R + T = 1).
+                            throughput = throughput * mat.albedo * (1.0 - r);
+                            refracted
+                        }
+                        None => {
+                            // Total internal reflection: the whole power
+                            // reflects.
+                            throughput = throughput * mat.albedo;
+                            reflect_dir(dir, normal)
+                        }
+                    }
+                }
+                _ => unreachable!("only Mirror and Glass are delta BSDFs"),
+            };
+            // Offset along the side the new ray travels to (a refracted
+            // ray leaves through the surface, so offsetting by the
+            // arrival-side normal would start it inside the glass).
+            let offset = if dir.dot(normal) > 0.0 {
+                normal
+            } else {
+                normal * -1.0
+            };
+            origin = hit.p + offset * EPS_NEAR;
+        }
+        // Specular chain longer than the bound: the beam never reached a
+        // diffuse surface within `max_bounces`.
+        BeamTrace { legs, spot: None }
     }
 
     /// Build the trait-object scene (BVH) used by the CPU renderer.
@@ -592,6 +771,17 @@ impl SceneData {
         let scene = crate::bvh::BVHNode::build(objects).expect("scene is non-empty");
         let lights = self.lights.iter().map(|l| self.cpu_light(l)).collect();
         (scene, lights)
+    }
+
+    /// The specular bridges of all laser lights in the scene: the analytic
+    /// one-bounce specular paths from a diffuse vertex to each laser
+    /// aperture (the aperture's mirror image). Consumed by the BDPT eye
+    /// walk's diffuse sampling mixture — see `bdpt::Bridge`.
+    pub fn bridges(&self) -> Vec<crate::bdpt::Bridge> {
+        self.lights
+            .iter()
+            .filter_map(|l| l.bridge)
+            .collect()
     }
 
     fn cpu_light(&self, l: &LightData) -> AreaLight {

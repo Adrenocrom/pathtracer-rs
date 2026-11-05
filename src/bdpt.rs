@@ -33,7 +33,7 @@
 //! where it stopped are exactly reproducible.
 
 use crate::geometry::{
-    AreaLight, Bsdf, Intersectable, Material, Ray, Transport,
+    AreaLight, Bsdf, BsdfSample, Intersectable, Material, Ray, Transport, cosine_hemisphere,
 };
 use crate::math::{Vec3, EPS_NEAR, VEC_ZERO};
 use rand::Rng;
@@ -138,6 +138,191 @@ const RR_MIN: f32 = 0.05;
 /// low-variance.
 const RR_START: usize = 3;
 
+/// The probability of drawing the specular-bridge direction at a diffuse
+/// eye vertex when a bridge qualifies there (see `sample_diffuse_mixture`
+/// and `Bridge`). The value is not free: the accumulation layer's temporal
+/// outlier rejection winsorizes each sample/batch against μ + K·σ
+/// (K = WINSOR_K = 3), and a rare-event signal whose bright mode lies
+/// beyond that bound is structurally clamped — the mode sits at
+/// μ + sqrt((1−p)/p)·σ, so it passes iff p ≥ 1/(1+K²) = 0.1. 0.25 sits
+/// comfortably inside (the mode at μ + 1.7σ), which keeps the beam's
+/// spot unbiased; the cost is that non-footprint vertices waste 25% of
+/// their diffuse draws on bridge directions the aperture's cone gate
+/// kills (+33% ambient variance, cleaned up by accumulation).
+pub const BRIDGE_PROB: f32 = 0.25;
+
+/// A specular bridge: the analytic description of the one-bounce specular
+/// path from a diffuse vertex to a laser aperture — the aperture's
+/// *mirror image*, a disc. Built by the scene (`SceneData::add_laser`
+/// traces the beam and reflects the aperture across the first mirror it
+/// hits), carried by the light types (`LightData` → `AreaLight` /
+/// `GpuLight`), and consumed here as a *sampling technique* for the eye
+/// subpath: at a diffuse vertex the walk draws a direction toward the
+/// image disc with probability `BRIDGE_PROB`, so the path
+/// camera → wall → mirror → aperture — which no BDPT connection can
+/// sample (the mirror is a delta endpoint) and no light subpath can
+/// reach (the aperture is a ~1 cm disc behind the mirror) — is carried
+/// by ordinary subpath walking. The beam's spot on the wall then
+/// emerges from real light transport: the direct-hit strategy credits
+/// the aperture's emission, gated by its cone, and the MIS machinery
+/// weights the (single) valid strategy.
+///
+/// The construction is exact: the mirror plane is the perpendicular
+/// bisector of the segment aperture ↔ image, so a ray from `p` aimed at
+/// a point `q` of the image disc crosses the mirror plane and reflects
+/// onto the corresponding point of the aperture disc — the classic
+/// mirror-image construction. The set of directions from `p` that reach
+/// the aperture through the mirror is therefore exactly the cone
+/// subtended by the image disc, which is what `sample_dir`/`pdf`
+/// describe (uniform over that cone).
+///
+/// This is a sampling technique, not a light source: no fake emitters,
+/// no mid-air beam — in clean air a laser beam is invisible from the
+/// side; only the spot on the wall is real.
+#[derive(Clone, Copy)]
+pub struct Bridge {
+    /// The aperture's mirror image: a disc of `radius` centered at
+    /// `image_center` (the aperture disc reflected across the mirror
+    /// plane).
+    pub image_center: Vec3,
+    /// The image disc's radius (the aperture radius).
+    pub radius: f32,
+}
+
+impl Bridge {
+    /// The solid-angle pdf of the bridge direction `dir` from `p`:
+    /// uniform over the cone subtended by the image disc —
+    /// pdf = 1 / (2π(1 − cos θ_c)) with θ_c = asin(radius / dist).
+    /// 0 when `p` lies within the image sphere (degenerate) or `dir`
+    /// points outside the cone.
+    pub fn pdf(&self, p: Vec3, dir: Vec3) -> f32 {
+        let d = self.image_center - p;
+        let len_sq = d.length_squared();
+        if len_sq <= self.radius * self.radius {
+            return 0.0;
+        }
+        // Inside the cone iff d·dir ≥ sqrt(len² − r²) — both sides
+        // scaled by len, i.e. cos(angle) ≥ cos(θ_c). No trig needed.
+        let cos_cone = (len_sq - self.radius * self.radius).sqrt();
+        if d.dot(dir) < cos_cone {
+            return 0.0;
+        }
+        let omega = 2.0 * PI * (1.0 - cos_cone / len_sq.sqrt());
+        1.0 / omega
+    }
+
+    /// Sample a direction uniformly over the cone subtended by the
+    /// image disc at `p`. None when `p` lies within the image sphere
+    /// (the cone is degenerate; the caller excludes such bridges from
+    /// the qualifying set, so this is a defensive fallback).
+    pub fn sample_dir(&self, p: Vec3, rng: &mut impl Rng) -> Option<Vec3> {
+        let d = self.image_center - p;
+        let len_sq = d.length_squared();
+        if len_sq <= self.radius * self.radius {
+            return None;
+        }
+        let len = len_sq.sqrt();
+        let axis = d * (1.0 / len);
+        let cos_cone = (len_sq - self.radius * self.radius).sqrt() / len;
+        let a = if axis.x.abs() > 0.9 {
+            Vec3::new(0.0, 1.0, 0.0)
+        } else {
+            Vec3::new(1.0, 0.0, 0.0)
+        };
+        let t = a.cross(axis).normalize();
+        let b = axis.cross(t);
+        // Uniform in the cone: cos φ uniform in [cos θ_c, 1].
+        let cos_phi = 1.0 - rng.gen::<f32>() * (1.0 - cos_cone);
+        let sin_phi = (1.0 - cos_phi * cos_phi).sqrt();
+        let phi = 2.0 * PI * rng.gen::<f32>();
+        Some(t * (sin_phi * phi.cos()) + b * (sin_phi * phi.sin()) + axis * cos_phi)
+    }
+}
+
+/// Which subpath's sampling distribution a pdf/weight query refers to.
+/// The eye walk samples diffuse vertices with the cosine–bridge mixture
+/// (`sample_diffuse_mixture`); the light walk samples plain cosine. The
+/// MIS machinery must use each walk's own distribution for its edges —
+/// that asymmetry is exactly what `pdf_eye`/`pdf_light` encode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    Eye,
+    Light,
+}
+
+/// The indices of the bridges that qualify at a diffuse vertex `p` with
+/// normal `normal`: the image disc's axis lies in the vertex's hemisphere
+/// (a bridge pointing into the surface could never carry light out of
+/// it) and the cone is non-degenerate (`p` outside the image sphere).
+fn qualifying_bridges(p: Vec3, normal: Vec3, bridges: &[Bridge]) -> Vec<usize> {
+    bridges
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| {
+            let d = b.image_center - p;
+            d.dot(normal) > 0.0 && d.length_squared() > b.radius * b.radius
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The eye walk's diffuse sampling density at a diffuse vertex: the
+/// cosine–bridge mixture. Must match `sample_diffuse_mixture` exactly —
+/// realized and hypothetical eye extensions both query it.
+fn mixture_pdf(p: Vec3, normal: Vec3, dir_in: Vec3, dir_out: Vec3, bridges: &[Bridge]) -> f32 {
+    let cos_i = -normal.dot(dir_in);
+    let cos_o = normal.dot(dir_out);
+    if cos_i <= 0.0 || cos_o <= 0.0 {
+        return 0.0;
+    }
+    let qualifying = qualifying_bridges(p, normal, bridges);
+    if qualifying.is_empty() {
+        return cos_o / PI;
+    }
+    let bridge_density: f32 = qualifying
+        .iter()
+        .map(|&i| bridges[i].pdf(p, dir_out))
+        .sum::<f32>()
+        / qualifying.len() as f32;
+    (1.0 - BRIDGE_PROB) * cos_o / PI + BRIDGE_PROB * bridge_density
+}
+
+/// The eye walk's diffuse sampling: a mixture of the cosine distribution
+/// (weight 1 − BRIDGE_PROB) and the specular-bridge cones (weight
+/// BRIDGE_PROB, split uniformly over the qualifying bridges). The
+/// realized direction's pdf is the full mixture density — the direction
+/// could have been drawn by either branch — and the sample weight is
+/// f·cos/pdf under that density, so the estimator stays unbiased for
+/// every direction the mixture can propose.
+fn sample_diffuse_mixture(
+    mat: &Material,
+    p: Vec3,
+    normal: Vec3,
+    dir_in: Vec3,
+    bridges: &[Bridge],
+    rng: &mut impl Rng,
+) -> BsdfSample {
+    let qualifying = qualifying_bridges(p, normal, bridges);
+    // Draw the branch, then the direction.
+    let dir_out = if !qualifying.is_empty() && rng.gen::<f32>() < BRIDGE_PROB {
+        let pick = qualifying[rng.gen_range(0..qualifying.len())];
+        match bridges[pick].sample_dir(p, rng) {
+            Some(d) => d,
+            // Unreachable for a qualifying bridge (non-degenerate by
+            // construction); fall back to cosine defensively.
+            None => cosine_hemisphere(normal, rng),
+        }
+    } else {
+        cosine_hemisphere(normal, rng)
+    };
+    let pdf = mixture_pdf(p, normal, dir_in, dir_out, bridges);
+    BsdfSample {
+        dir_out,
+        pdf_omega: pdf,
+        weight: mat.albedo * normal.dot(dir_out) / (PI * pdf),
+    }
+}
+
 /// One vertex of an eye or light subpath.
 struct PathVertex {
     p: Vec3,
@@ -174,6 +359,10 @@ struct PathView<'a> {
     cam_dir: Vec3,
     /// n_lights * area of the light the path ends on.
     inv_light_pdf: f64,
+    /// The specular bridges (the eye walk's diffuse sampling mixture).
+    /// The light walk samples plain cosine, so only eye-side diffuse
+    /// events query them.
+    bridges: &'a [Bridge],
 }
 
 impl<'a> PathView<'a> {
@@ -225,8 +414,10 @@ impl<'a> PathView<'a> {
     /// The solid-angle pdf of the scattering event at position m — arriving
     /// from `arrival`, scattering toward `to` (adjacent positions) — under
     /// the BSDF's own sampling distribution. Delta BSDFs: the symbolic 1
-    /// when the pair is the specular pair, 0 otherwise.
-    fn event_pdf(&self, m: usize, arrival: usize, to: usize) -> f64 {
+    /// when the pair is the specular pair, 0 otherwise. Diffuse events on
+    /// the eye side use the cosine–bridge mixture density (the eye walk's
+    /// own distribution); on the light side, plain cosine.
+    fn event_pdf(&self, m: usize, arrival: usize, to: usize, walk: Walk) -> f64 {
         let v = self.vertex(m);
         let d_in = self.dir(arrival, m);
         let d_out = self.dir(m, to);
@@ -240,6 +431,8 @@ impl<'a> PathView<'a> {
             } else {
                 0.0
             }
+        } else if walk == Walk::Eye && v.mat.bsdf == Bsdf::Diffuse {
+            mixture_pdf(v.p, normal, d_in, d_out, self.bridges) as f64
         } else {
             v.mat.eval_bsdf(normal, d_in, d_out).1 as f64
         }
@@ -248,13 +441,15 @@ impl<'a> PathView<'a> {
     /// The sample weight (f·|cos|/pdf) of the scattering event at position
     /// m — arriving from `arrival`, scattering toward `to` — under
     /// `transport`. Delta BSDFs return the deterministic specular weight;
-    /// impossible events return 0.
+    /// impossible events return 0. Diffuse events on the eye side use the
+    /// cosine–bridge mixture density.
     fn event_weight(
         &self,
         m: usize,
         arrival: usize,
         to: usize,
         transport: Transport,
+        walk: Walk,
     ) -> Vec3 {
         let v = self.vertex(m);
         let d_in = self.dir(arrival, m);
@@ -264,6 +459,15 @@ impl<'a> PathView<'a> {
             v.mat
                 .specular_weight(normal, front_face, d_in, d_out, transport)
                 .unwrap_or(VEC_ZERO)
+        } else if walk == Walk::Eye && v.mat.bsdf == Bsdf::Diffuse {
+            let pdf = mixture_pdf(v.p, normal, d_in, d_out, self.bridges);
+            if pdf <= 0.0 {
+                VEC_ZERO
+            } else {
+                // f·cos/pdf with f = albedo/π (the diffuse BSDF); only
+                // the sampling distribution changed, not the BSDF.
+                v.mat.albedo * (1.0 / PI) * (normal.dot(d_out) / pdf)
+            }
         } else {
             let (f, pdf) = v.mat.eval_bsdf(normal, d_in, d_out);
             if pdf <= 0.0 {
@@ -282,7 +486,7 @@ impl<'a> PathView<'a> {
         if m < 2 || m > self.k {
             return 0.0;
         }
-        let pdf_omega = self.event_pdf(m - 1, m - 2, m);
+        let pdf_omega = self.event_pdf(m - 1, m - 2, m, Walk::Eye);
         if pdf_omega <= 0.0 {
             return 0.0;
         }
@@ -324,7 +528,7 @@ impl<'a> PathView<'a> {
                 }
             }
         } else {
-            self.event_pdf(m, m + 1, m - 1) as f32
+            self.event_pdf(m, m + 1, m - 1, Walk::Light) as f32
         };
         if pdf_omega <= 0.0 {
             return 0.0;
@@ -538,7 +742,7 @@ fn rr_prefix_products(path: &PathView, alpha_light0: Vec3) -> RrProducts {
     let mut alpha = Vec3::new(1.0, 1.0, 1.0);
     out.qe[1] = 1.0;
     for l in 1..k {
-        let factor = path.event_weight(l, l - 1, l + 1, Transport::Radiance);
+        let factor = path.event_weight(l, l - 1, l + 1, Transport::Radiance, Walk::Eye);
         let beta = alpha * factor;
         let q = rr_survival(beta, l);
         out.qe[l + 1] = out.qe[l] * q as f64;
@@ -571,7 +775,7 @@ fn rr_prefix_products(path: &PathView, alpha_light0: Vec3) -> RrProducts {
                 _ => Vec3::new(PI, PI, PI),
             }
         } else {
-            path.event_weight(k - j, k - j + 1, k - j - 1, Transport::Importance)
+            path.event_weight(k - j, k - j + 1, k - j - 1, Transport::Importance, Walk::Light)
         };
         let beta = alpha_l * factor;
         let q = rr_survival(beta, j + 1);
@@ -596,6 +800,7 @@ pub fn bdpt_trace(
     scene: &dyn Intersectable,
     max_depth: usize,
     lights: &[AreaLight],
+    bridges: &[Bridge],
     rng: &mut impl Rng,
 ) -> Vec3 {
     let max_depth = max_depth.min(MAX_PATH_VERTICES);
@@ -651,9 +856,17 @@ pub fn bdpt_trace(
         // Sample the BSDF, then roll the roulette on the post-scatter
         // throughput: survive with probability q and divide by q, which
         // keeps the expected contribution of the subpath unchanged.
-        let s = hit
-            .mat
-            .sample_bsdf(normal, front_face, cur.direction, Transport::Radiance, rng);
+        // At a diffuse vertex the eye walk uses the cosine–bridge
+        // mixture (see `sample_diffuse_mixture`): with probability
+        // BRIDGE_PROB it aims at a laser aperture's mirror image, so
+        // the beam's path camera → wall → mirror → aperture is carried
+        // by ordinary subpath walking.
+        let s = if hit.mat.bsdf == Bsdf::Diffuse {
+            sample_diffuse_mixture(&hit.mat, hit.p, normal, cur.direction, bridges, rng)
+        } else {
+            hit.mat
+                .sample_bsdf(normal, front_face, cur.direction, Transport::Radiance, rng)
+        };
         let beta = throughput * s.weight;
         let q = rr_survival(beta, eye.len());
         if q < 1.0 && rng.gen::<f32>() >= q {
@@ -794,8 +1007,16 @@ pub fn bdpt_trace(
                 // outside the beam (the dark side of the housing, or the
                 // aperture seen from behind) carries no emission. The
                 // eye vertex's stored normal is the aperture's outward
-                // normal; the incoming direction is the camera ray's.
-                let in_beam = light.in_beam(last.p, last.p - ray.direction);
+                // normal; the incoming direction is the direction of the
+                // *last* segment — the segment that actually arrives at
+                // the aperture (the primary ray for a direct hit, the
+                // wall -> mirror segment for a bridged path).
+                let d_in = if k >= 2 {
+                    (last.p - eye[k - 2].p).normalize()
+                } else {
+                    ray.direction
+                };
+                let in_beam = light.in_beam(last.p, last.p - d_in);
                 if in_beam {
                     let inv_pdf = n_lights as f64 * light.area() as f64;
                     let path = PathView {
@@ -805,6 +1026,7 @@ pub fn bdpt_trace(
                         n_eye: k,
                         cam_dir: ray.direction,
                         inv_light_pdf: inv_pdf,
+                        bridges,
                     };
                     // The hypothetical light subpath of the other strategies
                     // starts at this hit point with the emitter's throughput
@@ -845,6 +1067,7 @@ pub fn bdpt_trace(
                 n_eye: i + 1,
                 cam_dir: ray.direction,
                 inv_light_pdf,
+                bridges,
             };
 
             // Contribution: alpha_eye * f(x) * G * f(y) * alpha_light.
@@ -912,6 +1135,11 @@ mod tests {
     use crate::geometry::{Cube, Cylinder, Material, Plane, Quad, Sphere, cosine_hemisphere};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    /// The empty bridge list: the synthetic test scenes have no lasers,
+    /// so the eye walk's diffuse sampling mixture degenerates to plain
+    /// cosine (see `sample_diffuse_mixture`).
+    const NO_BRIDGES: &[Bridge] = &[];
 
     /// Write a marker so a failing test can be identified when the
     /// harness hides stdout: each test records its name on entry, and a
@@ -1052,6 +1280,7 @@ mod tests {
             n_eye: 2,
             cam_dir,
             inv_light_pdf: 2.0,
+            bridges: NO_BRIDGES,
         };
         let rr = rr_prefix_products(&path, Vec3::new(1.0, 1.0, 1.0));
         let mut sum = 0.0f32;
@@ -1117,6 +1346,7 @@ mod tests {
             n_eye: 2,
             cam_dir,
             inv_light_pdf: 2.0,
+            bridges: NO_BRIDGES,
         };
         let rr = rr_prefix_products(&path, Vec3::new(1.0, 1.0, 1.0));
         let mut w = [0.0f32; 5];
@@ -1196,6 +1426,7 @@ mod tests {
             n_eye: 3,
             cam_dir,
             inv_light_pdf: 1.0,
+            bridges: NO_BRIDGES,
         };
         let rr = rr_prefix_products(&path, Vec3::new(0.1, 0.1, 0.1));
 
@@ -1227,7 +1458,7 @@ mod tests {
         let (scene, lights) = test_scene();
         let mut rng = StdRng::seed_from_u64(7);
         let r = ray(Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        let c = bdpt_trace(&r, &*scene, 8, &lights, &mut rng);
+        let c = bdpt_trace(&r, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
         assert!((c.x - 1.0).abs() < 1e-4, "got {c:?}");
         assert!((c.y - 1.0).abs() < 1e-4);
         assert!((c.z - 1.0).abs() < 1e-4);
@@ -1299,7 +1530,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(123);
         let mut mean_bdpt = VEC_ZERO;
         for _ in 0..N {
-            mean_bdpt = mean_bdpt + bdpt_trace(&r, &*scene, DEPTH, &lights, &mut rng);
+            mean_bdpt = mean_bdpt + bdpt_trace(&r, &*scene, DEPTH, &lights, NO_BRIDGES, &mut rng);
         }
         mean_bdpt = mean_bdpt * (1.0 / N as f32);
 
@@ -1322,7 +1553,7 @@ mod tests {
         let (scene, lights) = test_scene();
         let mut rng = StdRng::seed_from_u64(7);
         let r = ray(Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        let c = bdpt_trace(&r, &*scene, 4, &lights, &mut rng);
+        let c = bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
         assert!((c.x - 1.0).abs() < 1e-4, "got {c:?}");
         assert!((c.y - 1.0).abs() < 1e-4);
         assert!((c.z - 1.0).abs() < 1e-4);
@@ -1335,7 +1566,7 @@ mod tests {
         let r = ray(Vec3::new(0.0, 1.5, 2.0), Vec3::new(0.0, -1.0, -0.5));
         let mut mean = VEC_ZERO;
         for _ in 0..64 {
-            mean = mean + bdpt_trace(&r, &*scene, 8, &lights, &mut rng);
+            mean = mean + bdpt_trace(&r, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
         }
         mean = mean * (1.0 / 64.0);
         assert!(mean.x.is_finite() && mean.y.is_finite() && mean.z.is_finite());
@@ -1388,7 +1619,7 @@ mod tests {
 
         let mut mean_shadowed = VEC_ZERO;
         for _ in 0..4096 {
-            mean_shadowed = mean_shadowed + bdpt_trace(&target, &*scene, 4, &lights, &mut rng);
+            mean_shadowed = mean_shadowed + bdpt_trace(&target, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
         }
         mean_shadowed = mean_shadowed * (1.0 / 4096.0);
 
@@ -1404,7 +1635,7 @@ mod tests {
         let scene_no_cube = crate::bvh::BVHNode::build(objects_no_cube).unwrap();
         let mut mean_lit = VEC_ZERO;
         for _ in 0..4096 {
-            mean_lit = mean_lit + bdpt_trace(&target, &*scene_no_cube, 4, &lights, &mut rng);
+            mean_lit = mean_lit + bdpt_trace(&target, &*scene_no_cube, 4, &lights, NO_BRIDGES, &mut rng);
         }
         mean_lit = mean_lit * (1.0 / 4096.0);
 
@@ -1470,7 +1701,7 @@ mod tests {
 
         let mut rng = StdRng::seed_from_u64(9);
         let r = ray(Vec3::new(0.0, 0.5, 2.0), Vec3::new(0.0, 1.0, -1.0));
-        let c = bdpt_trace(&r, &*scene, 4, &lights, &mut rng);
+        let c = bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
         assert!((c.x - 4.0).abs() < 1e-3, "got {c:?}");
     }
 
@@ -1517,7 +1748,7 @@ mod tests {
         // side the cone opens to): full emission.
         let mut rng = StdRng::seed_from_u64(21);
         let r = ray(Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        let c = bdpt_trace(&r, &*scene, 4, &lights, &mut rng);
+        let c = bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
         assert!((c.x - le.x).abs() < 1e-3, "beam-axis view: {c:?}");
 
         // 1b. An off-center aperture hit: the disc has radius 0.1, and a
@@ -1527,7 +1758,7 @@ mod tests {
         // which blacked out every off-center point of the aperture.)
         let mut rng = StdRng::seed_from_u64(25);
         let off_center = ray(Vec3::new(0.05, 0.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        let c = bdpt_trace(&off_center, &*scene, 4, &lights, &mut rng);
+        let c = bdpt_trace(&off_center, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
         assert!((c.x - le.x).abs() < 1e-3, "off-center aperture view: {c:?}");
 
         // 2. Inside vs outside the beam on the floor. The beam disc has
@@ -1538,7 +1769,7 @@ mod tests {
         let inside = ray(Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, -1.0, 0.0));
         let mut mean_in = VEC_ZERO;
         for _ in 0..512 {
-            mean_in = mean_in + bdpt_trace(&inside, &*scene, 6, &lights, &mut rng);
+            mean_in = mean_in + bdpt_trace(&inside, &*scene, 6, &lights, NO_BRIDGES, &mut rng);
         }
         mean_in = mean_in * (1.0 / 512.0);
 
@@ -1546,7 +1777,7 @@ mod tests {
         let outside = ray(Vec3::new(1.5, 0.5, 0.0), Vec3::new(0.0, -1.0, 0.0));
         let mut mean_out = VEC_ZERO;
         for _ in 0..512 {
-            mean_out = mean_out + bdpt_trace(&outside, &*scene, 6, &lights, &mut rng);
+            mean_out = mean_out + bdpt_trace(&outside, &*scene, 6, &lights, NO_BRIDGES, &mut rng);
         }
         mean_out = mean_out * (1.0 / 512.0);
 
@@ -1567,7 +1798,7 @@ mod tests {
         let side = ray(Vec3::new(3.0, 2.0, 0.0), Vec3::new(-1.0, 0.0, 0.0));
         let mut mean_side = VEC_ZERO;
         for _ in 0..256 {
-            mean_side = mean_side + bdpt_trace(&side, &*scene, 4, &lights, &mut rng);
+            mean_side = mean_side + bdpt_trace(&side, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
         }
         mean_side = mean_side * (1.0 / 256.0);
         assert!(
@@ -1647,7 +1878,7 @@ mod tests {
         const N: usize = 4096;
         let mut mean = VEC_ZERO;
         for _ in 0..N {
-            mean = mean + bdpt_trace(&r, &*scene, 8, &lights, &mut rng);
+            mean = mean + bdpt_trace(&r, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
         }
         mean = mean * (1.0 / N as f32);
         assert!(
@@ -1714,14 +1945,14 @@ mod tests {
         let r_mirror = ray(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, -1.0));
         let mut mean_mirror = VEC_ZERO;
         for _ in 0..N {
-            mean_mirror = mean_mirror + bdpt_trace(&r_mirror, &*scene, 8, &lights, &mut rng);
+            mean_mirror = mean_mirror + bdpt_trace(&r_mirror, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
         }
         mean_mirror = mean_mirror * (1.0 / N as f32);
 
         let r_direct = ray(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
         let mut mean_direct = VEC_ZERO;
         for _ in 0..N {
-            mean_direct = mean_direct + bdpt_trace(&r_direct, &*scene, 8, &lights, &mut rng);
+            mean_direct = mean_direct + bdpt_trace(&r_direct, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
         }
         mean_direct = mean_direct * (1.0 / N as f32);
 
@@ -1828,7 +2059,7 @@ mod tests {
             let mut mean = VEC_ZERO;
             let mut sq = 0.0f64;
             for _ in 0..N {
-                let c = bdpt_trace(&r, &*scene, DEPTH, &lights, &mut rng);
+                let c = bdpt_trace(&r, &*scene, DEPTH, &lights, NO_BRIDGES, &mut rng);
                 mean = mean + c;
                 sq += (c.x * c.x) as f64;
             }
@@ -1936,7 +2167,7 @@ mod tests {
         const N: usize = 4096;
         let mut mean = VEC_ZERO;
         for _ in 0..N {
-            mean = mean + bdpt_trace(&r, &*scene, 8, &lights, &mut rng);
+            mean = mean + bdpt_trace(&r, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
         }
         mean = mean * (1.0 / N as f32);
         // Straight through the slab. The room is a closed white furnace,
@@ -2023,7 +2254,7 @@ mod tests {
         let mut mean_bdpt = VEC_ZERO;
         let mut sq_sum_bdpt = 0.0f32;
         for _ in 0..N {
-            let c = bdpt_trace(&r, &*scene, 8, &lights, &mut rng);
+            let c = bdpt_trace(&r, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
             mean_bdpt = mean_bdpt + c;
             sq_sum_bdpt += c.x * c.x;
         }

@@ -39,8 +39,6 @@ fn build_scene() -> SceneData {
     let red = MaterialData::diffuse(Vec3::new(0.75, 0.25, 0.25));
     let green = MaterialData::diffuse(Vec3::new(0.25, 0.75, 0.25));
 
-    let brown = MaterialData::diffuse(Vec3::new(0.2, 0.25, 0.25));
-
     let mut scene = SceneData::new();
 
     // The room: finite quads, not infinite planes. Planes get a ±1e6
@@ -109,37 +107,69 @@ fn build_scene() -> SceneData {
 
     // Ceiling light panel (one-sided: emits along its normal, i.e.
     // downward). `add_light` registers the quad as geometry too. It
-    // shines down on the glass sphere at a shallow off-axis angle
-    // (~15°), so the ball lens focuses its light into a caustic on the
-    // floor beside the sphere's shadow — the Phase 1 payoff
-    // (paper.md §6.2): a light path the unidirectional tracer cannot
-    // find. (The old hanging sphere light sat directly overhead; the
-    // panel is the same showcase with a lamp that is not in frame.)
+    // provides the room's ambient illumination; the lamp itself is not
+    // in frame from the default camera (it sits above the top edge of
+    // the view).
     scene.add_light(LightData::from_quad(
             Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     ));
 
-    // objects
-    scene.add_box( Vec3::new(room_size/2.0, 1.0, 1.0), Vec3::new(room_size, room_height, 0.02), white);
-
-    scene.add_laser(
-        Vec3::new(-0.5, 1.0, 2.0), // housing center, base sunk into the ceiling
-        Vec3::new(1.0, 0.0, 1.0),                // beam straight down
-        0.2,                                      // housing height
-        0.01,                                    // aperture radius
-        0.01,                                    // beam half-angle (radians, ~1.1°)
-        Vec3::new(800.0, 400000000.0, 800.0),        // green laser
-    );
-
+    // The mirror tile: 0.6 × 0.6, lying on the floor under the laser,
+    // tilted 30° (its lower edge 2 mm above the floor). The normal
+    // (0, cos 30°, sin 30°) points up and toward the front wall, so the
+    // downward beam reflects up the wall at 60° from vertical.
+    // Added *before* the laser: `add_laser` traces the beam's axis ray
+    // through the scene to build the specular bridge (the aperture's
+    // mirror image), so the mirror must already be registered.
+    let mirror_tilt = 30.0f32.to_radians();
     scene.add_quad(
-        Vec3::new(0.0, 1.0, room_size - 0.01),
-        Vec3::new(0.0, 0.0, -1.0),
-        1.5,
-        0.5,
+        Vec3::new(-0.9, 0.3 * mirror_tilt.sin() + 0.002, 0.6),
+        Vec3::new(0.0, mirror_tilt.cos(), mirror_tilt.sin()),
+        0.6,
+        0.6,
         MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
     );
 
+    // The laser showcase: a green laser hanging from the ceiling, aimed
+    // straight down at the mirror tile, which bounces the beam up onto
+    // the front wall — the wall the default camera faces. (A
+    // wall-mounted flat mirror cannot do this: it flips the beam's
+    // z-travel, so the beam can never land back on the wall it is
+    // mounted on. The floor tilt is what turns the downward beam into
+    // an upward one.)
+    //
+    // The beam's spot on the wall is *transported light*, not a decal:
+    // `add_laser` traces the beam's axis ray, and when it hits the
+    // mirror it registers the aperture's mirror image as a "specular
+    // bridge" — a sampling technique the BDPT eye walk uses at diffuse
+    // vertices (with probability BRIDGE_PROB it aims at the image disc,
+    // so the path camera → wall → mirror → aperture is carried by
+    // ordinary subpath walking; the direct-hit strategy then credits
+    // the aperture's emission, cone-gated). No BDPT connection can
+    // sample that path (the mirror is a delta endpoint) and no light
+    // subpath can reach the aperture (a ~1 cm disc behind the mirror),
+    // so without the bridge the spot is invisible — the estimator's
+    // blind spot. There is deliberately no beam in flight: in clean air
+    // a laser beam is invisible from the side; only the spot is real.
+    scene.add_laser(
+        Vec3::new(-0.9, 1.899, 0.6), // housing base cap 1 mm below the ceiling
+        Vec3::new(0.0, -1.0, 0.0),  // beam straight down at the floor mirror
+        0.2,                        // housing height
+        0.01,                       // aperture radius
+        0.01,                       // beam half-angle (radians, ~0.57°)
+        Vec3::new(0.8, 4.0e8, 0.8), // green laser
+    );
+
     scene
+}
+
+/// The default camera: eye height 1 m, level view down the room's +z
+/// axis. Level (not the old slightly-down lookat, which was tuned for
+/// the removed floor caustic) so the whole laser showcase is in frame:
+/// the ceiling-mounted housing, the floor mirror, and the spot on the
+/// front wall.
+fn default_cam() -> Cam {
+    Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 1.0, 0.0), 60.0)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -153,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !force_terminal || force_window {
         let scene = build_scene();
-        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+        let cam = default_cam();
         match window::run_window(scene, cam) {
             Ok(()) => return Ok(()),
             Err(e) => {
@@ -205,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
     eprintln!("Renderer: {}", renderer.name());
 
-    let mut cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+    let mut cam = default_cam();
     let mut needs_render = true;
     let mut filter_enabled = false;
     let mut showing_help = false;
@@ -387,6 +417,7 @@ fn render_fhd(
 
     // CPU fallback: render in bands with a progress bar.
     let (cpu_scene, lights) = scene.build_cpu_scene();
+    let bridges = scene.bridges();
     let aspect = fhd_w as f32 / fhd_h as f32;
     let theta = cam.fov_deg.to_radians();
     let h = (theta * 0.5).tan();
@@ -427,6 +458,7 @@ fn render_fhd(
                                     &*cpu_scene,
                                     MAX_DEPTH_FHD as usize,
                                     &lights,
+                                    &bridges,
                                     &mut rng,
                                 );
                         }
@@ -461,12 +493,14 @@ fn render_fhd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Bsdf;
 
     #[test]
     fn scene_builds_and_is_sampleable() {
         let scene = build_scene();
         // The demo scene has two emitters: the ceiling panel and the
-        // laser aperture.
+        // laser aperture. (No decal: the beam's spot is transported
+        // light, not a fake emitter.)
         assert_eq!(scene.lights.len(), 2);
         for light in &scene.lights {
             assert!(light.area() > 0.0);
@@ -594,7 +628,7 @@ mod tests {
     fn preview_render_produces_finite_pixels() {
         let scene = build_scene();
         let mut renderer = renderer::CpuRenderer::new(&scene, 16, 16, 4);
-        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+        let cam = default_cam();
         renderer.render_frame(&cam, 4);
         let buffer = renderer.read_pixels();
         assert_eq!(buffer.pixels.len(), 16 * 16);
@@ -606,126 +640,97 @@ mod tests {
         assert!(sum > 0.0);
     }
 
-    /// The caustic showcase (plan §2.7): the light must illuminate the
-    /// glass sphere from above so its light refracts through the ball
-    /// and focuses onto the floor below, and the sphere plus the
-    /// caustic point must be in frame from the default camera. This
-    /// pins the geometry the screenshot acceptance criterion depends
-    /// on — moving the light off the sphere or the sphere out of view
-    /// silently kills the caustic.
-    ///
-    /// The scene's emitter is a one-sided ceiling quad panel (the
-    /// hanging sphere light it replaced sat directly overhead); it
-    /// shines down on the sphere at a shallow off-axis angle (~15°),
-    /// so the caustic lands on the floor near the sphere's shadow. The
-    /// lamp itself is *not* in frame from the default camera (it sits
-    /// above the top edge of the view) — the caustic is the showcase,
-    /// not the lamp, so the in-frame checks cover the sphere and the
-    /// caustic point (the light→sphere axis crossing on the floor).
+    /// The laser showcase, pinned by the beam tracer itself: the beam
+    /// must leave the aperture, bounce off the mirror, and land on a
+    /// diffuse wall — with the landing point, the mirror hit, and the
+    /// housing all in frame from the default camera, and the landing
+    /// point visible (not occluded). This is the regression guard for
+    /// the whole showcase: a moved mirror, a re-aimed laser, or a
+    /// camera change that pushes the spot out of frame fails here.
     #[test]
-    fn caustic_geometry_is_in_frame() {
+    fn laser_beam_reflects_onto_a_visible_spot() {
         let scene = build_scene();
-        let light = &scene.lights[0];
-        // The glass sphere: the only non-diffuse, non-emissive sphere
-        // with ior != 1.
-        let glass = scene
-            .spheres
-            .iter()
-            .find(|s| s.mat.bsdf == crate::geometry::Bsdf::Glass { ior: 1.5 })
-            .expect("demo scene must contain a glass sphere");
-        // The light shines down on the glass sphere from above, at a
-        // shallow enough off-axis angle that the sphere sits well inside
-        // its beam (the old hanging sphere light was directly overhead,
-        // horiz = 0; the ceiling panel is ~15° — both focus a caustic
-        // below the ball).
-        let to_sphere = glass.center - light.center;
-        assert!(to_sphere.y < 0.0, "light not above the glass sphere");
-        let horiz = (to_sphere.x * to_sphere.x + to_sphere.z * to_sphere.z).sqrt();
-        assert!(
-            horiz < to_sphere.y.abs() * 0.5,
-            "light too far off-axis to focus a caustic through the sphere \
-             (horiz {horiz}, height {})",
-            to_sphere.y.abs()
-        );
-        // The glass sphere floats above the floor (not touching it), so
-        // refracted rays leaving the bottom cap can still hit the floor
-        // after the EPS_NEAR offset.
-        assert!(
-            glass.center.y - glass.radius > 0.01,
-            "glass sphere touches the floor"
-        );
-
-        // The sphere and the caustic point must be in frame from the
-        // default camera. The camera looks at (0, 0.7, 0) from
-        // (0, 1, -1.5) with a 60° fov: a point is in frame when its
-        // angle from the forward axis is under the half fov (30°) in
-        // both the horizontal and vertical projection. The caustic
-        // point is the light→sphere axis crossing on the floor (a ball
-        // lens focuses on its axis; with the off-axis ceiling panel
-        // that is beside the sphere's shadow, not directly below the
-        // sphere).
-        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
-        let forward = (cam.lookat - cam.origin).normalize();
-        let world_up = Vec3::new(0.0, 1.0, 0.0);
-        let right = world_up.cross(forward).normalize();
-        let up = forward.cross(right).normalize();
-        let half_fov = (cam.fov_deg * 0.5).to_radians().cos();
-        let axis = (glass.center - light.center).normalize();
-        let caustic = glass.center + axis * (-glass.center.y / axis.y);
-        for (name, p) in [("glass", glass.center), ("caustic", caustic)] {
-            let rel = p - cam.origin;
-            let f = rel.dot(forward);
-            assert!(f > 0.0, "{name} is behind the camera");
-            let cos_h = f / (rel.dot(right).abs().hypot(f));
-            let cos_v = f / (rel.dot(up).abs().hypot(f));
-            assert!(
-                cos_h >= half_fov && cos_v >= half_fov,
-                "{name} out of frame (cos_h {cos_h}, cos_v {cos_v}, need >= {half_fov})"
-            );
-        }
-
-        // The caustic center must be visible from the camera, not hidden
-        // behind the glass sphere's own silhouette: the distance from the
-        // sphere center to the camera→caustic segment must exceed the
-        // radius. (A sphere resting on the floor fails this — the floor
-        // point directly beneath it is behind the ball.)
-        let seg = caustic - cam.origin;
-        let to_center = glass.center - cam.origin;
-        let t = (to_center.dot(seg) / seg.dot(seg)).clamp(0.0, 1.0);
-        let closest = cam.origin + seg * t;
-        let dist = (glass.center - closest).length();
-        assert!(
-            dist > glass.radius,
-            "caustic center hidden behind the glass sphere (dist {dist} <= r {})",
-            glass.radius
-        );
-    }
-
-    /// The laser showcase: the housing (a cylinder hanging from the
-    /// ceiling) and the beam's floor spot must both be in frame from the
-    /// default camera, and the spot must be on open floor (not hidden
-    /// behind an object). This pins the geometry the visual acceptance
-    /// depends on — a laser that is out of frame or whose spot is
-    /// occluded silently produces no visible beam.
-    #[test]
-    fn laser_housing_and_spot_are_in_frame() {
-        let scene = build_scene();
-        // The laser: the only shape-2 light.
         let laser = scene
             .lights
             .iter()
             .find(|l| l.shape == 2)
             .expect("demo scene must contain a laser");
-        // The housing: the non-laser cylinder (the other one is the
-        // aperture puck, hidden inside it).
-        let cyl = scene
-            .cylinders
-            .iter()
-            .find(|c| !c.mat.is_laser())
-            .expect("the laser housing");
-        let aperture = laser.center;
+        let trace = scene.trace_laser_beam(laser, 4);
+        // Two legs: aperture -> mirror -> spot.
+        assert_eq!(
+            trace.legs.len(),
+            2,
+            "the beam must bounce exactly once (aperture -> mirror -> spot), got {:?}",
+            trace.legs
+        );
+        let spot = trace
+            .spot
+            .expect("the beam must land on a diffuse surface");
+        // The beam lands on the bare front wall (no decal: the spot is
+        // transported light, not a fake emitter).
+        assert_eq!(spot.mat.bsdf, Bsdf::Diffuse, "the spot must be diffuse");
+        assert!(!spot.mat.is_emissive(), "the wall must not be emissive");
+        // The spot is at the front wall (z = 2.5, normal -z).
+        assert!(
+            (spot.p.z - 2.5).abs() < 2e-3,
+            "the beam must land at the front wall, got {:?}",
+            spot.p
+        );
+        assert!((spot.normal + Vec3::new(0.0, 0.0, 1.0)).length() < 1e-4);
 
-        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+        // The mirror hit is the first leg's end: on the tilted mirror.
+        let mirror_hit = trace.legs[0].1;
+        let mirror = scene
+            .quads
+            .iter()
+            .find(|q| q.mat.bsdf == Bsdf::Mirror)
+            .expect("the mirror quad");
+        let local = mirror_hit - mirror.center;
+        assert!(
+            local.dot(mirror.tangent).abs() <= mirror.half_w + 1e-3
+                && local.dot(mirror.bitangent).abs() <= mirror.half_h + 1e-3,
+            "the mirror hit {:?} is outside the mirror quad",
+            mirror_hit
+        );
+
+        // The specular bridge: the aperture's mirror image, registered
+        // by add_laser when the beam's first delta hit is the mirror.
+        // This is the sampling technique that carries the beam's path
+        // camera → wall → mirror → aperture — the whole fix for the
+        // estimator's blind spot.
+        let bridge = laser
+            .bridge
+            .expect("the laser must carry a specular bridge");
+        // The image is the aperture reflected across the mirror quad's
+        // plane: image = aperture − 2·(d·n)·n with d = aperture − hit.
+        let aperture = laser.center;
+        let d = aperture - mirror_hit;
+        let expected_image = aperture - mirror.normal * (2.0 * d.dot(mirror.normal));
+        assert!(
+            (bridge.image_center - expected_image).length() < 1e-3,
+            "the bridge image {:?} must be the aperture's reflection {:?}",
+            bridge.image_center,
+            expected_image
+        );
+        // The image disc's radius is the aperture radius.
+        assert!((bridge.radius - laser.radius).abs() < 1e-6);
+
+        // The bridge must be *usable* from the spot: the image disc's
+        // axis lies in the wall's hemisphere (the spot can aim at it)
+        // and the cone is non-degenerate.
+        let d = bridge.image_center - spot.p;
+        assert!(
+            d.dot(spot.normal) > 0.0,
+            "the bridge must point out of the wall"
+        );
+        assert!(
+            d.length_squared() > bridge.radius * bridge.radius,
+            "the bridge cone must be non-degenerate"
+        );
+
+        // The housing, the mirror hit, and the spot must be in frame from
+        // the default camera.
+        let cam = default_cam();
         let forward = (cam.lookat - cam.origin).normalize();
         let world_up = Vec3::new(0.0, 1.0, 0.0);
         let right = world_up.cross(forward).normalize();
@@ -742,23 +747,20 @@ mod tests {
                 "{name} out of frame (cos_h {cos_h}, cos_v {cos_v}, need >= {half_fov})"
             );
         };
-
-        // The housing's midpoint and the aperture must be in frame.
-        let mid = cyl.base + cyl.axis * cyl.half_h;
+        let housing = scene
+            .cylinders
+            .iter()
+            .find(|c| !c.mat.is_laser())
+            .expect("the laser housing");
+        let mid = housing.base + housing.axis * housing.half_h;
         in_frame("laser housing", mid);
-        in_frame("laser aperture", aperture);
+        in_frame("mirror hit", mirror_hit);
+        in_frame("laser spot", spot.p);
 
-        // The beam spot: where the beam axis crosses the floor. The beam
-        // points straight down in the demo, so the spot is directly
-        // below the aperture.
-        let spot = aperture + laser.normal * (-aperture.y / laser.normal.y);
-        in_frame("laser spot", spot);
-
-        // The spot must be visible from the camera, not hidden behind
-        // the housing itself: the segment camera -> spot must not pass
-        // through the cylinder.
+        // The spot must be visible from the camera: the camera -> spot
+        // segment must not be occluded.
         let (cpu_scene, _) = scene.build_cpu_scene();
-        let seg = spot - cam.origin;
+        let seg = spot.p - cam.origin;
         let len = seg.length();
         let ray = crate::geometry::Ray {
             origin: cam.origin,
@@ -774,12 +776,73 @@ mod tests {
         }
     }
 
+    /// TEMPORARY probe: the CPU estimator's mean at the spot pixel vs the
+    /// analytic expectation. Run with --nocapture.
+    #[test]
+    fn temp_spot_probe_cpu() {
+        let scene = build_scene();
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        let bridges = scene.bridges();
+        let cam = default_cam();
+        let laser = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("laser");
+        let trace = scene.trace_laser_beam(laser, 4);
+        let spot = trace.spot.expect("spot").p;
+        let dir = (spot - cam.origin).normalize();
+        let ray = crate::geometry::Ray {
+            origin: cam.origin,
+            direction: dir,
+        };
+        let mut rng = rand::thread_rng();
+        let n = 4000;
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for _ in 0..n {
+            let c = crate::bdpt::bdpt_trace(&ray, &*cpu_scene, 8, &lights, &bridges, &mut rng);
+            sum += c.y as f64;
+            sum_sq += (c.y * c.y) as f64;
+        }
+        let mean = sum / n as f64;
+        let std = (sum_sq / n as f64 - mean * mean).max(0.0).sqrt();
+        std::fs::write(
+            "target/spot_probe_cpu.txt",
+            format!(
+                "CPU spot pixel: mean {mean:.1} ± {:.1}\n",
+                std / (n as f64).sqrt()
+            ),
+        )
+        .ok();
+        // The analytic expectation at the spot center:
+        // albedo/π · Le·R · cos·Ω_image, Ω_image = π r²/d² (face-on).
+        let d = (spot - laser.bridge.expect("bridge").image_center).length();
+        let omega = std::f32::consts::PI * laser.radius * laser.radius / (d * d);
+        let mirror = scene
+            .quads
+            .iter()
+            .find(|q| q.mat.bsdf == Bsdf::Mirror)
+            .expect("mirror");
+        let expected = 0.8 / std::f32::consts::PI
+            * laser.emission.y
+            * mirror.mat.albedo.y
+            * 0.8660254
+            * omega;
+        std::fs::write(
+            "target/spot_analytic.txt",
+            format!("analytic spot radiance: {expected:.1} (d {d:.3}, Ω {omega:.3e})\n"),
+        )
+        .ok();
+    }
+
     /// Regenerate `screenshot.png` headlessly through the exact production
-    /// path (`render_fhd` → `save_as_png`), so the Phase 1 acceptance
-    /// artifact (the caustic visible in the screenshot) can be produced
+    /// path (`render_fhd` → `save_as_png`), so the acceptance artifact
+    /// (the laser spot visible on the front wall) can be produced
     /// without pressing `P` in the interactive UI. Also probes the raw
-    /// HDR buffer for the caustic: a bright spot on the floor near the
-    /// glass sphere, brighter than the surrounding floor.
+    /// HDR buffer for the spot: the traced landing point must render
+    /// clearly brighter in the laser's color channel than the wall
+    /// around it.
     ///
     /// Runs as part of the default suite: it prefers the GPU (the FHD
     /// render takes seconds) and falls back to the CPU renderer, where
@@ -790,7 +853,7 @@ mod tests {
     #[test]
     fn regenerate_screenshot() {
         let scene = build_scene();
-        let cam = Cam::new(Vec3::new(0.0, 1.0, -1.5), Vec3::new(0.0, 0.7, 0.0), 60.0);
+        let cam = default_cam();
 
         // Optional quick-probe override for the sample count.
         let spp = std::env::var("SCREENSHOT_SPP")
@@ -808,30 +871,26 @@ mod tests {
 
         let buffer = render_fhd_with_spp(&scene, &cam, false, shared_device, spp);
 
-        // --- Caustic probe: the floor around the glass sphere must show a
-        // bright focused spot. A ball lens focuses on its axis, so the
-        // caustic lands where the light→sphere axis crosses the floor —
-        // with the ceiling panel ~15° off vertical that point sits beside
-        // the sphere's shadow, not directly below the sphere (where the
-        // old overhead light focused it, and which is now the umbra).
-        // Compare the mean HDR value in a small disc at that axis
-        // crossing against a nearby fully-lit floor disc: the focused
-        // light must be brighter by a clear margin — several times the
-        // direct illumination there.
-        let glass = scene
-            .spheres
+        // --- Laser spot probe: the traced landing point must render
+        // clearly brighter in the laser's color channel (green) than the
+        // wall around it — the visual acceptance of the laser showcase.
+        // The spot is the traced beam's landing point (never a formula:
+        // the trace is the ground truth); the reference is a wall disc
+        // 0.4 to the +x, outside the decal (half-width ~0.03) and away
+        // from every object.
+        let laser = scene
+            .lights
             .iter()
-            .find(|s| s.mat.bsdf == crate::geometry::Bsdf::Glass { ior: 1.5 })
-            .expect("glass sphere");
-        let light = &scene.lights[0];
-        let axis = (glass.center - light.center).normalize();
-        let caustic_world = glass.center + axis * (-glass.center.y / axis.y);
-        let (cx, cy) = project_to_pixel(&cam, caustic_world, buffer.width, buffer.height);
-        // The reference: fully-lit floor 1.2 to the +x of the caustic,
-        // outside the sphere's shadow (umbra ~0.4, penumbra ~0.6 for
-        // this light/sphere geometry) and away from every object.
-        let reference_world = caustic_world + Vec3::new(1.2, 0.0, 0.0);
-        let (rx, ry) = project_to_pixel(&cam, reference_world, buffer.width, buffer.height);
+            .find(|l| l.shape == 2)
+            .expect("demo scene must contain a laser");
+        let trace = scene.trace_laser_beam(laser, 4);
+        let spot_world = trace
+            .spot
+            .expect("the beam must land on a diffuse surface")
+            .p;
+        let (sx, sy) = project_to_pixel(&cam, spot_world, buffer.width, buffer.height);
+        let spot_ref_world = spot_world + Vec3::new(0.4, 0.0, 0.0);
+        let (srx, sry) = project_to_pixel(&cam, spot_ref_world, buffer.width, buffer.height);
         let disc_mean = |px: usize, py: usize| -> f32 {
             let mut sum = 0.0f32;
             let mut n = 0usize;
@@ -845,62 +904,36 @@ mod tests {
                     if x < 0 || y < 0 || x >= buffer.width as i64 || y >= buffer.height as i64 {
                         continue;
                     }
-                    sum += buffer.get_pixel(x as usize, y as usize).x;
+                    // The green channel: the laser's color. A green
+                    // laser is invisible in a red-channel probe.
+                    sum += buffer.get_pixel(x as usize, y as usize).y;
                     n += 1;
                 }
             }
             sum / n.max(1) as f32
         };
-        let center_mean = disc_mean(cx, cy);
-        let reference_mean = disc_mean(rx, ry);
-        // Diagnostic dump (the harness hides stdout).
-        std::fs::write(
-            "target/caustic_probe.txt",
-            format!(
-                "caustic ({cx},{cy}) mean {center_mean}\nreference ({rx},{ry}) mean {reference_mean}\nratio {}\n",
-                center_mean / reference_mean
-            ),
-        )
-        .ok();
-        // The focused light concentrates the light's power into a small
-        // disc: several times the direct illumination on nearby floor.
-        // 1.5x is a conservative floor for "clearly visible".
-        assert!(
-            center_mean > reference_mean * 1.5,
-            "no caustic visible: center {center_mean} vs reference {reference_mean}"
-        );
-
-        // --- Laser spot probe: the beam's floor disc must be clearly
-        // brighter (and redder) than the surrounding floor — the visual
-        // acceptance of the laser showcase, pinned the same way as the
-        // caustic. The spot sits directly below the aperture (the beam
-        // points straight down); the reference is the floor disc 0.6 to
-        // the +x, outside the beam disc (radius ~0.03) and away from
-        // every object.
-        let laser = scene
-            .lights
-            .iter()
-            .find(|l| l.shape == 2)
-            .expect("demo scene must contain a laser");
-        let spot_world = laser.center + laser.normal * (-laser.center.y / laser.normal.y);
-        let (sx, sy) = project_to_pixel(&cam, spot_world, buffer.width, buffer.height);
-        let spot_ref_world = spot_world + Vec3::new(0.6, 0.0, 0.0);
-        let (srx, sry) = project_to_pixel(&cam, spot_ref_world, buffer.width, buffer.height);
         let spot_mean = disc_mean(sx, sy);
         let spot_ref_mean = disc_mean(srx, sry);
+        // TEMPORARY: dump the center pixel and a cross-section through
+        // the spot, to compare against the CPU estimator's probe.
+        let center = buffer.get_pixel(sx, sy);
+        let mut cross = String::new();
+        for dx in -60i64..=60 {
+            let x = (sx as i64 + dx).clamp(0, buffer.width as i64 - 1) as usize;
+            cross.push_str(&format!("{:.0} ", buffer.get_pixel(x, sy).y));
+        }
         std::fs::write(
             "target/laser_probe.txt",
             format!(
-                "laser spot ({sx},{sy}) mean {spot_mean}\nreference ({srx},{sry}) mean {spot_ref_mean}\nratio {}\n",
+                "laser spot ({sx},{sy}) mean {spot_mean}\nreference ({srx},{sry}) mean {spot_ref_mean}\nratio {}\ncenter {center:?}\ncross {cross}\n",
                 spot_mean / spot_ref_mean
             ),
         )
         .ok();
         // The beam concentrates the aperture's power into a tiny disc:
         // the spot must be several times brighter than the ambient-lit
-        // floor around it. 2x is a conservative floor for "clearly
-        // visible" (the caustic probe uses 1.5x; the laser's narrower
-        // concentration warrants the higher bar).
+        // wall around it. 2x is a conservative floor for "clearly
+        // visible".
         assert!(
             spot_mean > spot_ref_mean * 2.0,
             "no laser spot visible: spot {spot_mean} vs reference {spot_ref_mean}"
@@ -972,6 +1005,7 @@ mod tests {
 
         // CPU fallback: render in bands with a progress bar.
         let (cpu_scene, lights) = scene.build_cpu_scene();
+        let bridges = scene.bridges();
         let aspect = fhd_w as f32 / fhd_h as f32;
         let theta = cam.fov_deg.to_radians();
         let h = (theta * 0.5).tan();
@@ -1012,6 +1046,7 @@ mod tests {
                                         &*cpu_scene,
                                         MAX_DEPTH_FHD as usize,
                                         &lights,
+                                        &bridges,
                                         &mut rng,
                                     );
                             }

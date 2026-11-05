@@ -2,9 +2,9 @@
 
 A high-performance, interactive path tracer rendered directly in the terminal using Rust. This project demonstrates the intersection of physically based rendering (PBR) and low-resolution terminal output.
 
-![Example render of the demo scene: a Cornell-box style room with red and green side walls, a glass sphere under the ceiling light panel focusing its light into a bright caustic on the floor, a chrome sphere on the cube stack, and diffuse spheres and cubes.](example.png)
+![Example render of the demo scene: a Cornell-box style room with red and green side walls, a ceiling light panel, and a green laser aimed at a tilted floor mirror that bounces the beam onto a bright spot on the front wall.](example.png)
 
-*The demo scene rendered with bidirectional path tracing — a caustic focused through the glass sphere (a light path unidirectional tracing cannot find), reflections in the chrome sphere, indirect color bleeding from the red and green walls, and global illumination in the cube stack.*
+*The demo scene rendered with bidirectional path tracing — a green laser beam traced analytically through a mirror bounce onto the front wall (a deterministic delta-cone path no Monte-Carlo estimator can sample), indirect color bleeding from the red and green walls, and global illumination.*
 
 ## 🚀 Features
 
@@ -56,7 +56,7 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 - **Windowing:** `winit` 0.30 (`ApplicationHandler`) with a wgpu 30 surface; the display pass reads the accumulation buffer directly (no readback).
 - **Image Processing:** `image` crate for PNG export.
 - **Light Transport:** Bidirectional path tracing with BSDF-aware sampling (Lambertian diffuse, perfect mirror, and dielectric glass with exact Fresnel and Snell refraction), area-light sampling, and MIS power-heuristic weights computed by Veach's incremental-ratio walk over the actual per-edge pdfs. Delta (specular) BSDFs contribute a symbolic pdf that cancels between strategies, and connections through them are excluded from the MIS normalization — specular transport is handled purely by subpath sampling, which is what lets BDPT find caustics that unidirectional path tracing cannot.
-- **Scene:** A Cornell-box style room — red and green side walls, a diffuse sphere, a stack of white cubes with a chrome sphere on top, and a ceiling light panel shining down on a glass sphere that focuses its light into a caustic on the floor.
+- **Scene:** A Cornell-box style room — red and green side walls, a ceiling light panel, and a green laser hanging from the ceiling aimed at a mirror tile lying on the floor and tilted 30°, which bounces the beam up onto a bright spot on the front wall. The beam's landing point is traced analytically through the real scene at build time (`SceneData::trace_laser_beam` follows the aperture's axis ray across every specular surface until it reaches a diffuse wall), and the landing patch is registered as a small quad emitter carrying exactly the radiance the wall would reflect — the analytic transport of a deterministic delta cone, a path no Monte-Carlo strategy can sample. There is deliberately no beam visible in mid-air: in clean air a laser beam is invisible from the side; only the spot on the wall is real.
 - **Complexity:** Implements a full orthonormal camera basis and a bidirectional path-tracing loop with vertex connection.
 
 ## 📦 Getting Started

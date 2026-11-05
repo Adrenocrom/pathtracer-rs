@@ -101,7 +101,9 @@ impl Cam {
         self.lookat = self.origin + clamped * rel.length();
     }
 
-    /// Render the scene using BDPT. `lights` are the sampleable area lights.
+    /// Render the scene using BDPT. `lights` are the sampleable area lights,
+    /// `bridges` the specular bridges (the eye walk's diffuse sampling
+    /// mixture; see `bdpt::Bridge`).
     pub fn render(
         &self,
         scene: &dyn crate::geometry::Intersectable,
@@ -110,6 +112,7 @@ impl Cam {
         samples: usize,
         max_depth: usize,
         lights: &[crate::geometry::AreaLight],
+        bridges: &[crate::bdpt::Bridge],
     ) -> crate::output::PixelBuffer {
         let aspect = width as f32 / height as f32;
         let theta = self.fov_deg.to_radians();
@@ -142,7 +145,7 @@ impl Cam {
                                 direction: dir,
                             };
                             color = color
-                                + crate::bdpt::bdpt_trace(&ray, scene, max_depth, lights, &mut rng);
+                                + crate::bdpt::bdpt_trace(&ray, scene, max_depth, lights, bridges, &mut rng);
                         }
                         color / samples as f32
                     })

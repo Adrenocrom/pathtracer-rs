@@ -224,7 +224,7 @@ pub(crate) fn cosine_hemisphere(normal: Vec3, rng: &mut impl Rng) -> Vec3 {
 
 /// Exact unpolarized dielectric Fresnel reflectance for an incidence
 /// cosine `cos_i` (measured against the normal on the incident side).
-fn fresnel_dielectric(cos_i: f32, eta_i: f32, eta_t: f32) -> f32 {
+pub(crate) fn fresnel_dielectric(cos_i: f32, eta_i: f32, eta_t: f32) -> f32 {
     let cos_i = cos_i.abs().min(1.0);
     let sin_i = (1.0 - cos_i * cos_i).sqrt();
     let sin_t = eta_i / eta_t * sin_i;
@@ -240,7 +240,7 @@ fn fresnel_dielectric(cos_i: f32, eta_i: f32, eta_t: f32) -> f32 {
 /// Snell refraction of the travel direction `dir_in` at a surface whose
 /// (unit) `normal` is oriented toward the side the ray arrives from.
 /// None = total internal reflection.
-fn refract_dir(dir_in: Vec3, normal: Vec3, eta_i: f32, eta_t: f32) -> Option<Vec3> {
+pub(crate) fn refract_dir(dir_in: Vec3, normal: Vec3, eta_i: f32, eta_t: f32) -> Option<Vec3> {
     let cos_i = -normal.dot(dir_in);
     let eta = eta_i / eta_t;
     let sin_t_sq = eta * eta * (1.0 - cos_i * cos_i);
@@ -253,7 +253,7 @@ fn refract_dir(dir_in: Vec3, normal: Vec3, eta_i: f32, eta_t: f32) -> Option<Vec
 
 /// Specular reflection of the travel direction `dir_in` (unit, with `normal`
 /// oriented against it).
-fn reflect_dir(dir_in: Vec3, normal: Vec3) -> Vec3 {
+pub(crate) fn reflect_dir(dir_in: Vec3, normal: Vec3) -> Vec3 {
     dir_in - normal * (2.0 * normal.dot(dir_in))
 }
 
