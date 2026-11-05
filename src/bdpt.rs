@@ -138,7 +138,7 @@ const RR_MIN: f32 = 0.05;
 /// low-variance.
 const RR_START: usize = 3;
 
-/// The probability of drawing the specular-bridge direction at a diffuse
+/// The probability of drawing a specular-bridge direction at a diffuse
 /// eye vertex when a bridge qualifies there (see `sample_diffuse_mixture`
 /// and `Bridge`). The value is not free: the accumulation layer's temporal
 /// outlier rejection winsorizes each sample/batch against μ + K·σ
@@ -146,43 +146,44 @@ const RR_START: usize = 3;
 /// beyond that bound is structurally clamped — the mode sits at
 /// μ + sqrt((1−p)/p)·σ, so it passes iff p ≥ 1/(1+K²) = 0.1. 0.25 sits
 /// comfortably inside (the mode at μ + 1.7σ), which keeps the beam's
-/// spot unbiased; the cost is that non-footprint vertices waste 25% of
+/// glow unbiased; the cost is that non-footprint vertices waste 25% of
 /// their diffuse draws on bridge directions the aperture's cone gate
 /// kills (+33% ambient variance, cleaned up by accumulation).
 pub const BRIDGE_PROB: f32 = 0.25;
 
-/// A specular bridge: the analytic description of the multi-bounce
-/// specular path from a diffuse vertex to a laser aperture — the
-/// aperture's *mirror image* through the beam's whole mirror chain, a
-/// disc. Derived by the scene on demand (`SceneData::bridge_of_light`
-/// traces the beam through the fully-built scene and unfolds the
-/// aperture across every mirror plane in beam order — never baked at
-/// add-time, so the registration order is irrelevant and a moving
-/// scene re-derives it), carried by the light types (`LightData` →
-/// `AreaLight` / `GpuLight`), and consumed here as a *sampling
-/// technique* for the eye subpath: at a diffuse vertex the walk draws a
-/// direction toward the image disc with probability `BRIDGE_PROB`, so
-/// the path camera → wall → mirror₁ → … → mirrorₙ → aperture — which
-/// no BDPT connection can sample (the mirrors are delta endpoints) and
-/// no light subpath can reach (the aperture is a ~1 cm disc behind the
-/// first mirror) — is carried by ordinary subpath walking. The beam's
-/// spot on the wall then emerges from real light transport: the
-/// direct-hit strategy credits the aperture's emission, gated by its
-/// cone, and the MIS machinery weights the (single) valid strategy.
+/// A specular bridge: the analytic description of a specular path
+/// from a diffuse vertex to a laser aperture — the aperture's *mirror
+/// image* through a prefix of the beam's mirror chain, a disc. Derived
+/// by the scene on demand (`SceneData::bridges_of_light` traces the
+/// beam through the fully-built scene and unfolds the aperture across
+/// every mirror plane in beam order, keeping one rung per mirror —
+/// never baked at add-time, so the registration order is irrelevant
+/// and a moving scene re-derives it), carried by the light types
+/// (`LightData` → `AreaLight` / `GpuLight`), and consumed here as a
+/// *sampling technique* for the eye subpath: at a diffuse vertex the
+/// walk draws a direction toward one of the qualifying rungs with
+/// probability `BRIDGE_PROB`, so the paths camera → wall → mirror₁ →
+/// … → mirrorⱼ → aperture — which no BDPT connection can sample (the
+/// mirrors are delta endpoints) and no light subpath can reach (the
+/// aperture is a ~1 cm disc behind the first mirror) — are carried by
+/// ordinary subpath walking. The beam's glow then appears beside
+/// *every* leg of the beam, not just the last: a diffuse vertex
+/// beside leg j+1 sees the aperture through exactly the first j
+/// mirrors, which is rung j.
 ///
 /// The construction is exact: each mirror plane is the perpendicular
 /// bisector of the segment image ↔ unfolded image, so a ray from `p`
-/// aimed at a point `q` of the final image disc crosses every mirror
-/// plane in the chain and reflects onto the corresponding point of the
-/// aperture disc — the classic mirror-image (unfolding) construction.
-/// The set of directions from `p` that reach the aperture through the
-/// mirror chain is therefore exactly the cone subtended by the image
-/// disc, which is what `sample_dir`/`pdf` describe (uniform over that
-/// cone).
+/// aimed at a point `q` of the rung's image disc crosses every mirror
+/// plane in the prefix and reflects onto the corresponding point of
+/// the aperture disc — the classic mirror-image (unfolding)
+/// construction. The set of directions from `p` that reach the
+/// aperture through the prefix is therefore exactly the cone subtended
+/// by the image disc, which is what `sample_dir`/`pdf` describe
+/// (uniform over that cone).
 ///
 /// This is a sampling technique, not a light source: no fake emitters,
 /// no mid-air beam — in clean air a laser beam is invisible from the
-/// side; only the spot on the wall is real.
+/// side; only the light deposited on real surfaces is real.
 #[derive(Clone, Copy)]
 pub struct Bridge {
     /// The aperture's mirror image through the beam's whole mirror
@@ -321,10 +322,22 @@ fn sample_diffuse_mixture(
         cosine_hemisphere(normal, rng)
     };
     let pdf = mixture_pdf(p, normal, dir_in, dir_out, bridges);
+    // A bridge direction can dip below the horizon: the image disc of
+    // a grazing rung lies nearly in the surface plane, so the cone
+    // (half-angle asin(r/dist)) can be wider than the axis elevation,
+    // and a uniform draw inside it can land below the horizon. The
+    // BSDF is zero there, so the sample carries no light — the weight
+    // must be 0, not albedo·cos/(π·0) = ±inf. (Unbiased: those
+    // directions contribute nothing to the integral; the draw is
+    // merely wasted.)
     BsdfSample {
         dir_out,
         pdf_omega: pdf,
-        weight: mat.albedo * normal.dot(dir_out) / (PI * pdf),
+        weight: if pdf > 0.0 {
+            mat.albedo * normal.dot(dir_out) / (PI * pdf)
+        } else {
+            VEC_ZERO
+        },
     }
 }
 
@@ -364,7 +377,8 @@ struct PathView<'a> {
     cam_dir: Vec3,
     /// n_lights * area of the light the path ends on.
     inv_light_pdf: f64,
-    /// The specular bridges (the eye walk's diffuse sampling mixture).
+    /// The specular bridges (the eye walk's diffuse sampling mixture):
+    /// each laser's whole ladder, one rung per mirror its beam crosses.
     /// The light walk samples plain cosine, so only eye-side diffuse
     /// events query them.
     bridges: &'a [Bridge],
@@ -863,9 +877,10 @@ pub fn bdpt_trace(
         // keeps the expected contribution of the subpath unchanged.
         // At a diffuse vertex the eye walk uses the cosine–bridge
         // mixture (see `sample_diffuse_mixture`): with probability
-        // BRIDGE_PROB it aims at a laser aperture's mirror image, so
-        // the beam's path camera → wall → mirror → aperture is carried
-        // by ordinary subpath walking.
+        // BRIDGE_PROB it aims at one of the laser's bridge rungs (the
+        // aperture's mirror images through the beam's mirror-chain
+        // prefixes), so the paths camera → wall → mirror → aperture
+        // are carried by ordinary subpath walking.
         let s = if hit.mat.bsdf == Bsdf::Diffuse {
             sample_diffuse_mixture(&hit.mat, hit.p, normal, cur.direction, bridges, rng)
         } else {

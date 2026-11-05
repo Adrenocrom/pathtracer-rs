@@ -535,12 +535,12 @@ impl SceneData {
     /// 0, emission gated to the beam cone), so only the puck's top cap
     /// radiates — the rest of it is hidden inside the housing.
     ///
-    /// The specular bridge (the aperture's mirror image through the
-    /// beam's whole mirror chain — see `bridges_by_light`) is *derived*
-    /// on demand, never baked here: the beam is traced through the
-    /// fully-built scene, so the laser may be added before, after or
-    /// interleaved with the mirrors, and a scene that moves between
-    /// frames simply re-derives the bridge from the new geometry.
+    /// The specular bridge *ladder* (one bridge per mirror the beam
+    /// crosses — see `bridges_of_light`) is *derived* on demand, never
+    /// baked here: the beam is traced through the fully-built scene,
+    /// so the laser may be added before, after or interleaved with the
+    /// mirrors, and a scene that moves between frames simply re-derives
+    /// every rung from the new geometry.
     pub fn add_laser(
         &mut self,
         center: Vec3,
@@ -556,86 +556,82 @@ impl SceneData {
         self.add_light(light);
     }
 
-    /// The specular bridge of one laser light: the aperture's mirror
-    /// image through the beam's *entire* mirror chain.
+    /// The specular bridge *ladder* of one laser: one bridge per mirror
+    /// the beam crosses, in beam order. Rung j is the aperture's mirror
+    /// image unfolded across the first j mirrors of the beam's chain —
+    /// the analytic description of the specular path "diffuse vertex →
+    /// mirror₁ → … → mirrorⱼ → aperture". A diffuse vertex beside the
+    /// beam's j-th leg sees the aperture through exactly those j
+    /// mirrors, so rung j is the bridge that carries the glow on that
+    /// leg: without it the light is unreachable (every BDPT connection
+    /// from such a vertex is either through a delta mirror — invalid —
+    /// or coplanar-grazing, G = 0 exactly), and the leg renders black.
     ///
-    /// The beam's axis ray is traced through the fully-built scene —
-    /// mirrors reflect it, glass refracts it — until it reaches a
-    /// non-delta surface (a diffuse wall) or escapes, exactly like
-    /// `trace_laser_beam`. The aperture disc is then reflected across
-    /// each mirror plane in beam order: the classic *unfolding*
-    /// construction. A ray from a diffuse vertex aimed at the final
-    /// image disc crosses every mirror plane in the chain and reflects
-    /// onto the aperture — the analytic description of the multi-bounce
-    /// specular path from that vertex to the aperture, which no BDPT
-    /// connection can sample (the mirrors are delta endpoints) and no
-    /// light subpath can reach (the aperture is a ~1 cm disc behind the
-    /// first mirror).
+    /// The rungs are free byproducts of the unfolding: the loop that
+    /// traces the beam reflects the image across each mirror plane as
+    /// it goes, and every intermediate image is a valid bridge for the
+    /// corresponding prefix of the chain — the classic unfolding
+    /// construction works for any prefix (a ray aimed at rung j's
+    /// image disc crosses the mirrors j…1 in reverse order and lands
+    /// on the aperture).
     ///
-    /// Glass ends the chain: a refracted ray's bend depends on where it
-    /// crosses the interface, so no single image disc describes the far
-    /// side of a glass surface. (A mirror behind glass is then not
-    /// bridged — the beam's spot there is carried by the ordinary
-    /// specular-chain sampling, which is unbiased, just slow to
-    /// converge.)
-    ///
-    /// `None` when the beam never hits a mirror (the bridge is then
-    /// meaningless — the aperture is directly visible and ordinary
-    /// sampling finds it), when the chain is longer than
-    /// `max_bounces`, or when the beam escapes first.
+    /// Glass ends the ladder (a refracted ray's bend depends on where
+    /// it crosses the interface, so no image disc describes the far
+    /// side); the rungs before the glass remain valid and are kept.
+    /// The ladder is empty when the beam never hits a mirror (the
+    /// aperture is then directly visible and ordinary sampling finds
+    /// it).
     ///
     /// Derived on demand, never stored: the scene may move between
-    /// frames, and the bridge must follow the geometry.
+    /// frames, and every rung must follow the geometry.
+    pub fn bridges_of_light(
+        &self,
+        laser: &LightData,
+        max_bounces: usize,
+    ) -> Vec<crate::bdpt::Bridge> {
+        debug_assert!(laser.shape == 2, "not a laser light");
+        let (cpu_scene, _) = self.build_cpu_scene();
+        self.bridges_of_light_in(laser, &*cpu_scene, max_bounces)
+    }
+
+    /// The specular bridge of one laser's *whole* mirror chain: the
+    /// last rung of the ladder (`bridges_of_light`). `None` when the
+    /// beam never hits a mirror.
     pub fn bridge_of_light(
         &self,
         laser: &LightData,
         max_bounces: usize,
     ) -> Option<crate::bdpt::Bridge> {
-        debug_assert!(laser.shape == 2, "not a laser light");
-        let (cpu_scene, _) = self.build_cpu_scene();
-        self.bridge_of_light_in(laser, &*cpu_scene, max_bounces)
+        self.bridges_of_light(laser, max_bounces).pop()
     }
 
-    /// The specular bridges of all laser lights in the scene: the
-    /// analytic multi-bounce specular paths from a diffuse vertex to
-    /// each laser aperture (the aperture's mirror image through the
-    /// beam's mirror chain). Consumed by the BDPT eye walk's diffuse
-    /// sampling mixture — see `bdpt::Bridge`.
+    /// The specular bridges of every laser in the scene: each laser's
+    /// whole ladder, concatenated — the eye walk's diffuse sampling
+    /// mixture (see `bdpt::Bridge`). One BVH build shared across the
+    /// lasers.
     pub fn bridges(&self) -> Vec<crate::bdpt::Bridge> {
-        self.bridges_by_light()
-            .into_iter()
-            .filter_map(|(_, b)| b)
-            .collect()
-    }
-
-    /// Like `bridges()`, but keyed by light: `(light index, bridge)` for
-    /// every laser light, `None` when that laser's beam never hits a
-    /// mirror. The GPU backend needs the per-light pairing (its shader
-    /// reads the bridge from the light record).
-    pub fn bridges_by_light(&self) -> Vec<(usize, Option<crate::bdpt::Bridge>)> {
         let (cpu_scene, _) = self.build_cpu_scene();
         self.lights
             .iter()
-            .enumerate()
-            .filter(|(_, l)| l.shape == 2)
-            .map(|(i, l)| (i, self.bridge_of_light_in(l, &*cpu_scene, MAX_BEAM_BOUNCES)))
+            .filter(|l| l.shape == 2)
+            .flat_map(|l| self.bridges_of_light_in(l, &*cpu_scene, MAX_BEAM_BOUNCES))
             .collect()
     }
 
-    /// `bridge_of_light` against an already-built BVH (the per-light
+    /// `bridges_of_light` against an already-built BVH (the per-laser
     /// variant rebuilds it; this one shares it across all lasers).
-    fn bridge_of_light_in(
+    fn bridges_of_light_in(
         &self,
         laser: &LightData,
         cpu_scene: &dyn Intersectable,
         max_bounces: usize,
-    ) -> Option<crate::bdpt::Bridge> {
+    ) -> Vec<crate::bdpt::Bridge> {
         debug_assert!(laser.shape == 2, "not a laser light");
         let mut origin = laser.center + laser.normal * EPS_NEAR;
         let mut dir = laser.normal;
         // The aperture's image, unfolded across the mirrors hit so far.
         let mut image = laser.center;
-        let mut hit_mirror = false;
+        let mut ladder = Vec::new();
         for _ in 0..max_bounces {
             let ray = Ray {
                 origin,
@@ -658,10 +654,15 @@ impl SceneData {
                     // bisector of image ↔ reflected image, so a ray
                     // aimed at the reflected image bounces onto the
                     // pre-image — and chaining the reflections lands on
-                    // the aperture itself.
+                    // the aperture itself. Every intermediate image is
+                    // a valid bridge for the prefix of the chain so
+                    // far: push it as a rung.
                     let d = image - hit.p;
                     image = image - normal * (2.0 * d.dot(normal));
-                    hit_mirror = true;
+                    ladder.push(crate::bdpt::Bridge {
+                        image_center: image,
+                        radius: laser.radius,
+                    });
                     dir = reflect_dir(dir, normal);
                     origin = hit.p + normal * EPS_NEAR;
                 }
@@ -669,13 +670,7 @@ impl SceneData {
                 _ => break, // diffuse (or the beam's own housing): the chain ends
             }
         }
-        if !hit_mirror {
-            return None;
-        }
-        Some(crate::bdpt::Bridge {
-            image_center: image,
-            radius: laser.radius,
-        })
+        ladder
     }
 
     /// The highest luminance any physically valid sample can carry:
@@ -1407,6 +1402,117 @@ mod tests {
         assert!(
             scene.bridge_of_light(laser, 4).is_none(),
             "a beam hitting only the diffuse floor must have no bridge"
+        );
+        assert!(
+            scene.bridges_of_light(laser, 4).is_empty(),
+            "a beam hitting only the diffuse floor must have no ladder"
+        );
+    }
+
+    /// The bridge *ladder*: one rung per mirror, and rung j must be the
+    /// correct bridge for the beam's j-th leg — the aperture's image
+    /// unfolded across exactly the first j mirrors. A diffuse vertex
+    /// beside leg j+1 sees the aperture through exactly those j
+    /// mirrors, so rung j is what carries the glow there. This is the
+    /// per-bounce generalization of the whole-chain test above.
+    #[test]
+    fn bridge_ladder_has_one_rung_per_mirror_in_beam_order() {
+        let mut scene = laser_room();
+        scene.add_laser(
+            Vec3::new(0.4, 1.9, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            0.2,
+            0.01,
+            0.01,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+        scene.add_quad(
+            Vec3::new(0.4, 0.002, 0.0),
+            Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2),
+            0.6,
+            0.6,
+            MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+        );
+        scene.add_quad(
+            Vec3::new(0.4, 0.0027, 0.998),
+            Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2),
+            0.6,
+            0.6,
+            MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+        );
+        let laser = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("the laser");
+        let trace = scene.trace_laser_beam(laser, 4);
+        assert_eq!(trace.legs.len(), 3, "two bounces");
+
+        let ladder = scene.bridges_of_light(laser, 4);
+        assert_eq!(ladder.len(), 2, "one rung per mirror");
+        // The last rung is the whole-chain bridge (the old contract).
+        let whole = scene
+            .bridge_of_light(laser, 4)
+            .expect("the whole-chain bridge");
+        assert!(
+            (ladder[1].image_center - whole.image_center).length() < 1e-6,
+            "the last rung must be the whole-chain bridge"
+        );
+
+        // Rung j is the aperture unfolded across exactly the first j
+        // mirrors, in beam order. The unfolding preserves path length,
+        // so the distance from the *end of leg j+1* (the point that sees
+        // the aperture through mirrors 1..j) to rung j's image equals
+        // the length of the specular path from there to the aperture:
+        // legs j+1..1 plus the aperture leg.
+        let unfold = |p: Vec3, hit: Vec3, normal: Vec3| {
+            let d = p - hit;
+            p - normal * (2.0 * d.dot(normal))
+        };
+        let aperture = laser.center;
+        let floor_hit = trace.legs[0].1;
+        let wall_hit = trace.legs[1].1;
+        let floor_n = Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+        let wall_n = Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2);
+        // Rung 0: the aperture reflected across the floor mirror only.
+        let expected0 = unfold(aperture, floor_hit, floor_n);
+        assert!(
+            (ladder[0].image_center - expected0).length() < 1e-3,
+            "rung 0 {:?} must be the single reflection {:?}",
+            ladder[0].image_center,
+            expected0
+        );
+        // Rung 1: that image reflected across the wall mirror.
+        let expected1 = unfold(expected0, wall_hit, wall_n);
+        assert!(
+            (ladder[1].image_center - expected1).length() < 1e-3,
+            "rung 1 {:?} must be the double reflection {:?}",
+            ladder[1].image_center,
+            expected1
+        );
+
+        // The per-leg usability invariant: a diffuse vertex beside leg
+        // j+1 aims at rung j. The vertex is the end of leg j+1 offset
+        // perpendicular to the beam, on the surface that leg runs
+        // along, and the image must lie in that surface's hemisphere.
+        // Leg 2 runs along the floor: a floor point beside the beam
+        // (offset in x) sees the aperture through mirror 1 only.
+        let leg2_end = trace.legs[1].1; // the wall-mirror hit
+        let beside_leg2 = Vec3::new(leg2_end.x + 0.05, 0.0, leg2_end.z * 0.5);
+        let d0 = ladder[0].image_center - beside_leg2;
+        assert!(
+            d0.dot(Vec3::new(0.0, 1.0, 0.0)) > 0.0,
+            "rung 0 must point out of the floor beside leg 2"
+        );
+        // Leg 3 runs from the front-wall mirror up to the ceiling: a
+        // ceiling point beside the beam sees the aperture through both
+        // mirrors.
+        let leg3_end = trace.legs[2].1; // the spot on the ceiling
+        let beside_leg3 = Vec3::new(leg3_end.x + 0.05, leg3_end.y, leg3_end.z - 0.05);
+        let d1 = ladder[1].image_center - beside_leg3;
+        assert!(
+            d1.dot(Vec3::new(0.0, -1.0, 0.0)) > 0.0,
+            "rung 1 must point out of the ceiling beside leg 3"
         );
     }
 }

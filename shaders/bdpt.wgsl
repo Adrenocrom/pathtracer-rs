@@ -120,12 +120,21 @@ struct GpuLight {
     _pad7: f32,
     emission: vec3<f32>,
     _pad8: f32,
-    // The specular bridge (a laser only): the aperture's mirror image —
-    // a disc of `bridge_radius` centered at `bridge_center`. The eye
-    // walk aims at it at diffuse vertices (see bdpt::Bridge).
-    // bridge_radius < 0 marks "no bridge".
-    bridge_center: vec3<f32>,
-    bridge_radius: f32,
+    // The specular bridge *ladder* (a laser only), packed one rung per
+    // vec4: xyz = the rung's image-center, w = its radius. Rung j is
+    // the aperture's mirror image unfolded across the first j mirrors
+    // of the beam's chain (see bdpt.rs::Bridge and
+    // SceneData::bridges_of_light); the eye walk aims at these at
+    // diffuse vertices, so the glow appears beside *every* leg of the
+    // beam, not just the last. n_bridges = 0 marks "no ladder".
+    bridge_rungs: array<vec4<f32>, 8>,
+    n_bridges: u32,
+    // Three scalar pads, not a vec3: WGSL aligns vec3 to 16 bytes, which
+    // would push the struct to 272 bytes while the Rust side's [f32; 3]
+    // stays at 256. Scalars are 4-byte aligned in both languages.
+    _pad9: f32,
+    _pad10: f32,
+    _pad11: f32,
 };
 
 struct Hit {
@@ -644,17 +653,19 @@ fn bsdf_sample(albedo: vec3<f32>, mat_type: u32, ior: f32, normal: vec3<f32>,
 
 // --- Specular bridges (the eye walk's diffuse sampling mixture) ---
 //
-// A specular bridge is the aperture's mirror image through the beam's
-// whole mirror chain — a disc. At a diffuse eye vertex the walk draws
-// a direction toward the image disc with probability BRIDGE_PROB, so
-// the path camera → wall → mirror₁ → … → mirrorₙ → aperture — which no
-// BDPT connection can sample (the mirrors are delta endpoints) and no
-// light subpath can reach (the aperture is a ~1 cm disc behind the
-// first mirror) — is carried by ordinary subpath walking. The beam's
-// spot on the wall then emerges from real light transport. The image
-// disc is derived on the CPU per frame from the current geometry
-// (`SceneData::bridges_by_light`), so a moving scene's bridges follow
-// the mirrors. See bdpt.rs::Bridge for the full story.
+// A specular bridge is the aperture's mirror image through a *prefix*
+// of the beam's mirror chain — a disc. Each laser carries a *ladder*:
+// one rung per mirror the beam crosses, in beam order. Rung j is the
+// aperture's image unfolded across the first j mirrors, so it is the
+// analytic description of the specular path "diffuse vertex → mirror₁
+// → … → mirrorⱼ → aperture" — exactly what a diffuse vertex beside
+// the beam's (j+1)-th leg sees. At a diffuse eye vertex the walk
+// draws a direction toward one of the qualifying rungs with
+// probability BRIDGE_PROB, so the glow appears beside *every* leg of
+// the beam, not just the last. The ladders are derived on the CPU per
+// frame from the current geometry (`SceneData::bridges_of_light`), so
+// a moving scene's rungs follow the mirrors. See bdpt.rs::Bridge for
+// the full story.
 
 const BRIDGE_PROB: f32 = 0.25;
 
@@ -694,18 +705,18 @@ fn bridge_sample_dir(center: vec3<f32>, radius: f32, p: vec3<f32>,
     return t * (sin_phi * cos(phi)) + b * (sin_phi * sin(phi)) + axis * cos_phi;
 }
 
-// The number of bridges that qualify at a diffuse vertex `p` with
+// The number of bridge rungs that qualify at a diffuse vertex `p` with
 // normal `normal`: the image disc's axis lies in the vertex's
-// hemisphere and the cone is non-degenerate. (The demo scene has at
-// most one laser, so this is 0 or 1; the loop keeps the general form
-// for parity with the CPU.)
+// hemisphere and the cone is non-degenerate. A laser with a ladder
+// contributes every rung that qualifies there.
 fn qualifying_bridge_count(p: vec3<f32>, normal: vec3<f32>) -> u32 {
     var count = 0u;
     for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
         let l = lights[li];
-        if (l.bridge_radius >= 0.0) {
-            let d = l.bridge_center - p;
-            if (dot(d, normal) > 0.0 && dot(d, d) > l.bridge_radius * l.bridge_radius) {
+        for (var bi = 0u; bi < l.n_bridges; bi = bi + 1u) {
+            let d = l.bridge_rungs[bi].xyz - p;
+            let r = l.bridge_rungs[bi].w;
+            if (dot(d, normal) > 0.0 && dot(d, d) > r * r) {
                 count = count + 1u;
             }
         }
@@ -725,10 +736,11 @@ fn mixture_pdf(p: vec3<f32>, normal: vec3<f32>, dir_in: vec3<f32>, dir_out: vec3
     var bridge_density = 0.0;
     for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
         let l = lights[li];
-        if (l.bridge_radius >= 0.0) {
-            let d = l.bridge_center - p;
-            if (dot(d, normal) > 0.0 && dot(d, d) > l.bridge_radius * l.bridge_radius) {
-                bridge_density += bridge_pdf(l.bridge_center, l.bridge_radius, p, dir_out);
+        for (var bi = 0u; bi < l.n_bridges; bi = bi + 1u) {
+            let d = l.bridge_rungs[bi].xyz - p;
+            let r = l.bridge_rungs[bi].w;
+            if (dot(d, normal) > 0.0 && dot(d, d) > r * r) {
+                bridge_density += bridge_pdf(l.bridge_rungs[bi].xyz, r, p, dir_out);
             }
         }
     }
@@ -747,31 +759,44 @@ fn sample_diffuse_mixture(albedo: vec3<f32>, p: vec3<f32>, normal: vec3<f32>,
     let n_qual = qualifying_bridge_count(p, normal);
     var dir_out = cosine_hemisphere(normal, state);
     if (n_qual > 0u && pcg(state) < BRIDGE_PROB) {
-        // Pick a qualifying bridge uniformly. (The demo scene has at
-        // most one; the loop keeps the general form for parity.)
+        // Pick a qualifying rung uniformly.
         let pick = u32(f32(n_qual) * pcg(state));
         var seen = 0u;
-        var chosen = -1i;
+        var chosen_light = -1i;
+        var chosen_bridge = -1i;
         for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
             let l = lights[li];
-            if (l.bridge_radius >= 0.0) {
-                let d = l.bridge_center - p;
-                if (dot(d, normal) > 0.0 && dot(d, d) > l.bridge_radius * l.bridge_radius) {
-                    if (seen == pick) { chosen = i32(li); }
+            for (var bi = 0u; bi < l.n_bridges; bi = bi + 1u) {
+                let d = l.bridge_rungs[bi].xyz - p;
+                let r = l.bridge_rungs[bi].w;
+                if (dot(d, normal) > 0.0 && dot(d, d) > r * r) {
+                    if (seen == pick) { chosen_light = i32(li); chosen_bridge = i32(bi); }
                     seen = seen + 1u;
                 }
             }
         }
-        if (chosen >= 0) {
-            let l = lights[u32(chosen)];
-            let d = bridge_sample_dir(l.bridge_center, l.bridge_radius, p, state);
-            // A degenerate cone (unreachable for a qualifying bridge)
+        if (chosen_light >= 0) {
+            let l = lights[u32(chosen_light)];
+            let rung = l.bridge_rungs[u32(chosen_bridge)];
+            let d = bridge_sample_dir(rung.xyz, rung.w, p, state);
+            // A degenerate cone (unreachable for a qualifying rung)
             // falls back to the cosine draw already made.
             if (dot(d, d) > 0.0) { dir_out = d; }
         }
     }
     let pdf = mixture_pdf(p, normal, dir_in, dir_out);
-    return BsdfSample(dir_out, pdf, albedo * dot(normal, dir_out) / (PI * pdf));
+    // A bridge direction can dip below the horizon: the image disc of
+    // a grazing rung lies nearly in the surface plane, so the cone can
+    // be wider than the axis elevation, and a uniform draw inside it
+    // can land below the horizon. The BSDF is zero there, so the
+    // sample carries no light — the weight must be 0, not
+    // albedo·cos/(π·0) = ±inf. (Unbiased: those directions contribute
+    // nothing to the integral; the draw is merely wasted.)
+    var weight = vec3<f32>(0.0);
+    if (pdf > 0.0) {
+        weight = albedo * dot(normal, dir_out) / (PI * pdf);
+    }
+    return BsdfSample(dir_out, pdf, weight);
 }
 
 // f (the raw BSDF, no cosine) and the solid-angle pdf of `dir_out`

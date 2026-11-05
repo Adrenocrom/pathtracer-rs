@@ -32,9 +32,10 @@ pub trait Renderer {
 
     /// Signal that the *scene* changed (e.g. an animated mirror moved):
     /// re-ingest the geometry and restart temporal accumulation. The
-    /// laser bridges are re-derived from the new geometry (they are
-    /// never stored), so the beam's sampling follows the movement. The
-    /// default is a no-op for backends that cannot re-ingest a scene.
+    /// laser bridge ladders are re-derived from the new geometry (they
+    /// are never stored), so the beam's sampling follows the movement.
+    /// The default is a no-op for backends that cannot re-ingest a
+    /// scene.
     fn update_scene(&mut self, _scene: &SceneData) {}
 
     /// Rebuild internal buffers at a new resolution. The default is a
@@ -50,7 +51,8 @@ pub trait Renderer {
 pub struct CpuRenderer {
     scene: Box<dyn crate::geometry::Intersectable>,
     lights: Vec<crate::geometry::AreaLight>,
-    /// The specular bridges (the eye walk's diffuse sampling mixture).
+    /// The specular bridges (the eye walk's diffuse sampling mixture):
+    /// each laser's whole ladder, one rung per mirror its beam crosses.
     bridges: Vec<crate::bdpt::Bridge>,
     width: usize,
     height: usize,
@@ -378,33 +380,35 @@ mod tests {
 
         let mut renderer = CpuRenderer::new(&build(0.998), 4, 4, 1);
         let before = renderer.bridges().to_vec();
-        assert_eq!(before.len(), 1, "the laser must carry a bridge");
+        assert_eq!(before.len(), 2, "the laser must carry one rung per mirror");
 
         // Move the wall mirror 0.5 toward the room center and update.
         let moved = build(0.5);
         renderer.update_scene(&moved);
         let after = renderer.bridges().to_vec();
-        assert_eq!(after.len(), 1, "the bridge must survive the move");
+        assert_eq!(after.len(), 2, "the ladder must survive the move");
         assert!(
-            (before[0].image_center - after[0].image_center).length() > 0.1,
-            "the bridge must follow the moved mirror: {:?} vs {:?}",
-            before[0].image_center,
-            after[0].image_center
+            (before[1].image_center - after[1].image_center).length() > 0.1,
+            "the whole-chain rung must follow the moved mirror: {:?} vs {:?}",
+            before[1].image_center,
+            after[1].image_center
         );
-        // The moved bridge must be the correct image for the moved
-        // geometry (the scene-level test pins the exact value; here it
-        // suffices that the renderer serves the *new* scene's bridge).
+        // The moved ladder must be the correct ladder for the moved
+        // geometry (the scene-level test pins the exact values; here it
+        // suffices that the renderer serves the *new* scene's ladder).
         let laser = moved
             .lights
             .iter()
             .find(|l| l.shape == 2)
             .expect("the laser");
         let expected = moved
-            .bridge_of_light(laser, 4)
-            .expect("the moved scene's bridge");
-        assert!(
-            (after[0].image_center - expected.image_center).length() < 1e-6,
-            "the renderer must serve the moved scene's bridge"
-        );
+            .bridges_of_light(laser, 4);
+        assert_eq!(expected.len(), 2, "the moved scene's ladder");
+        for (a, e) in after.iter().zip(&expected) {
+            assert!(
+                (a.image_center - e.image_center).length() < 1e-6,
+                "the renderer must serve the moved scene's ladder"
+            );
+        }
     }
 }

@@ -121,20 +121,43 @@ struct GpuLight {
     _pad7: f32,
     emission: [f32; 3],
     _pad8: f32,
-    /// The specular bridge (a laser only): the aperture's mirror image —
-    /// a disc of `bridge_radius` centered at `bridge_center`. The
-    /// estimator's eye walk aims at it at diffuse vertices (see
-    /// `bdpt::Bridge`). `bridge_radius` < 0 marks "no bridge".
-    bridge_center: [f32; 3],
-    bridge_radius: f32,
+    /// The specular bridge *ladder* (a laser only), packed one rung per
+    /// `vec4`: xyz = the rung's image-center, w = its radius. Rung j is
+    /// the aperture's mirror image unfolded across the first j mirrors
+    /// of the beam's chain (see `bdpt::Bridge` and
+    /// `SceneData::bridges_of_light`); the eye walk aims at these at
+    /// diffuse vertices, so the glow appears beside *every* leg of the
+    /// beam, not just the last. `n_bridges` = 0 marks "no ladder" (a
+    /// beam that never hits a mirror).
+    ///
+    /// Packed as vec4 (not center+radius arrays) so the WGSL
+    /// `array<vec4<f32>, 8>` and this Rust array agree on the 16-byte
+    /// element stride — `array<vec3<f32>, 8>` would be 16-byte-strided
+    /// in WGSL but 12-byte-strided here.
+    bridge_rungs: [[f32; 4]; MAX_BEAM_BOUNCES],
+    n_bridges: u32,
+    _pad9: [f32; 3],
 }
 
+/// The bridge-ladder capacity of a `GpuLight`: one rung per mirror the
+/// beam can cross (`scene::MAX_BEAM_BOUNCES`).
+const MAX_BEAM_BOUNCES: usize = crate::scene::MAX_BEAM_BOUNCES;
+
 impl GpuLight {
-    /// The bridge is passed explicitly (not read from `LightData`): it
+    /// The ladder is passed explicitly (not read from `LightData`): it
     /// is *derived* per frame from the current geometry
-    /// (`SceneData::bridges_by_light`), so a moving scene's bridges
-    /// follow the mirrors. `None` marks "no bridge" (radius < 0).
-    fn from_light_data(l: &LightData, bridge: Option<&crate::bdpt::Bridge>) -> Self {
+    /// (`SceneData::bridges_of_light`), so a moving scene's rungs
+    /// follow the mirrors. An empty ladder marks "no bridge".
+    fn from_light_data(l: &LightData, ladder: &[crate::bdpt::Bridge]) -> Self {
+        let mut bridge_rungs = [[0.0f32; 4]; MAX_BEAM_BOUNCES];
+        for (i, b) in ladder.iter().take(MAX_BEAM_BOUNCES).enumerate() {
+            bridge_rungs[i] = [
+                b.image_center.x,
+                b.image_center.y,
+                b.image_center.z,
+                b.radius,
+            ];
+        }
         Self {
             shape: l.shape,
             _pad0: 0.0,
@@ -154,11 +177,9 @@ impl GpuLight {
             _pad7: 0.0,
             emission: [l.emission.x, l.emission.y, l.emission.z],
             _pad8: 0.0,
-            bridge_center: match bridge {
-                Some(b) => [b.image_center.x, b.image_center.y, b.image_center.z],
-                None => [0.0, 0.0, 0.0],
-            },
-            bridge_radius: bridge.map_or(-1.0, |b| b.radius),
+            bridge_rungs,
+            n_bridges: ladder.len().min(MAX_BEAM_BOUNCES) as u32,
+            _pad9: [0.0; 3],
         }
     }
 }
@@ -184,7 +205,7 @@ const KIND_CYLINDER: u32 = 4;
 const _: () = {
     assert!(std::mem::size_of::<GpuPrim>() == 112);
     assert!(std::mem::size_of::<GpuBvhNode>() == 32);
-    assert!(std::mem::size_of::<GpuLight>() == 128);
+    assert!(std::mem::size_of::<GpuLight>() == 256);
     assert!(std::mem::size_of::<Uniforms>() == 96);
 };
 
@@ -719,21 +740,25 @@ impl GpuRenderer {
         }
         let n_prims = prims.len() as u32;
         let bvh_nodes = build_bvh(&mut prims).unwrap_or_default();
-        // The bridges are derived from the current geometry (the beam
-        // is traced through the fully-built scene), not baked at
+        // The bridge ladders are derived from the current geometry (the
+        // beam is traced through the fully-built scene), not baked at
         // add-time — a moving scene re-derives them per frame.
-        let bridges = scene.bridges_by_light();
+        let ladders: Vec<Vec<crate::bdpt::Bridge>> = scene
+            .lights
+            .iter()
+            .map(|l| {
+                if l.shape == 2 {
+                    scene.bridges_of_light(l, MAX_BEAM_BOUNCES)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
         let lights: Vec<GpuLight> = scene
             .lights
             .iter()
             .enumerate()
-            .map(|(i, l)| {
-                let bridge = bridges
-                    .iter()
-                    .find(|(bi, _)| *bi == i)
-                    .and_then(|(_, b)| b.as_ref());
-                GpuLight::from_light_data(l, bridge)
-            })
+            .map(|(i, l)| GpuLight::from_light_data(l, &ladders[i]))
             .collect();
         let firefly_clamp = crate::bdpt::firefly_clamp_bound(scene.max_light_luminance());
 

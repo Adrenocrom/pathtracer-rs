@@ -31,18 +31,18 @@ const MAX_DEPTH_PREVIEW: usize = 8;
 
 /// Build the scene with multiple objects for interesting lighting.
 ///
-/// `wall_mirror_tilt` is the wall mirror's tilt in radians (0 = flat
-/// against the front wall) — the one knob the movement demo animates
-/// (`M` in the window frontend): tilting the mirror sweeps the beam's
-/// second bounce, and with it the spot on the ceiling and the derived
-/// specular bridge. The scene is rebuilt from scratch per frame, which
-/// is exactly the contract the bridge derivation supports (it is
-/// never stored).
+/// `laser_aim_y` is the red laser's aim height on the front-wall mirror
+/// (1.0 = the mirror's center) — the one knob the movement demo
+/// animates (`M` in the window frontend): the laser pivots on its
+/// table mount, scanning the beam up and down the mirror, and the
+/// spot slides up and down the partition wall. The scene is rebuilt
+/// from scratch per frame, which is exactly the contract the bridge
+/// ladder derivation supports (it is never stored).
 fn build_scene() -> SceneData {
-    build_scene_with(0.0)
+    build_scene_with(1.0)
 }
 
-fn build_scene_with(wall_mirror_tilt: f32) -> SceneData {
+fn build_scene_with(laser_aim_y: f32) -> SceneData {
     let emission = Vec3::new(1000.0, 1000.0, 1000.0);
     let room_size = 2.5;
     let room_height = 2.0;
@@ -135,7 +135,7 @@ fn build_scene_with(wall_mirror_tilt: f32) -> SceneData {
     //// The laser is added *before* the mirrors on purpose: the specular
     //// bridge (the aperture's mirror image through the beam's whole
     //// mirror chain) is derived on demand from the fully-built scene
-    //// (`SceneData::bridges_by_light`), never baked at add-time, so the
+    //// (`SceneData::bridges_of_light`), never baked at add-time, so the
     //// registration order is irrelevant — and a scene that moves
     //// between frames simply re-derives the bridge from the new
     //// geometry.
@@ -197,15 +197,43 @@ fn build_scene_with(wall_mirror_tilt: f32) -> SceneData {
     //);
 
     scene.add_box( Vec3::new(room_size/2.0, 1.0, 1.0), Vec3::new(room_size, room_height, 0.02), white);
+
+    // The laser showcase: a red laser on the table, aimed backward at a
+    // mirror tile on the back wall, which bounces the beam forward across
+    // the room onto the partition wall's camera-facing side. One
+    // bounce, one spot — plus the glow beside the beam (the bridge
+    // ladder carries it on *every* leg now).
+    //
+    // The laser is added *before* the mirror on purpose: the specular
+    // bridge ladder (one rung per mirror the beam crosses — see
+    // `SceneData::bridges_of_light`) is derived on demand from the
+    // fully-built scene, never baked at add-time, so the registration
+    // order is irrelevant — and a scene that moves between frames
+    // simply re-derives every rung from the new geometry.
+    //
+    // `laser_aim_y` is the movement knob (the window frontend's `M`
+    // key): the laser pivots on its table mount, scanning the beam up
+    // and down the back-wall mirror; the spot slides up and down the
+    // partition, and the derived ladder follows.
+    let laser_pos = Vec3::new(-1.3, 0.62, 1.8);
+    let back_mirror_center = Vec3::new(0.0, 1.0, -(room_size - 0.01));
+    let aim_point = Vec3::new(0.0, laser_aim_y, -(room_size - 0.01));
+    let aim = (aim_point - laser_pos).normalize();
+    scene.add_laser(
+        laser_pos,
+        aim,
+        0.2,                        // housing height
+        0.01,                       // aperture radius
+        0.01,                       // beam half-angle (radians, ~0.57°)
+        Vec3::new(4.0e8, 800.0, 800.0), // red laser
+    );
     scene.add_quad(
-        Vec3::new(0.0, 1.0, room_size - 0.01),
-        Vec3::new(0.0, 0.0, -1.0),
+        back_mirror_center,
+        Vec3::new(0.0, 0.0, 1.0),
         1.5,
         0.5,
-        //white
         MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
     );
-
 
     scene.add_box( Vec3::new(-1.4, 0.65, 1.5), Vec3::new(0.1, 0.1, 0.1), MaterialData::glass(1.5));
     scene.add_box( Vec3::new(-1.9, 0.65, 1.7), Vec3::new(0.001, 0.1, 0.2), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
@@ -219,31 +247,20 @@ fn build_scene_with(wall_mirror_tilt: f32) -> SceneData {
     scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
     scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
 
-    //scene.add_laser(
-    //    Vec3::new(-1.0, 1.0, 1.8), // housing center, base sunk into the ceiling
-    //    Vec3::new(1.0, 0.0, 1.0),                // beam straight down
-    //    0.2,                                      // housing height
-    //    0.01,                                    // aperture radius
-    //    0.01,                                    // beam half-angle (radians, ~1.1°)
-    //    Vec3::new(800.0, 800.0, 40.0e8),        // green laser
-    //);
-
+    // A second laser (green) on the table, aimed across the room at the
+    // thin mirror boxes — its beam ping-pongs between them, and the
+    // wide cone (0.05 rad) paints the table under *every* leg: the glow
+    // under the middle legs (after one box, before the next) is exactly
+    // what the bridge ladder's rungs carry — before the ladder, only
+    // the first leg (direct light) and the last leg (the whole-chain
+    // rung) glowed.
     scene.add_laser(
-        Vec3::new(-1.3, 0.62, 1.8), // housing center, base sunk into the ceiling
-        Vec3::new(-0.1, 0.0, -1.0),                // beam straight down
-        0.2,                                      // housing height
-        0.01,                                    // aperture radius
-        0.01,                                    // beam half-angle (radians, ~1.1°)
-        Vec3::new(4.0e8, 800.0, 800.0),        // green laser
-    );
-    // objects
-    scene.add_laser(
-        Vec3::new(-1.6, 0.62, 1.9), // housing center, base sunk into the ceiling
-        Vec3::new(-1.0, 0.0, -0.5),                // beam straight down
-        0.2,                                      // housing height
-        0.01,                                    // aperture radius
-        0.01,                                    // beam half-angle (radians, ~1.1°)
-        Vec3::new(800.0, 4.0e8, 800.0),        // green laser
+        Vec3::new(-1.6, 0.62, 1.9),
+        Vec3::new(-1.0, 0.0, -0.5),
+        0.2,
+        0.01,
+        0.05,
+        Vec3::new(800.0, 4.0e8, 800.0),
     );
 
     scene
@@ -584,10 +601,10 @@ mod tests {
     #[test]
     fn scene_builds_and_is_sampleable() {
         let scene = build_scene();
-        // The demo scene has two emitters: the ceiling panel and the
-        // laser aperture. (No decal: the beam's spot is transported
-        // light, not a fake emitter.)
-        assert_eq!(scene.lights.len(), 2);
+        // The demo scene has three emitters: the ceiling panel and the
+        // two laser apertures. (No decal: the beams' spots are
+        // transported light, not fake emitters.)
+        assert_eq!(scene.lights.len(), 3);
         for light in &scene.lights {
             assert!(light.area() > 0.0);
             assert!(light.emission.x > 0.0 || light.emission.y > 0.0 || light.emission.z > 0.0);
@@ -599,61 +616,75 @@ mod tests {
             direction: Vec3::new(0.0, 0.0, 1.0),
         };
         assert!(cpu_scene.intersect(&ray).is_some());
-        assert_eq!(lights.len(), 2);
+        assert_eq!(lights.len(), 3);
     }
 
-    /// The laser light source: a diffuse cylinder housing plus a thin
-    /// cylinder puck of laser material whose top cap is the aperture.
-    /// The scene must register both as real geometry on both backends,
-    /// the housing must carry a normal (non-emissive) material, and the
-    /// aperture disc must be the puck's top cap.
+    /// The laser light sources: each is a diffuse cylinder housing plus
+    /// a thin cylinder puck of laser material whose top cap is the
+    /// aperture. The scene must register both as real geometry on both
+    /// backends, the housing must carry a normal (non-emissive)
+    /// material, and the aperture disc must be the puck's top cap.
     #[test]
     fn laser_is_a_cylinder_with_an_emitting_top_cap() {
         let scene = build_scene();
-        // Exactly two cylinders: the diffuse housing and the laser puck.
-        assert_eq!(scene.cylinders.len(), 2);
-        let housing = scene
+        // Two lasers: two housings and two pucks.
+        assert_eq!(scene.cylinders.len(), 4);
+        let housings: Vec<_> = scene
             .cylinders
             .iter()
-            .find(|c| !c.mat.is_laser())
-            .expect("the housing must carry a normal material");
-        let puck = scene
-            .cylinders
-            .iter()
-            .find(|c| c.mat.is_laser())
-            .expect("the puck must carry the laser material");
-        assert!(puck.mat.is_emissive());
-        assert!(!housing.mat.is_emissive());
-        // The light's aperture is the puck's top cap center.
-        let laser_light = scene
-            .lights
-            .iter()
-            .find(|l| l.shape == 2)
-            .expect("the laser must be registered as a light");
-        let top = puck.base + puck.axis * (2.0 * puck.half_h);
-        assert!((laser_light.center - top).length() < 1e-5);
-        assert!((laser_light.normal - puck.axis).length() < 1e-5);
-        assert!((laser_light.radius - puck.radius).abs() < 1e-5);
-        // The housing is fatter than the puck and reaches further along
-        // the axis, so the puck's rim never peeks out from behind it.
-        assert!(housing.radius > puck.radius);
-        assert!(
-            housing.base.dot(housing.axis) < puck.base.dot(puck.axis),
-            "the housing must start behind the puck"
-        );
-        // The CPU scene must contain the puck as intersectable geometry:
-        // a ray along the axis from beyond the top cap hits it.
+            .filter(|c| !c.mat.is_laser())
+            .collect();
+        let pucks: Vec<_> = scene.cylinders.iter().filter(|c| c.mat.is_laser()).collect();
+        assert_eq!(housings.len(), 2);
+        assert_eq!(pucks.len(), 2);
+        for puck in &pucks {
+            assert!(puck.mat.is_emissive());
+        }
+        for housing in &housings {
+            assert!(!housing.mat.is_emissive());
+        }
+        // Each laser light's aperture is its puck's top cap center.
+        for laser_light in scene.lights.iter().filter(|l| l.shape == 2) {
+            let puck = pucks
+                .iter()
+                .find(|c| (c.base + c.axis * (2.0 * c.half_h) - laser_light.center).length()
+                    < 1e-5)
+                .expect("each laser light must have its puck");
+            assert!((laser_light.normal - puck.axis).length() < 1e-5);
+            assert!((laser_light.radius - puck.radius).abs() < 1e-5);
+            // The housing is fatter than the puck and reaches further
+            // along the axis, so the puck's rim never peeks out from
+            // behind it.
+            let housing = housings
+                .iter()
+                .find(|h| (h.axis - puck.axis).length() < 1e-5
+                    && (h.base - puck.base).length() < 0.25)
+                .expect("each puck must have its housing");
+            assert!(housing.radius > puck.radius);
+            assert!(
+                housing.base.dot(housing.axis) < puck.base.dot(puck.axis),
+                "the housing must start behind the puck"
+            );
+        }
+        // The CPU scene must contain each puck as intersectable geometry:
+        // a ray along the axis from just beyond the top cap hits it.
+        // (Just beyond — a long probe can cross other scene geometry
+        // before reaching the puck, e.g. a mirror box in front of the
+        // aperture.)
         let (cpu_scene, _) = scene.build_cpu_scene();
-        let along_axis = crate::geometry::Ray {
-            origin: top + puck.axis * 0.5,
-            direction: puck.axis * -1.0,
-        };
-        let hit = cpu_scene
-            .intersect(&along_axis)
-            .expect("the laser housing must be intersectable");
-        assert!(hit.mat.is_emissive());
-        // ...and the hit is the aperture (the puck's top cap), in the beam.
-        assert!((hit.p - top).length() < 1e-4);
+        for puck in &pucks {
+            let top = puck.base + puck.axis * (2.0 * puck.half_h);
+            let along_axis = crate::geometry::Ray {
+                origin: top + puck.axis * 0.02,
+                direction: puck.axis * -1.0,
+            };
+            let hit = cpu_scene
+                .intersect(&along_axis)
+                .expect("the laser housing must be intersectable");
+            assert!(hit.mat.is_emissive());
+            // ...and the hit is the aperture (the puck's top cap), in the beam.
+            assert!((hit.p - top).length() < 1e-4);
+        }
     }
 
     /// The room must be closed: the six walls actually cover the full
@@ -727,10 +758,10 @@ mod tests {
     }
 
     /// The laser showcase, pinned by the beam tracer itself: the beam
-    /// must leave the aperture, bounce off *both* mirrors, and land on
-    /// a diffuse surface — with the landing point, the mirror hits, and
-    /// the housing all in frame from the default camera, and the
-    /// landing point visible (not occluded). This is the regression
+    /// must leave the aperture, bounce off the front-wall mirror, and
+    /// land on a diffuse surface — with the landing point, the mirror
+    /// hit, and the housing all in frame from the default camera, and
+    /// the landing point visible (not occluded). This is the regression
     /// guard for the whole showcase: a moved mirror, a re-aimed laser,
     /// or a camera change that pushes the spot out of frame fails here.
     #[test]
@@ -742,90 +773,66 @@ mod tests {
             .find(|l| l.shape == 2)
             .expect("demo scene must contain a laser");
         let trace = scene.trace_laser_beam(laser, 4);
-        // Three legs: aperture -> floor mirror -> wall mirror -> spot.
+        // Two legs: aperture -> back-wall mirror -> spot.
         assert_eq!(
             trace.legs.len(),
-            3,
-            "the beam must bounce twice (aperture -> floor mirror -> wall mirror -> spot), got {:?}",
+            2,
+            "the beam must bounce once (aperture -> back-wall mirror -> spot), got {:?}",
             trace.legs
         );
         let spot = trace
             .spot
             .expect("the beam must land on a diffuse surface");
-        // The beam lands on the bare ceiling (no decal: the spot is
-        // transported light, not a fake emitter).
         assert_eq!(spot.mat.bsdf, Bsdf::Diffuse, "the spot must be diffuse");
-        assert!(!spot.mat.is_emissive(), "the ceiling must not be emissive");
-        // The spot is at the ceiling (y = 2.0, normal -y).
-        assert!(
-            (spot.p.y - 2.0).abs() < 2e-3,
-            "the beam must land at the ceiling, got {:?}",
-            spot.p
-        );
-        assert!((spot.normal + Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4);
+        assert!(!spot.mat.is_emissive(), "the spot surface must not be emissive");
 
-        // Both mirror hits lie on their mirror quads.
-        let mirrors: Vec<_> = scene
+        // The mirror hit lies on the back-wall mirror quad.
+        let mirror = scene
             .quads
             .iter()
-            .filter(|q| q.mat.bsdf == Bsdf::Mirror)
-            .collect();
-        assert_eq!(mirrors.len(), 2, "the demo scene must have two mirrors");
-        for (mirror, hit) in mirrors.iter().zip(&trace.legs) {
-            let local = hit.1 - mirror.center;
-            assert!(
-                local.dot(mirror.tangent).abs() <= mirror.half_w + 1e-3
-                    && local.dot(mirror.bitangent).abs() <= mirror.half_h + 1e-3,
-                "the mirror hit {:?} is outside the mirror quad",
-                hit.1
-            );
-        }
+            .find(|q| q.mat.bsdf == Bsdf::Mirror)
+            .expect("the back-wall mirror");
+        let mirror_hit = trace.legs[0].1;
+        let local = mirror_hit - mirror.center;
+        assert!(
+            local.dot(mirror.tangent).abs() <= mirror.half_w + 1e-3
+                && local.dot(mirror.bitangent).abs() <= mirror.half_h + 1e-3,
+            "the mirror hit {:?} is outside the mirror quad",
+            mirror_hit
+        );
 
-        // The specular bridge: the aperture's mirror image through the
-        // beam's whole mirror chain, derived on demand from the
-        // fully-built scene (never baked at add-time — the laser is
-        // registered before the mirrors). This is the sampling
-        // technique that carries the beam's path camera → ceiling →
-        // wall mirror → floor mirror → aperture — the whole fix for the
-        // estimator's blind spot.
-        let bridge = scene
-            .bridge_of_light(laser, 4)
-            .expect("the laser must carry a specular bridge");
-        // The image is the aperture reflected across both mirror planes
-        // in beam order: unfold across the floor mirror, then across
-        // the wall mirror.
+        // The specular bridge ladder: one rung per mirror (here one),
+        // derived on demand from the fully-built scene (never baked at
+        // add-time — the laser is registered before the mirror). The
+        // rung is the aperture's mirror image through the mirror plane,
+        // and it must be usable from the spot: the image disc's axis
+        // lies in the spot's hemisphere and the cone is non-degenerate.
+        let ladder = scene.bridges_of_light(laser, 4);
+        assert_eq!(ladder.len(), 1, "one mirror, one rung");
         let aperture = laser.center;
-        let floor_hit = trace.legs[0].1;
-        let wall_hit = trace.legs[1].1;
         let unfold = |p: Vec3, hit: Vec3, normal: Vec3| {
             let d = p - hit;
             p - normal * (2.0 * d.dot(normal))
         };
-        let image1 = unfold(aperture, floor_hit, mirrors[0].normal);
-        let expected_image = unfold(image1, wall_hit, mirrors[1].normal);
+        let expected_image = unfold(aperture, mirror_hit, mirror.normal);
         assert!(
-            (bridge.image_center - expected_image).length() < 1e-3,
-            "the bridge image {:?} must be the aperture's double reflection {:?}",
-            bridge.image_center,
+            (ladder[0].image_center - expected_image).length() < 1e-3,
+            "the rung image {:?} must be the aperture's reflection {:?}",
+            ladder[0].image_center,
             expected_image
         );
-        // The image disc's radius is the aperture radius.
-        assert!((bridge.radius - laser.radius).abs() < 1e-6);
-
-        // The bridge must be *usable* from the spot: the image disc's
-        // axis lies in the ceiling's hemisphere (the spot can aim at
-        // it) and the cone is non-degenerate.
-        let d = bridge.image_center - spot.p;
+        assert!((ladder[0].radius - laser.radius).abs() < 1e-6);
+        let d = ladder[0].image_center - spot.p;
         assert!(
             d.dot(spot.normal) > 0.0,
-            "the bridge must point out of the ceiling"
+            "the rung must point out of the spot's surface"
         );
         assert!(
-            d.length_squared() > bridge.radius * bridge.radius,
-            "the bridge cone must be non-degenerate"
+            d.length_squared() > ladder[0].radius * ladder[0].radius,
+            "the rung cone must be non-degenerate"
         );
 
-        // The housing, the mirror hits, and the spot must be in frame from
+        // The housing, the mirror hit, and the spot must be in frame from
         // the default camera.
         let cam = default_cam();
         let forward = (cam.lookat - cam.origin).normalize();
@@ -851,8 +858,9 @@ mod tests {
             .expect("the laser housing");
         let mid = housing.base + housing.axis * housing.half_h;
         in_frame("laser housing", mid);
-        in_frame("floor mirror hit", floor_hit);
-        in_frame("wall mirror hit", wall_hit);
+        // (The back-wall mirror hit is behind the camera by design: the
+        // showcase shows the housing, the beam's glow, and the spot on
+        // the partition — not the mirror itself.)
         in_frame("laser spot", spot.p);
 
         // The spot must be visible from the camera: the camera -> spot
@@ -875,12 +883,13 @@ mod tests {
     }
 
     /// The movement demo's contract, pinned across the whole sweep: for
-    /// every wall-mirror tilt in the animated range, the beam must
-    /// still bounce off both mirrors, land on the ceiling, stay in
-    /// frame, and carry a *correctly re-derived* bridge (the image
-    /// distance equals the beam path length — the unfolding invariant).
+    /// every laser aim height in the animated range, the beam must
+    /// still bounce off the front-wall mirror, land on a diffuse
+    /// surface in frame, and carry a *correctly re-derived* ladder
+    /// (the image distance equals the beam path length — the unfolding
+    /// invariant).
     #[test]
-    fn wall_mirror_tilt_sweep_keeps_the_beam_valid() {
+    fn laser_aim_sweep_keeps_the_beam_valid() {
         let cam = default_cam();
         let forward = (cam.lookat - cam.origin).normalize();
         let world_up = Vec3::new(0.0, 1.0, 0.0);
@@ -898,14 +907,14 @@ mod tests {
             cos_h >= half_fov && cos_v >= half_fov
         };
 
-        let sweep = 20.0f32.to_radians();
+        // The demo's sweep: aim heights 1.0 ± 0.2 around the mirror's
+        // center (the window frontend's MIRROR_SWEEP), inside the
+        // mirror's y-extent [0.75, 1.25] so the beam always bounces.
+        const SWEEP: f32 = 0.2;
         let steps = 9;
         for i in 0..steps {
-            // The demo's sweep is 0..+sweep (never negative: a negative
-            // tilt sends the beam down to the back wall, behind the
-            // camera).
-            let tilt = sweep * (i as f32 / (steps - 1) as f32);
-            let scene = build_scene_with(tilt);
+            let aim_y = 1.0 + SWEEP * (2.0 * (i as f32 / (steps - 1) as f32) - 1.0);
+            let scene = build_scene_with(aim_y);
             let laser = scene
                 .lights
                 .iter()
@@ -914,33 +923,28 @@ mod tests {
             let trace = scene.trace_laser_beam(laser, 4);
             assert_eq!(
                 trace.legs.len(),
-                3,
-                "tilt {tilt}: the beam must bounce twice, got {:?}",
+                2,
+                "aim {aim_y}: the beam must bounce once, got {:?}",
                 trace.legs
             );
             let spot = trace
                 .spot
-                .expect("tilt {tilt}: the beam must land on a diffuse surface");
-            assert!(
-                (spot.p.y - 2.0).abs() < 2e-3,
-                "tilt {tilt}: the beam must land on the ceiling, got {:?}",
-                spot.p
-            );
+                .expect("aim {aim_y}: the beam must land on a diffuse surface");
             assert!(
                 in_frame(spot.p),
-                "tilt {tilt}: the spot {:?} must stay in frame",
+                "aim {aim_y}: the spot {:?} must stay in frame",
                 spot.p
             );
-            // The re-derived bridge must be correct for this tilt: the
-            // unfolding preserves path length.
-            let bridge = scene
-                .bridge_of_light(laser, 4)
-                .expect("tilt {tilt}: the bridge must exist");
+            // The re-derived ladder must be correct for this aim: the
+            // unfolding preserves path length, so the spot's distance
+            // to the rung's image equals the total beam path length.
+            let ladder = scene.bridges_of_light(laser, 4);
+            assert_eq!(ladder.len(), 1, "aim {aim_y}: one mirror, one rung");
             let path_len: f32 = trace.legs.iter().map(|(a, b)| (*b - *a).length()).sum();
-            let d = (bridge.image_center - spot.p).length();
+            let d = (ladder[0].image_center - spot.p).length();
             assert!(
                 (d - path_len).abs() < 0.01,
-                "tilt {tilt}: the image distance {d} must equal the beam path length {path_len}"
+                "aim {aim_y}: the image distance {d} must equal the beam path length {path_len}"
             );
         }
     }
@@ -985,10 +989,11 @@ mod tests {
         )
         .ok();
         // The analytic expectation at the spot center:
-        // albedo/π · Le·R² · cos·Ω_image, Ω_image = π r²/d² (face-on).
-        // Two mirror bounces, so the mirror albedo enters squared; the
-        // arrival cosine comes from the trace itself (the last leg's
-        // direction against the spot's oriented normal).
+        // albedo/π · Le·R^n · cos·Ω_image, Ω_image = π r²/d² (face-on),
+        // with n = the number of mirror bounces (the mirror albedo
+        // enters once per bounce); the arrival cosine comes from the
+        // trace itself (the last leg's direction against the spot's
+        // oriented normal).
         let bridge = scene
             .bridge_of_light(laser, 4)
             .expect("the laser must carry a specular bridge");
@@ -999,17 +1004,198 @@ mod tests {
             .iter()
             .find(|q| q.mat.bsdf == Bsdf::Mirror)
             .expect("mirror");
+        let n_bounces = trace.legs.len() - 1;
         let arrival = (spot - trace.legs[trace.legs.len() - 2].1).normalize();
         let cos = -trace.spot.expect("spot").normal.dot(arrival);
         let expected = 0.8 / std::f32::consts::PI
             * laser.emission.y
-            * mirror.mat.albedo.y
-            * mirror.mat.albedo.y
+            * mirror.mat.albedo.y.powi(n_bounces as i32)
             * cos
             * omega;
         std::fs::write(
             "target/spot_analytic.txt",
-            format!("analytic spot radiance: {expected:.1} (d {d:.3}, Ω {omega:.3e}, cos {cos:.3})\n"),
+            format!("analytic spot radiance: {expected:.1} (d {d:.3}, Ω {omega:.3e}, cos {cos:.3}, bounces {n_bounces})\n"),
+        )
+        .ok();
+    }
+
+    /// The middle-leg glow — the whole point of the bridge ladder. A
+    /// diffuse point under the beam's *middle* leg (after one mirror,
+    /// before the next) receives light that crossed exactly one mirror:
+    /// unreachable by any BDPT connection (the mirror is a delta
+    /// endpoint) and by any light subpath (the light walk's reflection
+    /// off the first mirror continues along the beam, and the floor
+    /// spot it eventually lands on cannot connect back to a floor point
+    /// — the floor-to-floor geometry term is exactly 0), so without the
+    /// ladder's rung 0 the point renders black. With the ladder, the
+    /// eye walk aims at rung 0's image disc and the glow appears.
+    ///
+    /// The probe uses a controlled synthetic scene (not the demo) so
+    /// the signal is clean: the beam hugs a white floor (the cone
+    /// footprint paints it), the walls and ceiling are black (no
+    /// ambient bounce to pollute the comparison), and the probe sits
+    /// under the middle leg inside the footprint. The whole-chain rung
+    /// cannot carry this light: its path from the probe arrives at the
+    /// aperture far off the beam axis, outside the emission cone.
+    #[test]
+    fn middle_leg_glow_is_carried_by_the_ladder() {
+        // A closed 2 x 2 x 2 room: a white floor, black walls (the
+        // only light is the laser, and the only diffuse light at the
+        // probe must be the glow itself).
+        let mut scene = SceneData::new();
+        let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
+        let black = MaterialData::diffuse(Vec3::new(0.02, 0.02, 0.02));
+        scene.add_wall(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 2.0, 2.0, black);
+        scene.add_wall(Vec3::new(0.0, 1.0, -1.0), Vec3::new(0.0, 0.0, 1.0), 2.0, 2.0, black);
+        scene.add_wall(Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, -1.0), 2.0, 2.0, black);
+        scene.add_wall(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0), 2.0, 2.0, black);
+        scene.add_wall(Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), 2.0, 2.0, black);
+        // The laser: 70 cm up, aimed straight down at the first
+        // mirror. The cone (0.03 rad) paints the floor the beam hugs
+        // (the mirrors sit 1 cm above it, so the beam's legs run 1 cm
+        // above the floor and the footprint starts ~0.33 m past each
+        // mirror).
+        scene.add_laser(
+            Vec3::new(0.0, 0.7, -0.5),
+            Vec3::new(0.0, -1.0, 0.0),
+            0.2,
+            0.02,
+            0.03,
+            Vec3::new(1.0, 50.0, 1.0),
+        );
+        // Mirror 1: 45°, 1 cm above the floor — reflects the downward
+        // beam horizontal (+z).
+        scene.add_quad(
+            Vec3::new(0.0, 0.01, -0.5),
+            Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2),
+            0.4,
+            0.4,
+            MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+        );
+        // Mirror 2: 45° the other way — reflects the horizontal beam
+        // straight down, to the spot on the floor 1 cm below.
+        scene.add_quad(
+            Vec3::new(0.0, 0.01, 0.5),
+            Vec3::new(0.0, -std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2),
+            0.4,
+            0.4,
+            MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+        );
+
+        let laser = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("the laser");
+        let trace = scene.trace_laser_beam(laser, 4);
+        assert_eq!(
+            trace.legs.len(),
+            3,
+            "two bounces: laser -> floor mirror -> wall mirror -> floor spot, got {:?}",
+            trace.legs
+        );
+        // The ladder: one rung per mirror crossed.
+        let ladder = scene.bridges_of_light(laser, 4);
+        assert_eq!(ladder.len(), 2, "one rung per mirror");
+        // Rung 0 is the aperture's single reflection across the first
+        // mirror's plane (the unfolding invariant).
+        let aperture = laser.center;
+        let first_hit = trace.legs[0].1;
+        let first_n = Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2);
+        let d = aperture - first_hit;
+        let expected_image = aperture - first_n * (2.0 * d.dot(first_n));
+        assert!(
+            (ladder[0].image_center - expected_image).length() < 1e-3,
+            "rung 0 {:?} must be the aperture's single reflection {:?}",
+            ladder[0].image_center,
+            expected_image
+        );
+
+        // The probe: the floor point under the middle leg, 0.8 m past
+        // the first mirror — inside the cone footprint (which starts
+        // 0.33 m past it), so the glow is physically present. The
+        // whole-chain rung's path from here arrives at the aperture
+        // ~36° off the beam axis — far outside the 1.7° emission cone
+        // — so only rung 0 can carry this light.
+        let probe = Vec3::new(0.0, 0.0, 0.3);
+        let to_image = ladder[0].image_center - probe;
+        assert!(
+            to_image.dot(Vec3::new(0.0, 1.0, 0.0)) > 0.0,
+            "rung 0 must point up out of the floor under the middle leg"
+        );
+        assert!(
+            to_image.length_squared() > ladder[0].radius * ladder[0].radius,
+            "rung 0's cone must be non-degenerate at the probe"
+        );
+
+        // The camera: inside the room, looking at the probe; the ray
+        // must hit the probe first (the mirrors are off to the sides).
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        let cam = Cam::new(Vec3::new(0.9, 0.3, 0.3), probe, 60.0);
+        let seg = probe - cam.origin;
+        let first = cpu_scene
+            .intersect(&crate::geometry::Ray {
+                origin: cam.origin,
+                direction: seg * (1.0 / seg.length()),
+            })
+            .expect("the camera must see the floor");
+        assert!(
+            (first.p - probe).length() < 1e-4,
+            "the camera ray must hit the probe first, got {:?}",
+            first.p
+        );
+
+        // The estimator at the probe, with and without the ladder: the
+        // difference is exactly the ladder's contribution. Without any
+        // bridge the glow is structurally unreachable — the mirror is a
+        // delta endpoint (no connection through it), the light walk
+        // reflects along the beam (never toward the probe), and the
+        // floor spot it lands on cannot connect to another floor point
+        // (the floor-to-floor geometry term is 0) — so only the black
+        // walls' faint bounce remains.
+        let ladder = scene.bridges();
+        let no_bridges: Vec<crate::bdpt::Bridge> = Vec::new();
+        let mut rng = rand::thread_rng();
+        let n = 2000;
+        let mut mean_at = |bridges: &[crate::bdpt::Bridge]| -> f64 {
+            let dir = (probe - cam.origin).normalize();
+            let ray = crate::geometry::Ray {
+                origin: cam.origin,
+                direction: dir,
+            };
+            let mut sum = 0.0f64;
+            for _ in 0..n {
+                let c = crate::bdpt::bdpt_trace(&ray, &*cpu_scene, 8, &lights, bridges, &mut rng);
+                assert!(c.y.is_finite(), "non-finite sample {c:?}");
+                sum += c.y as f64;
+            }
+            sum / n as f64
+        };
+        let with_ladder = mean_at(&ladder);
+        let without = mean_at(&no_bridges);
+
+        // The ladder must light the probe up clearly above the
+        // bridge-less value — the middle-leg glow. Analytically the
+        // glow is (albedo/π)·Le·cos_grazing·Ω_image ≈ 5e-5 (the image
+        // disc of the 2 cm aperture at 1.5 m, arriving 0.4° above the
+        // horizon), vs the black-wall bounce ≈ 1e-6: a ~30x ratio. 3x
+        // is a conservative floor; the absolute floor guards against
+        // both values collapsing to ~0.
+        assert!(
+            with_ladder > without * 3.0,
+            "the middle-leg glow {with_ladder} must exceed the bridge-less value {without} by 3x"
+        );
+        assert!(
+            with_ladder > 1e-6,
+            "the middle-leg glow {with_ladder} must be absolutely nonzero"
+        );
+        std::fs::write(
+            "target/middle_leg_probe.txt",
+            format!(
+                "middle-leg glow with ladder {with_ladder:.3e} vs without {without:.3e} (ratio {})\n",
+                with_ladder / without.max(1e-9)
+            ),
         )
         .ok();
     }
@@ -1050,12 +1236,13 @@ mod tests {
         let buffer = render_fhd_with_spp(&scene, &cam, false, shared_device, spp);
 
         // --- Laser spot probe: the traced landing point must render
-        // clearly brighter in the laser's color channel (green) than the
-        // wall around it — the visual acceptance of the laser showcase.
+        // clearly brighter in the laser's color channel than the wall
+        // around it — the visual acceptance of the laser showcase.
         // The spot is the traced beam's landing point (never a formula:
-        // the trace is the ground truth); the reference is a wall disc
-        // 0.4 to the +x, outside the decal (half-width ~0.03) and away
-        // from every object.
+        // the trace is the ground truth); the reference is a disc 0.4
+        // to the +x, outside the spot's footprint and away from every
+        // object. The channel is the laser's dominant color: the first
+        // laser is red, so the probe reads the red channel.
         let laser = scene
             .lights
             .iter()
@@ -1082,9 +1269,8 @@ mod tests {
                     if x < 0 || y < 0 || x >= buffer.width as i64 || y >= buffer.height as i64 {
                         continue;
                     }
-                    // The green channel: the laser's color. A green
-                    // laser is invisible in a red-channel probe.
-                    sum += buffer.get_pixel(x as usize, y as usize).y;
+                    // The red channel: the first laser's color.
+                    sum += buffer.get_pixel(x as usize, y as usize).x;
                     n += 1;
                 }
             }
@@ -1098,7 +1284,7 @@ mod tests {
         let mut cross = String::new();
         for dx in -60i64..=60 {
             let x = (sx as i64 + dx).clamp(0, buffer.width as i64 - 1) as usize;
-            cross.push_str(&format!("{:.0} ", buffer.get_pixel(x, sy).y));
+            cross.push_str(&format!("{:.0} ", buffer.get_pixel(x, sy).x));
         }
         std::fs::write(
             "target/laser_probe.txt",

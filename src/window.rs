@@ -31,12 +31,16 @@ const STRAFE_SPEED: f32 = 1.0;
 const ROT_SPEED: f32 = 1.0;
 /// Camera pitch speed in radians per second (arrow up/down).
 const PITCH_SPEED: f32 = 1.0;
-/// The wall mirror's sweep speed in radians per second (M): the
-/// movement demo — the beam's second bounce, the ceiling spot and the
-/// derived specular bridge all follow the tilting mirror live.
+/// The laser aim sweep speed in aim-height units per second (M): the
+/// movement demo — the laser pivots on its table mount, scanning the
+/// beam up and down the front-wall mirror, and the spot, the glow and
+/// the derived bridge ladder all follow live.
 const MIRROR_SPEED: f32 = 0.5;
-/// The wall mirror's tilt amplitude in radians (M).
-const MIRROR_SWEEP: f32 = 20.0f32.to_radians();
+/// The laser aim sweep amplitude, in aim-height units around the
+/// mirror's center (M). Bounded by the mirror's half-height (0.25): a
+/// wider sweep aims the beam below or above the mirror tile, and it
+/// lands on the diffuse back wall instead.
+const MIRROR_SWEEP: f32 = 0.2;
 
 /// The keys the window frontend reacts to. The discriminants are used as
 /// indices into the `Keys` state array, so they must stay contiguous.
@@ -384,12 +388,14 @@ struct App {
     fps: f32,
     /// True while the help overlay is on screen (any key dismisses it).
     showing_help: bool,
-    /// True while the movement demo runs (M): the wall mirror tilts back
-    /// and forth, and the scene is rebuilt + re-uploaded per frame so
-    /// the beam's spot and its derived bridge follow it live.
+    /// True while the movement demo runs (M): the laser pivots on its
+    /// table mount back and forth, and the scene is rebuilt + re-uploaded
+    /// per frame so the beam's spot, the glow beside every leg, and the
+    /// derived bridge ladder follow it live.
     animating: bool,
-    /// The wall mirror's tilt — the movement demo's knob.
-    wall_mirror_tilt: f32,
+    /// The laser's aim height on the front-wall mirror — the movement
+    /// demo's knob.
+    laser_aim_y: f32,
     /// The demo's running clock (seconds since M was pressed), advanced
     /// by the frame delta so the sweep is frame-rate independent.
     anim_time: f32,
@@ -433,7 +439,7 @@ impl App {
             fps: 0.0,
             showing_help: false,
             animating: false,
-            wall_mirror_tilt: 0.0,
+            laser_aim_y: 1.0,
             anim_time: 0.0,
             screenshot: None,
         }
@@ -507,7 +513,7 @@ impl App {
                     "Q/E     STRAFE LEFT/RIGHT",
                     "UP/DOWN PITCH",
                     "F       TOGGLE DENOISER",
-                    "M       TOGGLE MIRROR ANIMATION",
+                    "M       TOGGLE LASER SWEEP ANIMATION",
                     "P       EXPORT FHD PNG",
                     "H       TOGGLE THIS HELP",
                     "ESC     QUIT",
@@ -603,18 +609,19 @@ impl App {
             self.frames_accumulated = 0;
         }
 
-        // The movement demo (M): tilt the wall mirror and rebuild the
-        // scene per frame. The renderer re-ingests the geometry and
-        // re-derives the laser's specular bridge from the new mirror
-        // orientation, so the beam's spot follows the mirror live — the
-        // whole point of deriving the bridge instead of baking it.
-        // The sweep is 0..+MIRROR_SWEEP (never negative): a negative
-        // tilt sends the beam down to the back wall, behind the camera.
+        // The movement demo (M): pivot the laser on its table mount and
+        // rebuild the scene per frame. The renderer re-ingests the
+        // geometry and re-derives the laser's bridge ladder from the
+        // new aim, so the beam's spot, the glow beside every leg, and
+        // the ladder all follow the movement live — the whole point of
+        // deriving the ladder instead of baking it. The sweep is
+        // ±MIRROR_SWEEP around the mirror's center (1.0): the spot
+        // slides up and down the partition wall.
         if self.animating {
             self.anim_time += dt;
             let phase = 0.5 - 0.5 * (self.anim_time * MIRROR_SPEED * std::f32::consts::PI).cos();
-            self.wall_mirror_tilt = MIRROR_SWEEP * phase;
-            self.scene = crate::build_scene_with(self.wall_mirror_tilt);
+            self.laser_aim_y = 1.0 + MIRROR_SWEEP * (2.0 * phase - 1.0);
+            self.scene = crate::build_scene_with(self.laser_aim_y);
             renderer.update_scene(&self.scene);
             self.frames_accumulated = 0;
         }
