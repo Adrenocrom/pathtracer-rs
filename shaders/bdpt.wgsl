@@ -644,14 +644,17 @@ fn bsdf_sample(albedo: vec3<f32>, mat_type: u32, ior: f32, normal: vec3<f32>,
 
 // --- Specular bridges (the eye walk's diffuse sampling mixture) ---
 //
-// A specular bridge is the aperture's mirror image — a disc. At a
-// diffuse eye vertex the walk draws a direction toward the image disc
-// with probability BRIDGE_PROB, so the path camera → wall → mirror →
-// aperture — which no BDPT connection can sample (the mirror is a
-// delta endpoint) and no light subpath can reach (the aperture is a
-// ~1 cm disc behind the mirror) — is carried by ordinary subpath
-// walking. The beam's spot on the wall then emerges from real light
-// transport. See bdpt.rs::Bridge for the full story.
+// A specular bridge is the aperture's mirror image through the beam's
+// whole mirror chain — a disc. At a diffuse eye vertex the walk draws
+// a direction toward the image disc with probability BRIDGE_PROB, so
+// the path camera → wall → mirror₁ → … → mirrorₙ → aperture — which no
+// BDPT connection can sample (the mirrors are delta endpoints) and no
+// light subpath can reach (the aperture is a ~1 cm disc behind the
+// first mirror) — is carried by ordinary subpath walking. The beam's
+// spot on the wall then emerges from real light transport. The image
+// disc is derived on the CPU per frame from the current geometry
+// (`SceneData::bridges_by_light`), so a moving scene's bridges follow
+// the mirrors. See bdpt.rs::Bridge for the full story.
 
 const BRIDGE_PROB: f32 = 0.25;
 

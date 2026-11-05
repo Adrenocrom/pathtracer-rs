@@ -130,7 +130,11 @@ struct GpuLight {
 }
 
 impl GpuLight {
-    fn from_light_data(l: &LightData) -> Self {
+    /// The bridge is passed explicitly (not read from `LightData`): it
+    /// is *derived* per frame from the current geometry
+    /// (`SceneData::bridges_by_light`), so a moving scene's bridges
+    /// follow the mirrors. `None` marks "no bridge" (radius < 0).
+    fn from_light_data(l: &LightData, bridge: Option<&crate::bdpt::Bridge>) -> Self {
         Self {
             shape: l.shape,
             _pad0: 0.0,
@@ -150,11 +154,11 @@ impl GpuLight {
             _pad7: 0.0,
             emission: [l.emission.x, l.emission.y, l.emission.z],
             _pad8: 0.0,
-            bridge_center: match l.bridge {
+            bridge_center: match bridge {
                 Some(b) => [b.image_center.x, b.image_center.y, b.image_center.z],
                 None => [0.0, 0.0, 0.0],
             },
-            bridge_radius: l.bridge.map_or(-1.0, |b| b.radius),
+            bridge_radius: bridge.map_or(-1.0, |b| b.radius),
         }
     }
 }
@@ -386,10 +390,13 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
-    /// Bind group layout + uploaded scene buffers, kept together so the
-    /// bind group can be rebuilt when the accumulation buffer is
-    /// recreated on resize.
+    /// Bind group layout + the per-frame uniform buffer.
     res: StaticResources,
+    /// The scene geometry buffers, rebuilt by `upload_scene` whenever the
+    /// scene changes (a moving scene re-uploads them per frame).
+    prim_buf: wgpu::Buffer,
+    bvh_buf: wgpu::Buffer,
+    light_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     accum_buf: wgpu::Buffer,
     readback_buf: wgpu::Buffer,
@@ -408,20 +415,26 @@ pub struct GpuRenderer {
     adapter_info: String,
 }
 
-/// GPU resources that outlive a resize: the bind group layout, the
-/// per-frame uniform buffer and the scene geometry uploaded once.
+/// GPU resources that outlive a scene update: the bind group layout and
+/// the per-frame uniform buffer. The scene geometry buffers
+/// (prims/BVH/lights) are rebuilt by `upload_scene` whenever the scene
+/// changes — a moving scene re-uploads them per frame.
 struct StaticResources {
     bgl: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
-    prim_buf: wgpu::Buffer,
-    bvh_buf: wgpu::Buffer,
-    light_buf: wgpu::Buffer,
 }
 
 impl StaticResources {
     /// Bind group layout order: uniform + 3 read-only storage + 1
     /// read-write storage (the accumulation buffer).
-    fn bind_group(&self, device: &wgpu::Device, accum_buf: &wgpu::Buffer) -> wgpu::BindGroup {
+    fn bind_group(
+        &self,
+        device: &wgpu::Device,
+        prim_buf: &wgpu::Buffer,
+        bvh_buf: &wgpu::Buffer,
+        light_buf: &wgpu::Buffer,
+        accum_buf: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("bdpt-bind-group"),
             layout: &self.bgl,
@@ -432,15 +445,15 @@ impl StaticResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.prim_buf.as_entire_binding(),
+                    resource: prim_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.bvh_buf.as_entire_binding(),
+                    resource: bvh_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.light_buf.as_entire_binding(),
+                    resource: light_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -485,7 +498,121 @@ impl GpuRenderer {
     ) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/bdpt.wgsl"));
 
-        // --- Scene buffers (flat POD arrays, uploaded once) ---
+        // --- Scene buffers (flat POD arrays) ---
+        let (prim_buf, bvh_buf, light_buf, n_prims, n_lights, firefly_clamp) =
+            Self::build_scene_buffers(&device, &queue, scene);
+
+        let n_pixels = (width * height) as u64;
+        let accum_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("accum"),
+            size: n_pixels * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: n_pixels * 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // --- Bind group: uniform + 3 read-only storage + 1 read-write storage ---
+        let uniform_entry = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let storage_rw = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bdpt-bgl"),
+            entries: &[
+                uniform_entry,
+                storage_ro(1),
+                storage_ro(2),
+                storage_ro(3),
+                storage_rw(4),
+            ],
+        });
+
+        let res = StaticResources { bgl, uniform_buf };
+        let bind_group = res.bind_group(&device, &prim_buf, &bvh_buf, &light_buf, &accum_buf);
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bdpt-pipeline-layout"),
+            bind_group_layouts: &[Some(&res.bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("bdpt-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        Self {
+            device,
+            queue,
+            pipeline,
+            res,
+            prim_buf,
+            bvh_buf,
+            light_buf,
+            bind_group,
+            accum_buf,
+            readback_buf,
+            width,
+            height,
+            n_lights,
+            n_prims,
+            firefly_clamp,
+            samples: 0,
+            reset: true,
+            adapter_info,
+        }
+    }
+
+    /// Build the scene's GPU buffers: the kind-tagged prim array, the
+    /// flat BVH over it, and the light array (with each laser's derived
+    /// specular bridge). Returns the buffers plus the counts the
+    /// uniforms carry. Called once at construction and again by
+    /// `update_scene` whenever the scene changes.
+    fn build_scene_buffers(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &SceneData,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, u32, u32, f32) {
         // All four prim families share one kind-tagged array so a BVH
         // leaf can reference a contiguous range with no per-prim
         // indirection.
@@ -592,135 +719,78 @@ impl GpuRenderer {
         }
         let n_prims = prims.len() as u32;
         let bvh_nodes = build_bvh(&mut prims).unwrap_or_default();
-        let lights: Vec<GpuLight> = scene.lights.iter().map(GpuLight::from_light_data).collect();
+        // The bridges are derived from the current geometry (the beam
+        // is traced through the fully-built scene), not baked at
+        // add-time — a moving scene re-derives them per frame.
+        let bridges = scene.bridges_by_light();
+        let lights: Vec<GpuLight> = scene
+            .lights
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let bridge = bridges
+                    .iter()
+                    .find(|(bi, _)| *bi == i)
+                    .and_then(|(_, b)| b.as_ref());
+                GpuLight::from_light_data(l, bridge)
+            })
+            .collect();
         let firefly_clamp = crate::bdpt::firefly_clamp_bound(scene.max_light_luminance());
 
         // Storage buffers must be non-empty for WGSL arrayLength to be valid;
         // pad empty families to one zeroed element of the right stride.
         let prim_buf = upload_storage(
-            &device,
-            &queue,
+            device,
+            queue,
             bytemuck::cast_slice(&prims),
             std::mem::size_of::<GpuPrim>() as u64,
             "prims",
         );
         let bvh_buf = upload_storage(
-            &device,
-            &queue,
+            device,
+            queue,
             bytemuck::cast_slice(&bvh_nodes),
             std::mem::size_of::<GpuBvhNode>() as u64,
             "bvh_nodes",
         );
         let light_buf = upload_storage(
-            &device,
-            &queue,
+            device,
+            queue,
             bytemuck::cast_slice(&lights),
             std::mem::size_of::<GpuLight>() as u64,
             "lights",
         );
-
-        let n_pixels = (width * height) as u64;
-        let accum_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("accum"),
-            size: n_pixels * 16,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: n_pixels * 16,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniforms"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // --- Bind group: uniform + 3 read-only storage + 1 read-write storage ---
-        let uniform_entry = wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let storage_rw = |binding: u32| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bdpt-bgl"),
-            entries: &[
-                uniform_entry,
-                storage_ro(1),
-                storage_ro(2),
-                storage_ro(3),
-                storage_rw(4),
-            ],
-        });
-
-        let res = StaticResources {
-            bgl,
-            uniform_buf,
+        (
             prim_buf,
             bvh_buf,
             light_buf,
-        };
-        let bind_group = res.bind_group(&device, &accum_buf);
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("bdpt-pipeline-layout"),
-            bind_group_layouts: &[Some(&res.bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("bdpt-pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        Self {
-            device,
-            queue,
-            pipeline,
-            res,
-            bind_group,
-            accum_buf,
-            readback_buf,
-            width,
-            height,
-            n_lights: scene.lights.len() as u32,
             n_prims,
+            scene.lights.len() as u32,
             firefly_clamp,
-            samples: 0,
-            reset: true,
-            adapter_info,
-        }
+        )
+    }
+
+    /// Re-upload the scene geometry (prims, BVH, lights — including the
+    /// re-derived laser bridges) and reset the accumulation. Called by
+    /// the frontends whenever the scene changes (e.g. an animated
+    /// mirror), so the derived bridges follow the moving geometry.
+    pub fn update_scene(&mut self, scene: &SceneData) {
+        let (prim_buf, bvh_buf, light_buf, n_prims, n_lights, firefly_clamp) =
+            Self::build_scene_buffers(&self.device, &self.queue, scene);
+        self.prim_buf = prim_buf;
+        self.bvh_buf = bvh_buf;
+        self.light_buf = light_buf;
+        self.n_prims = n_prims;
+        self.n_lights = n_lights;
+        self.firefly_clamp = firefly_clamp;
+        self.bind_group = self.res.bind_group(
+            &self.device,
+            &self.prim_buf,
+            &self.bvh_buf,
+            &self.light_buf,
+            &self.accum_buf,
+        );
+        self.reset_accumulation();
     }
 
     /// Human-readable description of the GPU in use.
@@ -785,7 +855,13 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        self.bind_group = self.res.bind_group(&self.device, &self.accum_buf);
+        self.bind_group = self.res.bind_group(
+            &self.device,
+            &self.prim_buf,
+            &self.bvh_buf,
+            &self.light_buf,
+            &self.accum_buf,
+        );
         self.width = width;
         self.height = height;
         self.reset_accumulation();
@@ -961,6 +1037,12 @@ impl crate::renderer::Renderer for GpuRenderer {
 
     fn reset_accumulation(&mut self) {
         self.reset_accumulation();
+    }
+
+    /// The scene changed: re-upload the geometry (prims, BVH, lights —
+    /// with the re-derived laser bridges) and restart the accumulation.
+    fn update_scene(&mut self, scene: &SceneData) {
+        self.update_scene(scene);
     }
 
     /// Rebuild the accumulation/readback buffers at a new resolution,

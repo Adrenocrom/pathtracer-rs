@@ -30,6 +30,13 @@ pub trait Renderer {
     /// Signal that the camera moved: restart temporal accumulation.
     fn reset_accumulation(&mut self);
 
+    /// Signal that the *scene* changed (e.g. an animated mirror moved):
+    /// re-ingest the geometry and restart temporal accumulation. The
+    /// laser bridges are re-derived from the new geometry (they are
+    /// never stored), so the beam's sampling follows the movement. The
+    /// default is a no-op for backends that cannot re-ingest a scene.
+    fn update_scene(&mut self, _scene: &SceneData) {}
+
     /// Rebuild internal buffers at a new resolution. The default is a
     /// no-op: backends that allocate per-pixel state (the GPU accumulation
     /// buffer) override it, the CPU renderer rebuilds itself instead.
@@ -202,6 +209,17 @@ impl Renderer for CpuRenderer {
         self.samples_accumulated = 0;
     }
 
+    /// The scene changed: rebuild the BVH scene, the lights and the
+    /// (derived) laser bridges from the new geometry, and restart the
+    /// accumulation.
+    fn update_scene(&mut self, scene_data: &SceneData) {
+        let (scene, lights) = scene_data.build_cpu_scene();
+        self.scene = scene;
+        self.lights = lights;
+        self.bridges = scene_data.bridges();
+        self.reset_accumulation();
+    }
+
     /// The CPU renderer has no per-pixel GPU state; resizing just changes
     /// the target resolution and drops the stale accumulation.
     fn resize(&mut self, width: u32, height: u32) {
@@ -212,6 +230,16 @@ impl Renderer for CpuRenderer {
 
     fn name(&self) -> String {
         format!("CPU (rayon, {} spp/frame)", self.samples)
+    }
+}
+
+impl CpuRenderer {
+    /// The scene's laser bridges, re-derived from the current geometry
+    /// by `update_scene`. Exposed for tests that pin the movement
+    /// pipeline (a moved mirror must move the bridge).
+    #[cfg(test)]
+    pub fn bridges(&self) -> &[crate::bdpt::Bridge] {
+        &self.bridges
     }
 }
 
@@ -302,5 +330,81 @@ mod tests {
         assert_eq!(buffer.get_pixel(3, 2), Vec3::new(0.0, 0.0, 0.0));
         // Displaying the buffer must not panic either.
         assert!(!buffer.to_string().is_empty());
+    }
+
+    /// The movement pipeline: a scene mutation followed by
+    /// `update_scene` must move the derived laser bridge with the
+    /// geometry. The renderer's bridges are re-derived from the new
+    /// scene, never stored — this pins that contract end to end.
+    #[test]
+    fn update_scene_moves_the_derived_bridge() {
+        use crate::scene::{MaterialData, SceneData};
+
+        // A small closed room with a laser aimed at a 45° floor mirror
+        // and a 45° wall mirror (the same chain as the scene tests).
+        let build = |wall_z: f32| -> SceneData {
+            let mut scene = SceneData::new();
+            let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
+            scene.add_wall(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(0.0, 1.0, -1.0), Vec3::new(0.0, 0.0, 1.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, -1.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), 2.0, 2.0, white);
+            scene.add_laser(
+                Vec3::new(0.4, 1.9, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                0.2,
+                0.01,
+                0.01,
+                Vec3::new(1.0, 1.0, 1.0),
+            );
+            scene.add_quad(
+                Vec3::new(0.4, 0.002, 0.0),
+                Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2),
+                0.6,
+                0.6,
+                MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+            );
+            scene.add_quad(
+                Vec3::new(0.4, 0.0027, wall_z),
+                Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2),
+                0.6,
+                0.6,
+                MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+            );
+            scene
+        };
+
+        let mut renderer = CpuRenderer::new(&build(0.998), 4, 4, 1);
+        let before = renderer.bridges().to_vec();
+        assert_eq!(before.len(), 1, "the laser must carry a bridge");
+
+        // Move the wall mirror 0.5 toward the room center and update.
+        let moved = build(0.5);
+        renderer.update_scene(&moved);
+        let after = renderer.bridges().to_vec();
+        assert_eq!(after.len(), 1, "the bridge must survive the move");
+        assert!(
+            (before[0].image_center - after[0].image_center).length() > 0.1,
+            "the bridge must follow the moved mirror: {:?} vs {:?}",
+            before[0].image_center,
+            after[0].image_center
+        );
+        // The moved bridge must be the correct image for the moved
+        // geometry (the scene-level test pins the exact value; here it
+        // suffices that the renderer serves the *new* scene's bridge).
+        let laser = moved
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("the laser");
+        let expected = moved
+            .bridge_of_light(laser, 4)
+            .expect("the moved scene's bridge");
+        assert!(
+            (after[0].image_center - expected.image_center).length() < 1e-6,
+            "the renderer must serve the moved scene's bridge"
+        );
     }
 }

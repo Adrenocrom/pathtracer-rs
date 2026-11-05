@@ -2,9 +2,9 @@
 
 A high-performance, interactive path tracer rendered directly in the terminal using Rust. This project demonstrates the intersection of physically based rendering (PBR) and low-resolution terminal output.
 
-![Example render of the demo scene: a Cornell-box style room with red and green side walls, a ceiling light panel, and a green laser aimed at a tilted floor mirror that bounces the beam onto a bright spot on the front wall.](example.png)
+![Example render of the demo scene: a Cornell-box style room with red and green side walls, a ceiling light panel, and a green laser aimed at a tilted floor mirror that bounces the beam onto a wall mirror, which bounces it onto a bright spot on the ceiling.](example.png)
 
-*The demo scene rendered with bidirectional path tracing — a green laser beam traced analytically through a mirror bounce onto the front wall (a deterministic delta-cone path no Monte-Carlo estimator can sample), indirect color bleeding from the red and green walls, and global illumination.*
+*The demo scene rendered with bidirectional path tracing — a green laser beam traced analytically through a two-mirror chain onto the ceiling (a deterministic delta-cone path no Monte-Carlo estimator can sample), indirect color bleeding from the red and green walls, and global illumination.*
 
 ## 🚀 Features
 
@@ -33,6 +33,7 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 | `Q` / `E` | Strafe Left / Right |
 | `↑` / `↓` | Pitch Up / Down |
 | `F` | Toggle Denoiser |
+| `M` | Toggle Mirror Animation (the wall mirror tilts; the laser spot and its derived specular bridge follow live) |
 | `P` | Render High-Quality FHD Screenshot (`screenshot.png`) |
 | `H` | Toggle Help Overlay |
 | `Esc` | Quit |
@@ -56,7 +57,7 @@ A high-performance, interactive path tracer rendered directly in the terminal us
 - **Windowing:** `winit` 0.30 (`ApplicationHandler`) with a wgpu 30 surface; the display pass reads the accumulation buffer directly (no readback).
 - **Image Processing:** `image` crate for PNG export.
 - **Light Transport:** Bidirectional path tracing with BSDF-aware sampling (Lambertian diffuse, perfect mirror, and dielectric glass with exact Fresnel and Snell refraction), area-light sampling, and MIS power-heuristic weights computed by Veach's incremental-ratio walk over the actual per-edge pdfs. Delta (specular) BSDFs contribute a symbolic pdf that cancels between strategies, and connections through them are excluded from the MIS normalization — specular transport is handled purely by subpath sampling, which is what lets BDPT find caustics that unidirectional path tracing cannot.
-- **Scene:** A Cornell-box style room — red and green side walls, a ceiling light panel, and a green laser hanging from the ceiling aimed at a mirror tile lying on the floor and tilted 30°, which bounces the beam up onto a bright spot on the front wall. The beam's landing point is traced analytically through the real scene at build time (`SceneData::trace_laser_beam` follows the aperture's axis ray across every specular surface until it reaches a diffuse wall), and the landing patch is registered as a small quad emitter carrying exactly the radiance the wall would reflect — the analytic transport of a deterministic delta cone, a path no Monte-Carlo strategy can sample. There is deliberately no beam visible in mid-air: in clean air a laser beam is invisible from the side; only the spot on the wall is real.
+- **Scene:** A Cornell-box style room — red and green side walls, a ceiling light panel, and a green laser hanging from the ceiling aimed at a mirror tile lying on the floor and tilted 30°, which bounces the beam onto a flat mirror on the front wall, which bounces it up onto a bright spot on the ceiling. The beam's whole path is traced analytically through the real scene at build time (`SceneData::trace_laser_beam` follows the aperture's axis ray across every specular surface until it reaches a diffuse wall), and the aperture's mirror image through the entire mirror chain — the classic unfolding construction — is registered as a "specular bridge": a sampling technique the BDPT eye walk uses at diffuse vertices, carrying the deterministic delta-cone path no Monte-Carlo strategy can sample. The bridge is derived on demand from the fully-built scene (never baked at add-time), so the laser may be registered before or after the mirrors, and a scene that moves between frames simply re-derives it. There is deliberately no beam visible in mid-air: in clean air a laser beam is invisible from the side; only the spot on the wall is real.
 - **Complexity:** Implements a full orthonormal camera basis and a bidirectional path-tracing loop with vertex connection.
 
 ## 📦 Getting Started

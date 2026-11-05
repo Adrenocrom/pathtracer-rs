@@ -28,6 +28,12 @@ const LASER_HOUSING_MARGIN: f32 = 0.1;
 /// cylinder.
 const LASER_PUCK_FRACTION: f32 = 0.1;
 
+/// The maximum number of specular surfaces a laser beam is traced
+/// across when deriving its specular bridge (see
+/// `SceneData::bridge_of_light`). A beam caught in a mirror loop must
+/// not spin forever; 8 matches the path tracer's vertex budget.
+pub const MAX_BEAM_BOUNCES: usize = 8;
+
 /// A surface material in flat, GPU-friendly form. `emission != 0` marks a
 /// pure emitter: the BSDF is ignored and the surface does not scatter.
 #[derive(Clone, Copy, Debug)]
@@ -127,12 +133,6 @@ pub struct LightData {
     pub half_w: f32,
     pub half_h: f32,
     pub emission: Vec3,
-    /// The specular bridge (a laser only): the aperture's mirror image —
-    /// the analytic one-bounce specular path from a diffuse vertex to
-    /// this aperture. `None` when the beam never hits a mirror (the
-    /// bridge is then meaningless) or for non-laser lights. See
-    /// `bdpt::Bridge`.
-    pub bridge: Option<crate::bdpt::Bridge>,
 }
 
 impl LightData {
@@ -147,7 +147,6 @@ impl LightData {
             half_w: 0.0,
             half_h: 0.0,
             emission,
-            bridge: None,
         }
     }
 
@@ -170,7 +169,6 @@ impl LightData {
             half_w,
             half_h,
             emission,
-            bridge: None,
         }
     }
 
@@ -198,7 +196,6 @@ impl LightData {
             half_w: theta,   // the cone half-angle rides in the unused slot
             half_h: height, // the housing height rides in the unused slot
             emission,
-            bridge: None,
         }
     }
 
@@ -537,6 +534,13 @@ impl SceneData {
     /// housing's top cap. The laser material is a pure emitter (albedo
     /// 0, emission gated to the beam cone), so only the puck's top cap
     /// radiates — the rest of it is hidden inside the housing.
+    ///
+    /// The specular bridge (the aperture's mirror image through the
+    /// beam's whole mirror chain — see `bridges_by_light`) is *derived*
+    /// on demand, never baked here: the beam is traced through the
+    /// fully-built scene, so the laser may be added before, after or
+    /// interleaved with the mirrors, and a scene that moves between
+    /// frames simply re-derives the bridge from the new geometry.
     pub fn add_laser(
         &mut self,
         center: Vec3,
@@ -548,47 +552,130 @@ impl SceneData {
     ) {
         let axis = axis.normalize();
         let aperture = center + axis * (height * 0.5);
-        let mut light = LightData::from_laser(aperture, axis, radius, theta, height, emission);
-        // Build the specular bridge: trace the beam's axis ray; if the
-        // first delta surface it hits is a mirror, the aperture's mirror
-        // image is the analytic description of the one-bounce specular
-        // path from any diffuse vertex to this aperture. The trace runs
-        // against the scene *without* this light's geometry (the light
-        // is not yet registered), so the beam's first hit is the mirror
-        // itself, not the housing.
-        let (cpu_scene, _) = self.build_cpu_scene();
-        let mut origin = aperture + axis * EPS_NEAR;
-        let mut dir = axis;
-        for _ in 0..4 {
-            let ray = Ray { origin, direction: dir };
-            let Some(hit) = cpu_scene.intersect(&ray) else { break };
-            if hit.mat.bsdf == Bsdf::Mirror {
-                // Orient the normal toward the side the beam arrives from.
-                let front_face = hit.normal.dot(dir) < 0.0;
-                let normal = if front_face { hit.normal } else { hit.normal * -1.0 };
-                // The aperture's mirror image: reflect the aperture
-                // center across the mirror plane (the plane is the
-                // perpendicular bisector of aperture ↔ image, so a ray
-                // aimed at the image reflects onto the aperture).
-                let d = aperture - hit.p;
-                let image = aperture - normal * (2.0 * d.dot(normal));
-                light.bridge = Some(crate::bdpt::Bridge {
-                    image_center: image,
-                    radius,
-                });
-                break;
-            }
-            // Not a mirror: continue the specular chain (glass) or stop
-            // (a diffuse surface ends the beam; no bridge exists).
-            if !hit.mat.bsdf.is_delta() {
-                break;
-            }
-            let front_face = hit.normal.dot(dir) < 0.0;
-            let normal = if front_face { hit.normal } else { hit.normal * -1.0 };
-            dir = reflect_dir(dir, normal);
-            origin = hit.p + normal * EPS_NEAR;
-        }
+        let light = LightData::from_laser(aperture, axis, radius, theta, height, emission);
         self.add_light(light);
+    }
+
+    /// The specular bridge of one laser light: the aperture's mirror
+    /// image through the beam's *entire* mirror chain.
+    ///
+    /// The beam's axis ray is traced through the fully-built scene —
+    /// mirrors reflect it, glass refracts it — until it reaches a
+    /// non-delta surface (a diffuse wall) or escapes, exactly like
+    /// `trace_laser_beam`. The aperture disc is then reflected across
+    /// each mirror plane in beam order: the classic *unfolding*
+    /// construction. A ray from a diffuse vertex aimed at the final
+    /// image disc crosses every mirror plane in the chain and reflects
+    /// onto the aperture — the analytic description of the multi-bounce
+    /// specular path from that vertex to the aperture, which no BDPT
+    /// connection can sample (the mirrors are delta endpoints) and no
+    /// light subpath can reach (the aperture is a ~1 cm disc behind the
+    /// first mirror).
+    ///
+    /// Glass ends the chain: a refracted ray's bend depends on where it
+    /// crosses the interface, so no single image disc describes the far
+    /// side of a glass surface. (A mirror behind glass is then not
+    /// bridged — the beam's spot there is carried by the ordinary
+    /// specular-chain sampling, which is unbiased, just slow to
+    /// converge.)
+    ///
+    /// `None` when the beam never hits a mirror (the bridge is then
+    /// meaningless — the aperture is directly visible and ordinary
+    /// sampling finds it), when the chain is longer than
+    /// `max_bounces`, or when the beam escapes first.
+    ///
+    /// Derived on demand, never stored: the scene may move between
+    /// frames, and the bridge must follow the geometry.
+    pub fn bridge_of_light(
+        &self,
+        laser: &LightData,
+        max_bounces: usize,
+    ) -> Option<crate::bdpt::Bridge> {
+        debug_assert!(laser.shape == 2, "not a laser light");
+        let (cpu_scene, _) = self.build_cpu_scene();
+        self.bridge_of_light_in(laser, &*cpu_scene, max_bounces)
+    }
+
+    /// The specular bridges of all laser lights in the scene: the
+    /// analytic multi-bounce specular paths from a diffuse vertex to
+    /// each laser aperture (the aperture's mirror image through the
+    /// beam's mirror chain). Consumed by the BDPT eye walk's diffuse
+    /// sampling mixture — see `bdpt::Bridge`.
+    pub fn bridges(&self) -> Vec<crate::bdpt::Bridge> {
+        self.bridges_by_light()
+            .into_iter()
+            .filter_map(|(_, b)| b)
+            .collect()
+    }
+
+    /// Like `bridges()`, but keyed by light: `(light index, bridge)` for
+    /// every laser light, `None` when that laser's beam never hits a
+    /// mirror. The GPU backend needs the per-light pairing (its shader
+    /// reads the bridge from the light record).
+    pub fn bridges_by_light(&self) -> Vec<(usize, Option<crate::bdpt::Bridge>)> {
+        let (cpu_scene, _) = self.build_cpu_scene();
+        self.lights
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.shape == 2)
+            .map(|(i, l)| (i, self.bridge_of_light_in(l, &*cpu_scene, MAX_BEAM_BOUNCES)))
+            .collect()
+    }
+
+    /// `bridge_of_light` against an already-built BVH (the per-light
+    /// variant rebuilds it; this one shares it across all lasers).
+    fn bridge_of_light_in(
+        &self,
+        laser: &LightData,
+        cpu_scene: &dyn Intersectable,
+        max_bounces: usize,
+    ) -> Option<crate::bdpt::Bridge> {
+        debug_assert!(laser.shape == 2, "not a laser light");
+        let mut origin = laser.center + laser.normal * EPS_NEAR;
+        let mut dir = laser.normal;
+        // The aperture's image, unfolded across the mirrors hit so far.
+        let mut image = laser.center;
+        let mut hit_mirror = false;
+        for _ in 0..max_bounces {
+            let ray = Ray {
+                origin,
+                direction: dir,
+            };
+            let Some(hit) = cpu_scene.intersect(&ray) else {
+                break; // escaped: no (further) mirror
+            };
+            // Orient the normal toward the side the beam arrives from.
+            let front_face = hit.normal.dot(dir) < 0.0;
+            let normal = if front_face {
+                hit.normal
+            } else {
+                hit.normal * -1.0
+            };
+            match hit.mat.bsdf {
+                Bsdf::Mirror => {
+                    // Unfold: reflect the current image across this
+                    // mirror plane. The plane is the perpendicular
+                    // bisector of image ↔ reflected image, so a ray
+                    // aimed at the reflected image bounces onto the
+                    // pre-image — and chaining the reflections lands on
+                    // the aperture itself.
+                    let d = image - hit.p;
+                    image = image - normal * (2.0 * d.dot(normal));
+                    hit_mirror = true;
+                    dir = reflect_dir(dir, normal);
+                    origin = hit.p + normal * EPS_NEAR;
+                }
+                Bsdf::Glass { .. } => break, // see the doc comment
+                _ => break, // diffuse (or the beam's own housing): the chain ends
+            }
+        }
+        if !hit_mirror {
+            return None;
+        }
+        Some(crate::bdpt::Bridge {
+            image_center: image,
+            radius: laser.radius,
+        })
     }
 
     /// The highest luminance any physically valid sample can carry:
@@ -771,17 +858,6 @@ impl SceneData {
         let scene = crate::bvh::BVHNode::build(objects).expect("scene is non-empty");
         let lights = self.lights.iter().map(|l| self.cpu_light(l)).collect();
         (scene, lights)
-    }
-
-    /// The specular bridges of all laser lights in the scene: the analytic
-    /// one-bounce specular paths from a diffuse vertex to each laser
-    /// aperture (the aperture's mirror image). Consumed by the BDPT eye
-    /// walk's diffuse sampling mixture — see `bdpt::Bridge`.
-    pub fn bridges(&self) -> Vec<crate::bdpt::Bridge> {
-        self.lights
-            .iter()
-            .filter_map(|l| l.bridge)
-            .collect()
     }
 
     fn cpu_light(&self, l: &LightData) -> AreaLight {
@@ -1129,5 +1205,208 @@ mod tests {
         ));
         assert_eq!(scene.quads.len(), 1);
         assert!(scene.quads[0].mat.is_emissive());
+    }
+
+    /// A small closed room with a laser and a mirror chain, used by the
+    /// bridge tests below.
+    fn laser_room() -> SceneData {
+        let mut scene = SceneData::new();
+        let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
+        // A 2 x 2 x 2 room.
+        scene.add_wall(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(0.0, 1.0, -1.0), Vec3::new(0.0, 0.0, 1.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, -1.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), 2.0, 2.0, white);
+        scene
+    }
+
+    /// The specular bridge must be the aperture's mirror image through
+    /// the beam's *whole* mirror chain — not just the first mirror.
+    /// A beam aimed at a 45° floor mirror that bounces onto a 45° wall
+    /// mirror must unfold across both planes, in beam order.
+    #[test]
+    fn bridge_unfolds_across_the_whole_mirror_chain() {
+        let mut scene = laser_room();
+        // The laser first (order independence: the bridge is derived
+        // from the fully-built scene, never baked at add-time).
+        scene.add_laser(
+            Vec3::new(0.4, 1.9, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            0.2,
+            0.01,
+            0.01,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+        // Mirror 1: the floor, tilted 45° — the downward beam reflects
+        // horizontal (+z).
+        scene.add_quad(
+            Vec3::new(0.4, 0.002, 0.0),
+            Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2),
+            0.6,
+            0.6,
+            MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+        );
+        // Mirror 2: the front wall (z = 1), tilted 45° the other way —
+        // the horizontal beam reflects straight up, landing on the
+        // ceiling far from the laser housing.
+        scene.add_quad(
+            Vec3::new(0.4, 0.0027, 0.998),
+            Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2),
+            0.6,
+            0.6,
+            MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+        );
+
+        let laser = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("the laser");
+        let trace = scene.trace_laser_beam(laser, 4);
+        // Three legs: aperture -> floor mirror -> wall mirror -> spot.
+        assert_eq!(
+            trace.legs.len(),
+            3,
+            "the beam must bounce twice, got {:?}",
+            trace.legs
+        );
+        let spot = trace.spot.expect("the beam must land on a diffuse surface");
+        // The beam ends going straight up: it lands on the ceiling.
+        assert!(
+            (spot.p.y - 2.0).abs() < 2e-3,
+            "the beam must land on the ceiling, got {:?}",
+            spot.p
+        );
+
+        // The bridge: the aperture unfolded across both mirrors.
+        let bridge = scene
+            .bridge_of_light(laser, 4)
+            .expect("the laser must carry a specular bridge");
+        let aperture = laser.center;
+        let floor_hit = trace.legs[0].1;
+        let wall_hit = trace.legs[1].1;
+        let unfold = |p: Vec3, hit: Vec3, normal: Vec3| {
+            let d = p - hit;
+            p - normal * (2.0 * d.dot(normal))
+        };
+        let image1 = unfold(
+            aperture,
+            floor_hit,
+            Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2),
+        );
+        let expected = unfold(
+            image1,
+            wall_hit,
+            Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2),
+        );
+        assert!(
+            (bridge.image_center - expected).length() < 1e-3,
+            "the bridge image {:?} must be the double reflection {:?}",
+            bridge.image_center,
+            expected
+        );
+        assert!((bridge.radius - laser.radius).abs() < 1e-6);
+    }
+
+    /// The bridge must follow a *moved* mirror: the same scene with the
+    /// wall mirror shifted must produce a different (correct) image.
+    /// This is the movement-readiness guard — the bridge is derived
+    /// per query, never stored.
+    #[test]
+    fn bridge_follows_a_moved_mirror() {
+        let build = |wall_z: f32| -> (SceneData, crate::bdpt::Bridge) {
+            let mut scene = laser_room();
+            scene.add_laser(
+                Vec3::new(0.4, 1.9, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                0.2,
+                0.01,
+                0.01,
+                Vec3::new(1.0, 1.0, 1.0),
+            );
+            scene.add_quad(
+                Vec3::new(0.4, 0.002, 0.0),
+                Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2),
+                0.6,
+                0.6,
+                MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+            );
+            scene.add_quad(
+                Vec3::new(0.4, 0.0027, wall_z),
+                Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2),
+                0.6,
+                0.6,
+                MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)),
+            );
+            let laser = scene
+                .lights
+                .iter()
+                .find(|l| l.shape == 2)
+                .expect("the laser");
+            let bridge = scene
+                .bridge_of_light(laser, 4)
+                .expect("the beam must hit both mirrors");
+            (scene, bridge)
+        };
+
+        let (_, bridge_a) = build(0.998);
+        let (_, bridge_b) = build(0.5);
+        // The wall mirror moved 0.5 toward the room center; the image
+        // must move with it (the second unfolding plane changed).
+        assert!(
+            (bridge_a.image_center - bridge_b.image_center).length() > 0.1,
+            "the bridge must follow the moved mirror: {:?} vs {:?}",
+            bridge_a.image_center,
+            bridge_b.image_center
+        );
+        // And each image is the correct double reflection for its own
+        // geometry: the unfolding preserves path length, so the spot's
+        // distance to the image equals the total beam path length (up
+        // to the per-bounce EPS_NEAR ray offsets).
+        for (scene, bridge) in [build(0.998), build(0.5)] {
+            let laser = scene
+                .lights
+                .iter()
+                .find(|l| l.shape == 2)
+                .expect("the laser");
+            let trace = scene.trace_laser_beam(laser, 4);
+            let spot = trace.spot.expect("spot");
+            let path_len: f32 = trace
+                .legs
+                .iter()
+                .map(|(a, b)| (*b - *a).length())
+                .sum();
+            let d = (bridge.image_center - spot.p).length();
+            assert!(
+                (d - path_len).abs() < 0.01,
+                "the image distance {d} must equal the beam path length {path_len}"
+            );
+        }
+    }
+
+    /// A beam that never hits a mirror must produce no bridge: the
+    /// aperture is directly visible and ordinary sampling finds it.
+    #[test]
+    fn beam_without_mirrors_has_no_bridge() {
+        let mut scene = laser_room();
+        scene.add_laser(
+            Vec3::new(0.0, 1.9, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            0.2,
+            0.01,
+            0.01,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
+        let laser = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("the laser");
+        assert!(
+            scene.bridge_of_light(laser, 4).is_none(),
+            "a beam hitting only the diffuse floor must have no bridge"
+        );
     }
 }

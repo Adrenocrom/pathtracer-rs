@@ -31,6 +31,12 @@ const STRAFE_SPEED: f32 = 1.0;
 const ROT_SPEED: f32 = 1.0;
 /// Camera pitch speed in radians per second (arrow up/down).
 const PITCH_SPEED: f32 = 1.0;
+/// The wall mirror's sweep speed in radians per second (M): the
+/// movement demo — the beam's second bounce, the ceiling spot and the
+/// derived specular bridge all follow the tilting mirror live.
+const MIRROR_SPEED: f32 = 0.5;
+/// The wall mirror's tilt amplitude in radians (M).
+const MIRROR_SWEEP: f32 = 20.0f32.to_radians();
 
 /// The keys the window frontend reacts to. The discriminants are used as
 /// indices into the `Keys` state array, so they must stay contiguous.
@@ -44,6 +50,7 @@ enum Key {
     E,
     Up,
     Down,
+    M,
     Count,
 }
 
@@ -59,6 +66,7 @@ impl Key {
             KeyCode::KeyE => Some(Key::E),
             KeyCode::ArrowUp => Some(Key::Up),
             KeyCode::ArrowDown => Some(Key::Down),
+            KeyCode::KeyM => Some(Key::M),
             _ => None,
         }
     }
@@ -376,6 +384,15 @@ struct App {
     fps: f32,
     /// True while the help overlay is on screen (any key dismisses it).
     showing_help: bool,
+    /// True while the movement demo runs (M): the wall mirror tilts back
+    /// and forth, and the scene is rebuilt + re-uploaded per frame so
+    /// the beam's spot and its derived bridge follow it live.
+    animating: bool,
+    /// The wall mirror's tilt — the movement demo's knob.
+    wall_mirror_tilt: f32,
+    /// The demo's running clock (seconds since M was pressed), advanced
+    /// by the frame delta so the sweep is frame-rate independent.
+    anim_time: f32,
     /// Screenshot in flight: the FHD renderer accumulates in the
     /// background while the preview keeps running.
     screenshot: Option<Screenshot>,
@@ -415,6 +432,9 @@ impl App {
             last_frame: None,
             fps: 0.0,
             showing_help: false,
+            animating: false,
+            wall_mirror_tilt: 0.0,
+            anim_time: 0.0,
             screenshot: None,
         }
     }
@@ -487,6 +507,7 @@ impl App {
                     "Q/E     STRAFE LEFT/RIGHT",
                     "UP/DOWN PITCH",
                     "F       TOGGLE DENOISER",
+                    "M       TOGGLE MIRROR ANIMATION",
                     "P       EXPORT FHD PNG",
                     "H       TOGGLE THIS HELP",
                     "ESC     QUIT",
@@ -579,6 +600,22 @@ impl App {
         if moved {
             // Camera moved: the accumulated image is stale, start over.
             renderer.reset_accumulation();
+            self.frames_accumulated = 0;
+        }
+
+        // The movement demo (M): tilt the wall mirror and rebuild the
+        // scene per frame. The renderer re-ingests the geometry and
+        // re-derives the laser's specular bridge from the new mirror
+        // orientation, so the beam's spot follows the mirror live — the
+        // whole point of deriving the bridge instead of baking it.
+        // The sweep is 0..+MIRROR_SWEEP (never negative): a negative
+        // tilt sends the beam down to the back wall, behind the camera.
+        if self.animating {
+            self.anim_time += dt;
+            let phase = 0.5 - 0.5 * (self.anim_time * MIRROR_SPEED * std::f32::consts::PI).cos();
+            self.wall_mirror_tilt = MIRROR_SWEEP * phase;
+            self.scene = crate::build_scene_with(self.wall_mirror_tilt);
+            renderer.update_scene(&self.scene);
             self.frames_accumulated = 0;
         }
 
@@ -810,6 +847,13 @@ impl ApplicationHandler for App {
                             if let Some(window) = self.window.as_ref() {
                                 window.request_redraw();
                             }
+                        }
+                        KeyCode::KeyM => {
+                            // Toggle the movement demo: the wall mirror
+                            // sweeps, and the scene (with its re-derived
+                            // laser bridge) is rebuilt per frame.
+                            self.animating = !self.animating;
+                            self.anim_time = 0.0;
                         }
                         KeyCode::KeyP => {
                             // Start a full-quality export. It accumulates

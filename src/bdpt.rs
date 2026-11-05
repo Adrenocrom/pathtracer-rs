@@ -151,39 +151,44 @@ const RR_START: usize = 3;
 /// kills (+33% ambient variance, cleaned up by accumulation).
 pub const BRIDGE_PROB: f32 = 0.25;
 
-/// A specular bridge: the analytic description of the one-bounce specular
-/// path from a diffuse vertex to a laser aperture — the aperture's
-/// *mirror image*, a disc. Built by the scene (`SceneData::add_laser`
-/// traces the beam and reflects the aperture across the first mirror it
-/// hits), carried by the light types (`LightData` → `AreaLight` /
-/// `GpuLight`), and consumed here as a *sampling technique* for the eye
-/// subpath: at a diffuse vertex the walk draws a direction toward the
-/// image disc with probability `BRIDGE_PROB`, so the path
-/// camera → wall → mirror → aperture — which no BDPT connection can
-/// sample (the mirror is a delta endpoint) and no light subpath can
-/// reach (the aperture is a ~1 cm disc behind the mirror) — is carried
-/// by ordinary subpath walking. The beam's spot on the wall then
-/// emerges from real light transport: the direct-hit strategy credits
-/// the aperture's emission, gated by its cone, and the MIS machinery
-/// weights the (single) valid strategy.
+/// A specular bridge: the analytic description of the multi-bounce
+/// specular path from a diffuse vertex to a laser aperture — the
+/// aperture's *mirror image* through the beam's whole mirror chain, a
+/// disc. Derived by the scene on demand (`SceneData::bridge_of_light`
+/// traces the beam through the fully-built scene and unfolds the
+/// aperture across every mirror plane in beam order — never baked at
+/// add-time, so the registration order is irrelevant and a moving
+/// scene re-derives it), carried by the light types (`LightData` →
+/// `AreaLight` / `GpuLight`), and consumed here as a *sampling
+/// technique* for the eye subpath: at a diffuse vertex the walk draws a
+/// direction toward the image disc with probability `BRIDGE_PROB`, so
+/// the path camera → wall → mirror₁ → … → mirrorₙ → aperture — which
+/// no BDPT connection can sample (the mirrors are delta endpoints) and
+/// no light subpath can reach (the aperture is a ~1 cm disc behind the
+/// first mirror) — is carried by ordinary subpath walking. The beam's
+/// spot on the wall then emerges from real light transport: the
+/// direct-hit strategy credits the aperture's emission, gated by its
+/// cone, and the MIS machinery weights the (single) valid strategy.
 ///
-/// The construction is exact: the mirror plane is the perpendicular
-/// bisector of the segment aperture ↔ image, so a ray from `p` aimed at
-/// a point `q` of the image disc crosses the mirror plane and reflects
-/// onto the corresponding point of the aperture disc — the classic
-/// mirror-image construction. The set of directions from `p` that reach
-/// the aperture through the mirror is therefore exactly the cone
-/// subtended by the image disc, which is what `sample_dir`/`pdf`
-/// describe (uniform over that cone).
+/// The construction is exact: each mirror plane is the perpendicular
+/// bisector of the segment image ↔ unfolded image, so a ray from `p`
+/// aimed at a point `q` of the final image disc crosses every mirror
+/// plane in the chain and reflects onto the corresponding point of the
+/// aperture disc — the classic mirror-image (unfolding) construction.
+/// The set of directions from `p` that reach the aperture through the
+/// mirror chain is therefore exactly the cone subtended by the image
+/// disc, which is what `sample_dir`/`pdf` describe (uniform over that
+/// cone).
 ///
 /// This is a sampling technique, not a light source: no fake emitters,
 /// no mid-air beam — in clean air a laser beam is invisible from the
 /// side; only the spot on the wall is real.
 #[derive(Clone, Copy)]
 pub struct Bridge {
-    /// The aperture's mirror image: a disc of `radius` centered at
-    /// `image_center` (the aperture disc reflected across the mirror
-    /// plane).
+    /// The aperture's mirror image through the beam's whole mirror
+    /// chain: a disc of `radius` centered at `image_center` (the
+    /// aperture disc unfolded across every mirror plane in beam
+    /// order).
     pub image_center: Vec3,
     /// The image disc's radius (the aperture radius).
     pub radius: f32,
