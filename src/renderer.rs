@@ -17,7 +17,7 @@ pub const MAX_ACCUMULATED_FRAMES: usize = 128;
 /// 1024 samples per pixel.
 pub const FHD_WIDTH: u32 = 1920;
 pub const FHD_HEIGHT: u32 = 1080;
-pub const SAMPLES_FHD: u32 = 128;
+pub const SAMPLES_FHD: u32 = 1289;
 pub const MAX_DEPTH_FHD: u32 = 8;
 
 pub trait Renderer {
