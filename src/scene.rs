@@ -407,6 +407,109 @@ impl SceneData {
         });
     }
 
+    /// Add a simple table: a top slab plus four legs, all of `mat`.
+    /// `center` is the center of the top slab, `size` its full extent
+    /// (x width, y thickness, z depth). The legs are square, 10% of
+    /// the smaller horizontal extent, inset 10% from the edges, and
+    /// reach down to the floor (y = 0) — the convention the demo
+    /// room's hand-built table uses.
+    ///
+    /// Like `add_box`/`add_cylinder`: composed of boxes, so both
+    /// backends see it without any changes.
+    #[allow(dead_code)]
+    pub fn add_table(&mut self, center: Vec3, size: Vec3, mat: MaterialData) {
+        self.add_box(center, size, mat);
+        let leg_t = size.x.min(size.z) * 0.1;
+        let leg_h = center.y - size.y * 0.5;
+        for sx in [-1.0, 1.0] {
+            for sz in [-1.0, 1.0] {
+                self.add_box(
+                    Vec3::new(
+                        center.x + sx * size.x * 0.4,
+                        leg_h * 0.5,
+                        center.z + sz * size.z * 0.4,
+                    ),
+                    Vec3::new(leg_t, leg_h, leg_t),
+                    mat,
+                );
+            }
+        }
+    }
+
+    /// Add a simple chair: a seat, four legs and a backrest, all of
+    /// `mat`. `center` is the center of the seat; the chair faces +z
+    /// (the backrest sits at the -z edge). Fixed ~0.45 m proportions,
+    /// legs reaching the floor (y = 0).
+    ///
+    /// Like `add_box`/`add_cylinder`: composed of boxes, so both
+    /// backends see it without any changes.
+    #[allow(dead_code)]
+    pub fn add_chair(&mut self, center: Vec3, mat: MaterialData) {
+        const SEAT: f32 = 0.45; // seat width/depth
+        const SEAT_T: f32 = 0.05; // seat thickness
+        const LEG: f32 = 0.04; // leg thickness
+        const BACK_H: f32 = 0.5; // backrest height above the seat
+        const BACK_T: f32 = 0.04; // backrest thickness
+        self.add_box(center, Vec3::new(SEAT, SEAT_T, SEAT), mat);
+        let leg_h = center.y - SEAT_T * 0.5;
+        for sx in [-1.0, 1.0] {
+            for sz in [-1.0, 1.0] {
+                self.add_box(
+                    Vec3::new(
+                        center.x + sx * (SEAT * 0.5 - LEG),
+                        leg_h * 0.5,
+                        center.z + sz * (SEAT * 0.5 - LEG),
+                    ),
+                    Vec3::new(LEG, leg_h, LEG),
+                    mat,
+                );
+            }
+        }
+        // Backrest, rising from the back edge of the seat.
+        self.add_box(
+            Vec3::new(
+                center.x,
+                center.y + SEAT_T * 0.5 + BACK_H * 0.5,
+                center.z - SEAT * 0.5 + BACK_T * 0.5,
+            ),
+            Vec3::new(SEAT, BACK_H, BACK_T),
+            mat,
+        );
+    }
+
+    /// Add a simple shelf: two side panels and four boards, all of
+    /// `mat`. `center` is the shelf's center, `size` its full extent
+    /// (x width, y height, z depth). The panels are 5% of the width
+    /// thick; the boards are 4% of the height thick, span between the
+    /// panels and are evenly spaced.
+    ///
+    /// Unlike `add_table`/`add_chair` (whose legs are derived down to
+    /// the floor), the shelf is placed exactly at `center`/`size` —
+    /// like `add_box` — so it can also hang on a wall; to stand it on
+    /// the floor, pass `center.y = size.y / 2`.
+    ///
+    /// Like `add_box`/`add_cylinder`: composed of boxes, so both
+    /// backends see it without any changes.
+    #[allow(dead_code)]
+    pub fn add_shelf(&mut self, center: Vec3, size: Vec3, mat: MaterialData) {
+        let panel_t = size.x * 0.05;
+        let board_t = size.y * 0.04;
+        for sx in [-1.0, 1.0] {
+            self.add_box(
+                Vec3::new(center.x + sx * (size.x * 0.5 - panel_t * 0.5), center.y, center.z),
+                Vec3::new(panel_t, size.y, size.z),
+                mat,
+            );
+        }
+        for f in [-0.375, -0.125, 0.125, 0.375] {
+            self.add_box(
+                Vec3::new(center.x, center.y + size.y * f, center.z),
+                Vec3::new(size.x - 2.0 * panel_t, board_t, size.z),
+                mat,
+            );
+        }
+    }
+
     /// Add an infinite plane. Kept for tests and future scenes; the demo
     /// room uses `add_wall` (finite quads) so the BVH can cull.
     #[allow(dead_code)]
@@ -1200,6 +1303,54 @@ mod tests {
         ));
         assert_eq!(scene.quads.len(), 1);
         assert!(scene.quads[0].mat.is_emissive());
+    }
+
+    /// The furniture helpers (`add_table`, `add_chair`, `add_shelf`)
+    /// must be composed of boxes only — real geometry on both backends
+    /// with no backend changes — and must stand on the floor: every
+    /// part's bottom face at y = 0 (a leg floating above the floor or
+    /// sunk through it would be a visible bug in the render).
+    #[test]
+    fn furniture_helpers_stand_on_the_floor() {
+        let mut scene = SceneData::new();
+        scene.add_table(
+            Vec3::new(0.0, 0.7, 0.0),
+            Vec3::new(1.0, 0.05, 0.7),
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        scene.add_chair(
+            Vec3::new(1.0, 0.45, 0.0),
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        scene.add_shelf(
+            Vec3::new(-1.0, 0.8, 0.0), // center.y = size.y/2: stands on the floor
+            Vec3::new(1.0, 1.6, 0.3),
+            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
+        );
+        // Table: top + 4 legs. Chair: seat + 4 legs + backrest.
+        // Shelf: 2 panels + 4 boards.
+        assert_eq!(scene.cubes.len(), 5 + 6 + 6);
+        assert!(scene.lights.is_empty());
+        // Nothing may sink below the floor...
+        for c in &scene.cubes {
+            assert!(c.min.y >= -1e-6, "part sinks below the floor, min.y = {}", c.min.y);
+        }
+        // ...and each object must actually stand on it: its lowest
+        // part reaches y = 0 (a floating object would be a visible bug).
+        for cubes in [
+            &scene.cubes[..5],   // table
+            &scene.cubes[5..11], // chair
+            &scene.cubes[11..],  // shelf
+        ] {
+            let lowest = cubes.iter().map(|c| c.min.y).fold(f32::MAX, f32::min);
+            assert!(
+                lowest.abs() < 1e-6,
+                "object must stand on the floor, lowest part at y = {lowest}"
+            );
+        }
+        // The chair's backrest must rise above the seat, not below it.
+        let backrest = scene.cubes[10];
+        assert!(backrest.max.y > 0.45);
     }
 
     /// A small closed room with a laser and a mirror chain, used by the

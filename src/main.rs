@@ -263,6 +263,10 @@ fn build_scene_with(laser_aim_y: f32) -> SceneData {
         Vec3::new(800.0, 4.0e8, 800.0),
     );
 
+    scene.add_table(Vec3::new(0.0, 0.7, 0.0), Vec3::new(1.0, 0.05, 0.7), brown); // top slab + 4 legs to the floor
+    scene.add_chair(Vec3::new(1.0, 0.45, 0.0), brown);                            // seat + 4 legs + backrest, faces +z
+    scene.add_shelf(Vec3::new(-1.0, 0.8, -1.0), Vec3::new(1.0, 1.6, 0.3), brown);   // 2 side panels + 4 boards
+
     scene
 }
 
