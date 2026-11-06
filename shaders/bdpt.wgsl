@@ -519,7 +519,7 @@ fn intersect_scene(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             inv_dir[i] = 1.0 / dir[i];
         }
     }
-    var stack: array<u32, MAX_BVH_STACK>;
+    var stack: array<u32, 32u>;
     var sp = 0u;
     stack[0] = 0u; // root
     sp = 1u;

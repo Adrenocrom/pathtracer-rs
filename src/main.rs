@@ -45,7 +45,7 @@ fn build_scene() -> SceneData {
 
 fn build_scene_with(_laser_aim_y: f32) -> SceneData {
     let emission = Vec3::new(1000.0, 1000.0, 1000.0);
-    let room_size = 1.5;
+    let room_size = 2.5;
     let room_height = 2.0;
 
     let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
@@ -128,11 +128,106 @@ fn build_scene_with(_laser_aim_y: f32) -> SceneData {
             Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
     ));
 
-    //scene.add_box( Vec3::new(room_size/2.0, 1.0, 1.0), Vec3::new(room_size, room_height, 0.02), white);
+    scene.add_box( Vec3::new(room_size/2.0, 1.0, 1.0), Vec3::new(room_size, room_height, 0.02), white);
 
-    //scene.add_cube(Vec3::new(0.0, 0.2, 0.0), 0.4, white);
-    scene.add_sphere(Vec3::new(0.5, 0.3, 1.0), 0.3, MaterialData::glass(1.5));
-    scene.add_box(Vec3::new(-0.5, 0.4, 1.0), Vec3::new(0.4, 1.8, 0.4), MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)));
+    // The laser showcase: a red laser on the table, aimed backward at a
+    // mirror tile on the back wall, which bounces the beam forward across
+    // the room onto the partition wall's camera-facing side. One
+    // bounce, one spot — plus the glow beside the beam (the bridge
+    // ladder carries it on *every* leg now).
+    //
+    // The laser is added *before* the mirror on purpose: the specular
+    // bridge ladder (one rung per mirror the beam crosses — see
+    // `SceneData::bridges_of_light`) is derived on demand from the
+    // fully-built scene, never baked at add-time, so the registration
+    // order is irrelevant — and a scene that moves between frames
+    // simply re-derives every rung from the new geometry.
+    //
+    // `laser_aim_y` is the movement knob (the window frontend's `M`
+    // key): the laser pivots on its table mount, scanning the beam up
+    // and down the back-wall mirror; the spot slides up and down the
+    // partition, and the derived ladder follows.
+    //
+    // Spectral (paper §9.2): the laser is a *monochromatic line* —
+    // 650 nm, the physically correct replacement for the old RGB trick
+    // of putting 4×10⁸ in the red channel. The line's power is chosen
+    // so the rendered spot's luminance matches the old RGB hack (the
+    // 1/p(λ) sensor factor ≈ ×3 replaces the channel stuffing); the
+    // out-of-gamut negative channels clamp at display, where they
+    // belong.
+    let laser_pos = Vec3::new(-1.3, 0.62, 1.8);
+    let back_mirror_center = Vec3::new(0.0, 1.0, -(room_size - 0.01));
+    //let aim_point = Vec3::new(0.0, laser_aim_y, -(room_size - 0.01));
+    let aim = Vec3::new(1.0, 0.0, -room_size).normalize();
+    scene.add_laser_line(
+        laser_pos,
+        aim,
+        0.2,                        // housing height
+        0.01,                       // aperture radius
+        0.01,                       // beam half-angle (radians, ~0.57°)
+        650.0,                      // nm — the red laser line
+        1.2e9,                      // spectral radiance at the line
+    );
+    scene.add_quad(
+        back_mirror_center,
+        Vec3::new(0.0, 0.0, 1.0),
+        2.0,
+        1.0,
+        MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
+    );
+
+    // The glass cube: N-BK7 borosilicate (paper §9.2) — a dispersive
+    // dielectric, so its caustic picks up chromatic fringes (blue bends
+    // more than red). The Sellmeier coefficients replace the constant
+    // n = 1.5.
+    scene.add_box(
+        Vec3::new(-1.4, 0.65, 1.5),
+        Vec3::new(0.1, 0.1, 0.1),
+        MaterialData::glass_bk7(),
+    );
+    // The green laser's ping-pong tiles: the first is a GGX *rough
+    // mirror* (paper §9.5) — the tile picks up soft reflections of the
+    // room, the beam still lands (the trace follows the lobe's mean),
+    // the ladder still derives rung-per-crossing, and the spot softens.
+    // The second stays a perfect mirror — the visible contrast.
+    scene.add_box(
+        Vec3::new(-1.9, 0.65, 1.7),
+        Vec3::new(0.001, 0.1, 0.2),
+        MaterialData::glossy(Vec3::new(1.0, 1.0, 1.0), 0.08, 0.9),
+    );
+    scene.add_box( Vec3::new(-1.7, 0.65, 1.6), Vec3::new(0.001, 0.1, 0.4), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
+
+    let pos = Vec3::new(-1.7, 0.6, 1.7);
+    let dim = Vec3::new(1.0, 0.02, 0.7);
+    scene.add_box(pos, dim, white);
+    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+
+    // A second laser (green) on the table, aimed across the room at the
+    // thin mirror boxes — its beam ping-pongs between them, and the
+    // wide cone (0.05 rad) paints the table under *every* leg: the glow
+    // under the middle legs (after one box, before the next) is exactly
+    // what the bridge ladder's rungs carry — before the ladder, only
+    // the first leg (direct light) and the last leg (the whole-chain
+    // rung) glowed.
+    //
+    // Spectral (paper §9.2): a 532 nm line — the classic green laser
+    // wavelength. A pure 532 nm green is outside the sRGB gamut, so the
+    // rendered sample carries negative R/B channels; the display stage
+    // gamut-maps them (§9.2: "the out-of-gamut problem moves to the
+    // display stage where it belongs").
+    scene.add_laser_line(
+        Vec3::new(-1.6, 0.62, 1.9),
+        Vec3::new(-1.0, 0.0, -0.5),
+        0.2,
+        0.01,
+        0.01,
+        532.0,                      // nm — the green laser line
+        1.2e9,
+    );
+
     scene
 }
 
