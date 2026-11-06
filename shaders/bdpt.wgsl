@@ -49,7 +49,7 @@ struct Uniforms {
     reset: u32,
     spp: u32,            // samples traced per pixel in this dispatch
     n_prims: u32,        // scene prims; 0 = empty scene, skip traversal
-    firefly_clamp: f32,  // per-sample luminance clamp bound (0 = disable)
+    firefly_clamp: f32,  // per-sample clamp *multiplier* (the bound is spectral, per-λ)
     _pad2: u32,
 };
 
@@ -59,13 +59,16 @@ struct Uniforms {
 // slots: the cube's min/max live in center/normal, the quad's half_w
 // lives in radius, the cylinder's base lives in center, its axis in
 // tangent, its radius in radius and its half-height in half_h.
-// mat_type is 0 diffuse / 1 emissive / 2 mirror / 3 glass / 4 laser;
-// ior carries the glass interior index (1.0 otherwise), or the laser
-// emission cone's cosine for mat_type 4.
+// mat_type is 0 diffuse / 1 emissive / 2 mirror / 3 glass / 4 laser /
+// 5 glossy; ior carries the glass interior index (1.0 otherwise), or
+// the laser emission cone's cosine for mat_type 4. The spectral fields
+// (paper §9.2): sellmeier carries the glass dispersion coefficients
+// (all zeros = achromatic, the constant ior); rough/f0 carry the GGX
+// lobe for mat_type 5 (§9.5).
 //
 // Layout rule: every vec3<f32> is immediately followed by an f32/u32 so
 // WGSL's implicit 16-byte alignment never inserts padding that Rust's
-// #[repr(C)] doesn't have. Stride 112, matching GpuPrim in gpu.rs.
+// #[repr(C)] doesn't have. Stride 128, matching GpuPrim in gpu.rs.
 struct Prim {
     kind: u32,              // KIND_SPHERE / KIND_QUAD / KIND_CUBE / KIND_PLANE / KIND_CYLINDER
     ior: f32,
@@ -81,8 +84,9 @@ struct Prim {
     _pad2: f32,
     albedo: vec3<f32>,
     _pad3: f32,
-    emission: vec3<f32>,
-    _pad4: f32,
+    sellmeier: array<f32, 6>,  // glass dispersion [B1,B2,B3,C1,C2,C3]; zeros = achromatic
+    rough: f32,             // GGX roughness (mat_type 5)
+    f0: f32,                // GGX normal-incidence reflectance (mat_type 5)
 };
 
 // One flat BVH node, 32 bytes (matching GpuBvhNode in gpu.rs).
@@ -103,7 +107,7 @@ struct BvhNode {
 
 struct GpuLight {
     shape: u32,
-    _pad0: f32,
+    spectrum_kind: u32,   // 0 = smooth (CMF-basis coeffs), 1 = monochromatic line
     _pad1: f32,
     _pad2: f32,
     center: vec3<f32>,
@@ -115,11 +119,21 @@ struct GpuLight {
     bitangent: vec3<f32>,
     half_w: f32,
     half_h: f32,
-    _pad5: f32,
-    _pad6: f32,
-    _pad7: f32,
-    emission: vec3<f32>,
+    // The smooth spectrum's CMF-basis coefficients (a line ignores
+    // them): S(λ) = coeffs·CMF(λ), the unique SPD whose tristimulus
+    // integral is the RGB intent (paper §9.2). Three *scalars*, not a
+    // vec3: WGSL aligns vec3 to 16 bytes, which would misalign
+    // bridge_rungs (16-byte vec4 elements) against the Rust layout.
+    coeff_x: f32,
+    coeff_y: f32,
+    coeff_z: f32,
+    // The line's wavelength (nm) and spectral radiance; 0 for a smooth
+    // spectrum. A laser is monochromatic, so λ is deterministic on its
+    // branch.
+    lambda: f32,
+    power: f32,
     _pad8: f32,
+    _pad8b: f32,
     // The specular bridge *ladder* (a laser only), packed one rung per
     // vec4: xyz = the rung's image-center, w = its radius. Rung j is
     // the aperture's mirror image unfolded across the first j mirrors
@@ -142,9 +156,14 @@ struct Hit {
     p: vec3<f32>,
     normal: vec3<f32>,
     albedo: vec3<f32>,
-    emission: vec3<f32>,
     mat_type: u32,
     ior: f32,
+    // The glass Sellmeier coefficients (zeros = achromatic) and the GGX
+    // lobe parameters, carried so the BSDF helpers can evaluate n(λ) and
+    // the microfacet lobe without re-reading the prim.
+    sellmeier: array<f32, 6>,
+    rough: f32,
+    f0: f32,
 };
 
 // One vertex of an eye or light subpath. `normal` is oriented toward the
@@ -152,16 +171,19 @@ struct Hit {
 // geometric normal (as returned by the intersection) faces that side, so
 // hypothetical events can re-orient it for their own arrival side.
 // `throughput` excludes the BSDF applied when *leaving* the vertex (that
-// factor belongs to the connection term).
+// factor belongs to the connection term) and is a *spectral* scalar at
+// the path's hero wavelength (paper §9.2).
 struct PathVertex {
     p: vec3<f32>,
     normal: vec3<f32>,
     front_face: bool,
     albedo: vec3<f32>,
-    emission: vec3<f32>,
     mat_type: u32,
     ior: f32,
-    throughput: vec3<f32>,
+    sellmeier: array<f32, 6>,
+    rough: f32,
+    f0: f32,
+    throughput: f32,
     on_light: bool,
 };
 
@@ -178,10 +200,14 @@ struct PathVertex {
 struct PathView {
     k: u32,
     n_eye: u32,
-    // n_lights * area of the light the path ends on.
+    // n_active * area of the light the path ends on (the *active*
+    // lights: those that radiate at the drawn λ — see the branch rule).
     inv_light_pdf: f32,
     // The primary camera ray direction (the incoming direction at x_1).
     cam_dir: vec3<f32>,
+    // The path's hero wavelength (nm). Fixed per path, so realized and
+    // hypothetical events evaluate the same spectral quantities.
+    lambda: f32,
 };
 
 const PI: f32 = 3.141592653589793;
@@ -203,6 +229,10 @@ const MAT_GLASS: u32 = 3u;
 // A laser aperture: emissive, radiating only into the cone whose cosine
 // rides in the prim's `ior` slot.
 const MAT_LASER: u32 = 4u;
+// A GGX microfacet "rough mirror" (paper §9.5): a continuous lobe, so
+// connections through it are valid. The roughness rides in `rough`, the
+// normal-incidence reflectance in `f0`.
+const MAT_GLOSSY: u32 = 5u;
 // Which quantity a subpath transports: the two agree for reflection but
 // differ for transmission (radiance picks up (eta_t/eta_i)^2 crossing a
 // refractive boundary, importance does not). The eye subpath carries
@@ -305,7 +335,9 @@ fn intersect_prim(p: Prim, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function
         (*best).p = hp;
         (*best).normal = normalize3(hp - p.center);
         (*best).albedo = p.albedo;
-        (*best).emission = p.emission;
+        (*best).sellmeier = p.sellmeier;
+        (*best).rough = p.rough;
+        (*best).f0 = p.f0;
         (*best).mat_type = p.mat_type;
         (*best).ior = p.ior;
         return;
@@ -322,7 +354,9 @@ fn intersect_prim(p: Prim, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function
         (*best).p = hp;
         (*best).normal = p.normal;
         (*best).albedo = p.albedo;
-        (*best).emission = p.emission;
+        (*best).sellmeier = p.sellmeier;
+        (*best).rough = p.rough;
+        (*best).f0 = p.f0;
         (*best).mat_type = p.mat_type;
         (*best).ior = p.ior;
         return;
@@ -372,7 +406,9 @@ fn intersect_prim(p: Prim, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function
         (*best).p = hp;
         (*best).normal = normal;
         (*best).albedo = p.albedo;
-        (*best).emission = p.emission;
+        (*best).sellmeier = p.sellmeier;
+        (*best).rough = p.rough;
+        (*best).f0 = p.f0;
         (*best).mat_type = p.mat_type;
         (*best).ior = p.ior;
         return;
@@ -437,7 +473,9 @@ fn intersect_prim(p: Prim, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function
         (*best).p = hp;
         (*best).normal = best_normal;
         (*best).albedo = p.albedo;
-        (*best).emission = p.emission;
+        (*best).sellmeier = p.sellmeier;
+        (*best).rough = p.rough;
+        (*best).f0 = p.f0;
         (*best).mat_type = p.mat_type;
         (*best).ior = p.ior;
         return;
@@ -451,7 +489,9 @@ fn intersect_prim(p: Prim, origin: vec3<f32>, dir: vec3<f32>, best: ptr<function
     (*best).p = origin + dir * t;
     (*best).normal = p.normal;
     (*best).albedo = p.albedo;
-    (*best).emission = p.emission;
+    (*best).sellmeier = p.sellmeier;
+    (*best).rough = p.rough;
+    (*best).f0 = p.f0;
     (*best).mat_type = p.mat_type;
     (*best).ior = p.ior;
 }
@@ -462,7 +502,9 @@ fn intersect_scene(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     best.p = vec3<f32>(0.0);
     best.normal = vec3<f32>(0.0, 1.0, 0.0);
     best.albedo = vec3<f32>(0.0);
-    best.emission = vec3<f32>(0.0);
+    best.sellmeier = array<f32, 6>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    best.rough = 0.0;
+    best.f0 = 0.0;
     best.mat_type = 0u;
     best.ior = 1.0;
     if (uniforms.n_prims == 0u) { return best; }
@@ -510,6 +552,310 @@ fn intersect_scene(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
 }
 
 fn has_hit(h: Hit) -> bool { return h.t < 1e29; }
+
+// --- Spectral transport (paper §9.2) ---
+//
+// The CIE 1931 2° color matching functions (x̄, ȳ, z̄), 380–780 nm at
+// 5 nm — 81 knots, the same table as src/spectrum.rs (source: CIE
+// 018:2019). CMF[i] = (x̄, ȳ, z̄) at 380 + i·5 nm. The sensor converts
+// the spectral estimate through these; the emitters' smooth spectra
+// are CMF-basis combinations whose tristimulus integral is exactly the
+// RGB intent.
+
+const LAMBDA_MIN: f32 = 380.0;
+const LAMBDA_MAX: f32 = 780.0;
+const CMF_STEP: f32 = 5.0;
+
+const CMF = array<vec3<f32>, 81>(
+    vec3<f32>(0.001368, 0.000039, 0.006450), // 380
+    vec3<f32>(0.002236, 0.000064, 0.010550), // 385
+    vec3<f32>(0.004243, 0.000120, 0.020050), // 390
+    vec3<f32>(0.007650, 0.000217, 0.036210), // 395
+    vec3<f32>(0.014310, 0.000396, 0.067850), // 400
+    vec3<f32>(0.023190, 0.000640, 0.110200), // 405
+    vec3<f32>(0.043510, 0.001210, 0.207400), // 410
+    vec3<f32>(0.077630, 0.002180, 0.371300), // 415
+    vec3<f32>(0.134380, 0.004000, 0.645600), // 420
+    vec3<f32>(0.214770, 0.007300, 1.039050), // 425
+    vec3<f32>(0.283900, 0.011600, 1.385600), // 430
+    vec3<f32>(0.328500, 0.016840, 1.622960), // 435
+    vec3<f32>(0.348280, 0.023000, 1.747060), // 440
+    vec3<f32>(0.348060, 0.029800, 1.782600), // 445
+    vec3<f32>(0.336200, 0.038000, 1.772110), // 450
+    vec3<f32>(0.318700, 0.048000, 1.744100), // 455
+    vec3<f32>(0.290800, 0.060000, 1.669200), // 460
+    vec3<f32>(0.251100, 0.073900, 1.528100), // 465
+    vec3<f32>(0.195360, 0.090980, 1.287640), // 470
+    vec3<f32>(0.142100, 0.112600, 1.041900), // 475
+    vec3<f32>(0.095640, 0.139020, 0.812950), // 480
+    vec3<f32>(0.057950, 0.169300, 0.616200), // 485
+    vec3<f32>(0.032010, 0.208020, 0.465180), // 490
+    vec3<f32>(0.014700, 0.258600, 0.353300), // 495
+    vec3<f32>(0.004900, 0.323000, 0.272000), // 500
+    vec3<f32>(0.002400, 0.407300, 0.212300), // 505
+    vec3<f32>(0.009300, 0.503000, 0.158200), // 510
+    vec3<f32>(0.029100, 0.608200, 0.111700), // 515
+    vec3<f32>(0.063270, 0.710000, 0.078250), // 520
+    vec3<f32>(0.109600, 0.793200, 0.057250), // 525
+    vec3<f32>(0.165500, 0.862000, 0.042160), // 530
+    vec3<f32>(0.225750, 0.914850, 0.029840), // 535
+    vec3<f32>(0.290400, 0.954000, 0.020300), // 540
+    vec3<f32>(0.359700, 0.980300, 0.013400), // 545
+    vec3<f32>(0.433450, 0.994950, 0.008750), // 550
+    vec3<f32>(0.512050, 1.000000, 0.005750), // 555
+    vec3<f32>(0.594500, 0.995000, 0.003900), // 560
+    vec3<f32>(0.678400, 0.978600, 0.002750), // 565
+    vec3<f32>(0.762100, 0.952000, 0.002100), // 570
+    vec3<f32>(0.842500, 0.915400, 0.001800), // 575
+    vec3<f32>(0.916300, 0.870000, 0.001650), // 580
+    vec3<f32>(0.978600, 0.816300, 0.001400), // 585
+    vec3<f32>(1.026300, 0.757000, 0.001100), // 590
+    vec3<f32>(1.056700, 0.694900, 0.001000), // 595
+    vec3<f32>(1.062200, 0.631000, 0.000800), // 600
+    vec3<f32>(1.045600, 0.566800, 0.000600), // 605
+    vec3<f32>(1.002600, 0.503000, 0.000340), // 610
+    vec3<f32>(0.938400, 0.441200, 0.000240), // 615
+    vec3<f32>(0.854450, 0.381000, 0.000190), // 620
+    vec3<f32>(0.751400, 0.321000, 0.000100), // 625
+    vec3<f32>(0.642400, 0.265000, 0.000050), // 630
+    vec3<f32>(0.541900, 0.217000, 0.000030), // 635
+    vec3<f32>(0.447900, 0.175000, 0.000020), // 640
+    vec3<f32>(0.360800, 0.138200, 0.000010), // 645
+    vec3<f32>(0.283500, 0.107000, 0.000000), // 650
+    vec3<f32>(0.218700, 0.081600, 0.000000), // 655
+    vec3<f32>(0.164900, 0.061000, 0.000000), // 660
+    vec3<f32>(0.121200, 0.044580, 0.000000), // 665
+    vec3<f32>(0.087400, 0.032000, 0.000000), // 670
+    vec3<f32>(0.063600, 0.023200, 0.000000), // 675
+    vec3<f32>(0.046770, 0.017000, 0.000000), // 680
+    vec3<f32>(0.032900, 0.011920, 0.000000), // 685
+    vec3<f32>(0.022700, 0.008210, 0.000000), // 690
+    vec3<f32>(0.015840, 0.005723, 0.000000), // 695
+    vec3<f32>(0.011359, 0.004102, 0.000000), // 700
+    vec3<f32>(0.008111, 0.002929, 0.000000), // 705
+    vec3<f32>(0.005790, 0.002091, 0.000000), // 710
+    vec3<f32>(0.004109, 0.001484, 0.000000), // 715
+    vec3<f32>(0.002899, 0.001047, 0.000000), // 720
+    vec3<f32>(0.002049, 0.000740, 0.000000), // 725
+    vec3<f32>(0.001440, 0.000520, 0.000000), // 730
+    vec3<f32>(0.001000, 0.000361, 0.000000), // 735
+    vec3<f32>(0.000690, 0.000249, 0.000000), // 740
+    vec3<f32>(0.000476, 0.000172, 0.000000), // 745
+    vec3<f32>(0.000332, 0.000120, 0.000000), // 750
+    vec3<f32>(0.000235, 0.000085, 0.000000), // 755
+    vec3<f32>(0.000166, 0.000060, 0.000000), // 760
+    vec3<f32>(0.000117, 0.000042, 0.000000), // 765
+    vec3<f32>(0.000083, 0.000030, 0.000000), // 770
+    vec3<f32>(0.000059, 0.000021, 0.000000), // 775
+    vec3<f32>(0.000042, 0.000015, 0.000000), // 780
+);
+
+// The CMF at `lambda` (nm), linearly interpolated between knots and 0
+// outside the table range.
+fn cmf(lambda: f32) -> vec3<f32> {
+    if (lambda < LAMBDA_MIN || lambda > LAMBDA_MAX) { return vec3<f32>(0.0); }
+    let t = (lambda - LAMBDA_MIN) / CMF_STEP;
+    var i = u32(t);
+    if (i > 79u) { i = 79u; }
+    let f = t - f32(i);
+    let a = CMF[i];
+    let b = CMF[i + 1u];
+    return vec3<f32>(
+        a.x + (b.x - a.x) * f,
+        a.y + (b.y - a.y) * f,
+        a.z + (b.z - a.z) * f,
+    );
+}
+
+// XYZ → linear sRGB (IEC 61966-2-1). Out-of-gamut XYZ (a pure 532 nm
+// green) produces negative channels — correct; the display stage
+// gamut-maps them (§9.2).
+fn xyz_to_srgb(xyz: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z,
+        -0.9689 * xyz.x + 1.8758 * xyz.y + 0.0415 * xyz.z,
+        0.0557 * xyz.x - 0.2040 * xyz.y + 1.0570 * xyz.z,
+    );
+}
+
+// The sensor conversion: the rendered linear-sRGB sample for a spectral
+// radiance estimate at `lambda`, weighted by 1/p(λ).
+fn sensor_rgb(lambda: f32, radiance: f32, inv_pdf: f32) -> vec3<f32> {
+    return xyz_to_srgb(cmf(lambda) * (radiance * inv_pdf));
+}
+
+// The spectral reflectance of an RGB albedo at `lambda`: the
+// complementary-ramp partition of unity (grays exact, energy
+// conservation automatic; see spectrum.rs::rgb_to_albedo).
+fn rgb_to_albedo(rgb: vec3<f32>, lambda: f32) -> f32 {
+    let b = 1.0 - smoothstep01((lambda - 440.0) / 60.0);
+    var g = 0.0;
+    if (lambda > 440.0 && lambda < 500.0) {
+        g = smoothstep01((lambda - 440.0) / 60.0);
+    } else if (lambda >= 500.0 && lambda <= 570.0) {
+        g = 1.0;
+    } else if (lambda > 570.0 && lambda < 630.0) {
+        g = 1.0 - smoothstep01((lambda - 570.0) / 60.0);
+    }
+    let r = smoothstep01((lambda - 570.0) / 60.0);
+    return rgb.x * r + rgb.y * g + rgb.z * b;
+}
+
+// The smoothstep ramp on [0, 1] (0 outside) — the shape of the albedo
+// reconstruction's ramps.
+fn smoothstep01(t: f32) -> f32 {
+    let c = clamp(t, 0.0, 1.0);
+    return c * c * (3.0 - 2.0 * c);
+}
+
+// Sellmeier's dispersion formula: n²(λ) = 1 + Σ Bᵢλ²/(λ² − Cᵢ), λ in µm.
+fn sellmeier_n(coeffs: array<f32, 6>, lambda_nm: f32) -> f32 {
+    let l = lambda_nm / 1000.0;
+    let l2 = l * l;
+    var n2 = 1.0;
+    // Unrolled: WGSL array indexing in a loop is fine, but the unroll
+    // keeps the constant-foldable zeros cheap.
+    n2 = n2 + coeffs[0] * l2 / (l2 - coeffs[3]);
+    n2 = n2 + coeffs[1] * l2 / (l2 - coeffs[4]);
+    n2 = n2 + coeffs[2] * l2 / (l2 - coeffs[5]);
+    return sqrt(n2);
+}
+
+// The refractive index of a glass vertex at the path's hero wavelength:
+// Sellmeier when the coefficients are set, the constant otherwise.
+fn glass_n(ior: f32, sellmeier: array<f32, 6>, lambda: f32) -> f32 {
+    if (sellmeier[0] != 0.0 || sellmeier[1] != 0.0 || sellmeier[2] != 0.0) {
+        return sellmeier_n(sellmeier, lambda);
+    }
+    return ior;
+}
+
+// Bit-exact f32 equality as a u32 compare: the values are exact line
+// wavelengths (650.0, 532.0 — whole floats, no arithmetic), so the bit
+// patterns are identical iff the values are. The NVIDIA 615.78.08
+// shader compiler crashes (SIGILL in libnvidia-gpucomp) on the plain
+// f32 `==` between a buffer-loaded value and a dynamic value in this
+// shader's context (the known `gc_driver_f32_compare_constant` bug
+// class); the integer compare avoids the broken path entirely.
+fn lambda_eq(a: f32, b: f32) -> bool {
+    return bitcast<u32>(a) == bitcast<u32>(b);
+}
+
+// The spectral radiance of a light at `lambda` under the drawn branch
+// (the branch rule): a line radiates its full power on its own line
+// branch, a smooth SPD its density on the smooth branch, everything
+// else is dark.
+fn light_eval(l: GpuLight, lambda: f32, line_branch: bool) -> f32 {
+    if (l.spectrum_kind == 1u) {
+        // A line: radiates only on its own line branch. Nested ifs,
+        // not `&&`: the NVIDIA 615.78.08 shader compiler crashes
+        // (SIGILL in libnvidia-gpucomp) on the vectorized
+        // bool-and-f32-compare pattern this used to form.
+        if (line_branch) {
+            if (lambda_eq(l.lambda, lambda)) { return l.power; }
+        }
+        return 0.0;
+    }
+    // A smooth SPD: radiates only on the smooth branch.
+    if (line_branch) { return 0.0; }
+    return dot(cmf(lambda), vec3<f32>(l.coeff_x, l.coeff_y, l.coeff_z));
+}
+
+// True when the light radiates at `lambda` under the drawn branch —
+// the branch rule as a set-membership test, used to pick the light
+// subpath's starting emitter among the *active* ones. The test is
+// *structural*, not sign-based: a smooth CMF-basis spectrum can
+// evaluate negative at some wavelengths (a legitimate part of the
+// response integral — dropping it would bias the estimator), so a
+// smooth spectrum is active on the whole smooth branch and a line only
+// on its own line branch.
+fn light_active(l: GpuLight, lambda: f32, line_branch: bool) -> bool {
+    // Structured exactly like light_eval: the lambda comparison feeds
+    // control flow (`if (...) return true`), never a returned bool
+    // value. The NVIDIA 615.78.08 shader compiler crashes (SIGILL in
+    // libnvidia-gpucomp, the gc_driver_f32_compare_constant bug class)
+    // when an f32 comparison against the dynamic hero wavelength is
+    // materialized as a value; consumed by a branch it compiles fine
+    // (light_eval has carried the same comparison all along).
+    if (l.spectrum_kind == 1u) {
+        if (line_branch) {
+            if (lambda_eq(l.lambda, lambda)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return !line_branch;
+}
+
+// The per-path wavelength sample: the hero wavelength, the sensor
+// weight 1/p(λ), and which branch of the emitter mixture was drawn.
+// Mirrors `spectrum::sample_wavelength` exactly (the mixture over the
+// emitters: pick one uniformly, then take its branch — a line's λ is
+// its own line, a smooth emitter's λ uniform over the visible range).
+struct WaveSample {
+    lambda: f32,
+    inv_pdf: f32,
+    line_branch: bool,
+};
+
+fn sample_wavelength(state: ptr<function, u32>) -> WaveSample {
+    let n = uniforms.n_lights;
+    if (n == 0u) {
+        return WaveSample(550.0, 1.0, false);
+    }
+    let pick = min(u32(f32(n) * pcg(state)), n - 1u);
+    let l = lights[pick];
+    if (l.spectrum_kind == 1u) {
+        // The line branch: the atom's mass is k₀/n (k₀ lines at this
+        // exact λ₀), so 1/p = n/k₀. Nested ifs, not `&&` (see
+        // light_eval — the NVIDIA 615.78.08 compiler bug).
+        var k = 0u;
+        for (var i = 0u; i < n; i = i + 1u) {
+            let li = lights[i];
+            if (li.spectrum_kind == 1u) {
+                if (lambda_eq(li.lambda, l.lambda)) { k = k + 1u; }
+            }
+        }
+        let kk = max(k, 1u);
+        return WaveSample(l.lambda, f32(n) / f32(kk), true);
+    }
+    // The smooth branch: λ uniform over the visible range; the
+    // continuous density is (n_smooth/n)/400, so 1/p = 400·n/n_smooth.
+    var n_smooth = 0u;
+    for (var i = 0u; i < n; i = i + 1u) {
+        if (lights[i].spectrum_kind == 0u) { n_smooth = n_smooth + 1u; }
+    }
+    let ns = max(n_smooth, 1u);
+    let lambda = LAMBDA_MIN + pcg(state) * (LAMBDA_MAX - LAMBDA_MIN);
+    return WaveSample(lambda, (LAMBDA_MAX - LAMBDA_MIN) * f32(n) / f32(ns), false);
+}
+
+// The per-sample firefly clamp bound at the drawn wavelength (paper
+// §9.2): 8× the brightest *active* emitter's direct-view sample
+// luminance at λ — the faithful generalization of the old
+// `8·max emission luminance`. The max is clamped at 0 (a smooth
+// CMF-basis spectrum can evaluate negative at some wavelengths; a
+// negative bound would disable the clamp). 0 when no active emitter
+// radiates positively (disabled).
+fn spectral_clamp_bound(wave: WaveSample) -> f32 {
+    // No light_active filter here: light_eval already returns 0 for
+    // inactive lights (the branch rule), and max(max_le, 0) is a no-op
+    // since max_le starts at 0 — the filter is redundant. Dropping it
+    // also keeps the loop body's dynamic-comparison count low: the
+    // NVIDIA 615.78.08 shader compiler crashes (SIGILL in
+    // libnvidia-gpucomp, the gc_driver_f32_compare_constant bug class)
+    // when a loop body carries enough dynamic bools for the vectorizer
+    // to pack them into an <8 x i4> (light_active + light_eval inlined
+    // together cross that threshold; light_eval alone does not).
+    var max_le = 0.0;
+    for (var i = 0u; i < uniforms.n_lights; i = i + 1u) {
+        let l = lights[i];
+        max_le = max(max_le, light_eval(l, wave.lambda, wave.line_branch));
+    }
+    if (max_le <= 0.0) { return 0.0; }
+    return uniforms.firefly_clamp * cmf(wave.lambda).y * max_le * wave.inv_pdf;
+}
 
 // --- Sampling ---
 
@@ -610,45 +956,137 @@ fn eta_factor(transport: u32, eta_i: f32, eta_t: f32) -> f32 {
 // One scattering event sampled from a BSDF. `normal` must be oriented
 // toward the side the ray arrives from (normal . dir_in < 0);
 // `front_face` says whether the geometric normal faces that side (for
-// glass: which medium is incident). Delta BSDFs sample
-// deterministically; their pdf_omega is 0 (the delta has no numeric
-// value — the MIS machinery replaces it symbolically).
+// glass: which medium is incident); `lambda` is the path's hero
+// wavelength (nm) — the albedo evaluates to ρ(λ) and dispersive glass
+// to n(λ). Delta BSDFs sample deterministically; their pdf_omega is 0
+// (the delta has no numeric value — the MIS machinery replaces it
+// symbolically).
 struct BsdfSample {
     dir_out: vec3<f32>,
     pdf_omega: f32,
-    // f . |cos| / pdf, the throughput multiplier of the event. For delta
+    // f . |cos| / pdf, the throughput multiplier of the event — a
+    // *spectral* scalar at the path's hero wavelength. For delta
     // BSDFs the delta cancels and this is the deterministic specular
     // weight; the Fresnel probability cancels against the BSDF value.
-    weight: vec3<f32>,
+    weight: f32,
 };
 
-fn bsdf_sample(albedo: vec3<f32>, mat_type: u32, ior: f32, normal: vec3<f32>,
-               front_face: bool, dir_in: vec3<f32>, transport: u32,
+fn bsdf_sample(albedo: vec3<f32>, mat_type: u32, ior: f32,
+               sellmeier: array<f32, 6>, rough: f32, f0: f32,
+               normal: vec3<f32>, front_face: bool, dir_in: vec3<f32>,
+               transport: u32, lambda: f32,
                state: ptr<function, u32>) -> BsdfSample {
+    let rho = rgb_to_albedo(albedo, lambda);
     if (mat_type == MAT_MIRROR) {
-        return BsdfSample(reflect_dir(dir_in, normal), 0.0, albedo);
+        return BsdfSample(reflect_dir(dir_in, normal), 0.0, rho);
     }
     if (mat_type == MAT_GLASS) {
-        let eta_i = select(ior, 1.0, front_face);
-        let eta_t = select(1.0, ior, front_face);
+        let n = glass_n(ior, sellmeier, lambda);
+        let eta_i = select(n, 1.0, front_face);
+        let eta_t = select(1.0, n, front_face);
         let cos_i = -dot(normal, dir_in);
         let f = fresnel_dielectric(cos_i, eta_i, eta_t);
         if (pcg(state) < f) {
             // Reflection. The Fresnel reflectance is both the discrete
             // choice probability and the BSDF value, so it cancels out
             // of the weight.
-            return BsdfSample(reflect_dir(dir_in, normal), 0.0, albedo);
+            return BsdfSample(reflect_dir(dir_in, normal), 0.0, rho);
         }
         // Refraction (total internal reflection cannot reach this
         // branch: it gives f = 1, so the roll reflects); the fallback
         // mirrors the CPU's defensive unwrap_or_else.
         let refr = refract_dir(dir_in, normal, eta_i, eta_t);
         let dir_out = select(reflect_dir(dir_in, normal), refr.dir, refr.valid);
-        return BsdfSample(dir_out, 0.0, albedo * eta_factor(transport, eta_i, eta_t));
+        return BsdfSample(dir_out, 0.0, rho * eta_factor(transport, eta_i, eta_t));
+    }
+    if (mat_type == MAT_GLOSSY) {
+        // The GGX microfacet lobe (paper §9.5): sample a half-vector
+        // from the NDF, reflect about it. A below-horizon draw is
+        // possible at high roughness and carries no light (weight 0,
+        // never infinite).
+        let h = ggx_sample_half_vector(rough, normal, state);
+        let dir_out = dir_in - h * (2.0 * dot(dir_in, h));
+        let e = ggx_eval_pdf(rough, f0, rho, normal, dir_in, dir_out);
+        var weight = 0.0;
+        if (e.pdf > 0.0) {
+            weight = e.f * dot(normal, dir_out) / e.pdf;
+        }
+        return BsdfSample(dir_out, e.pdf, weight);
     }
     // Diffuse (and emissive, which never scatters — unreachable here).
     let dir_out = cosine_hemisphere(normal, state);
-    return BsdfSample(dir_out, dot(dir_out, normal) / PI, albedo);
+    return BsdfSample(dir_out, dot(dir_out, normal) / PI, rho);
+}
+
+// --- GGX microfacet BSDF (paper §9.5) ---
+//
+// The "rough mirror": a GGX lobe replaces the perfect mirror's delta.
+// The convention matches the rest of the shader — `dir_in` is the
+// *travel* direction (normal . dir_in < 0), `normal` orients the
+// hemisphere — so the microfacet half-vector is
+// h = normalize(−dir_in + dir_out) and the reflection about it is
+// dir_out = dir_in − 2(dir_in·h)h.
+
+// The GGX normal distribution D(h) for roughness `alpha` and
+// cos θ_h = normal·h.
+fn ggx_d(alpha: f32, cos_h: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let d = cos_h * cos_h * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
+}
+
+// The Smith GGX masking term G1 (Walter et al. 2007, eq. 99).
+fn ggx_g1(alpha: f32, cos_v: f32) -> f32 {
+    let c = clamp(cos_v, 1e-6, 1.0);
+    let a2 = alpha * alpha;
+    return 2.0 * c / (c + sqrt(a2 + c * c * (1.0 - a2)));
+}
+
+// Schlick's Fresnel approximation from the normal-incidence
+// reflectance `f0`.
+fn schlick_f(f0: f32, cos: f32) -> f32 {
+    let c = clamp(cos, 0.0, 1.0);
+    return f0 + (1.0 - f0) * pow(1.0 - c, 5.0);
+}
+
+// Sample a GGX half-vector around `normal` for roughness `alpha`
+// (the standard NDF inversion).
+fn ggx_sample_half_vector(alpha: f32, normal: vec3<f32>, state: ptr<function, u32>) -> vec3<f32> {
+    let u = clamp(pcg(state), 1e-6, 1.0 - 1e-6);
+    let v = pcg(state);
+    let a2 = alpha * alpha;
+    let cos_h = sqrt((1.0 - u) / (1.0 + (a2 - 1.0) * u));
+    let sin_h = sqrt(max(0.0, 1.0 - cos_h * cos_h));
+    let phi = 2.0 * PI * v;
+    let a = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) > 0.9);
+    let t = normalize3(cross(a, normal));
+    let b = cross(normal, t);
+    return t * (sin_h * cos(phi)) + b * (sin_h * sin(phi)) + normal * cos_h;
+}
+
+// The GGX microfacet BSDF value f (no cosine) and its NDF-sampling pdf
+// for the direction pair, at spectral reflectance `rho`.
+struct GgxEval {
+    f: f32,
+    pdf: f32,
+};
+
+fn ggx_eval_pdf(alpha: f32, f0: f32, rho: f32, normal: vec3<f32>,
+                dir_in: vec3<f32>, dir_out: vec3<f32>) -> GgxEval {
+    let cos_i = -dot(normal, dir_in);
+    let cos_o = dot(normal, dir_out);
+    if (cos_i <= 0.0 || cos_o <= 0.0) { return GgxEval(0.0, 0.0); }
+    let h = normalize3(dir_out - dir_in);
+    let cos_h = dot(normal, h);
+    if (cos_h <= 0.0) { return GgxEval(0.0, 0.0); }
+    let v_dot_h = -dot(dir_in, h); // ω_i·h, positive on a reflection pair
+    if (v_dot_h <= 0.0) { return GgxEval(0.0, 0.0); }
+    let d = ggx_d(alpha, cos_h);
+    let g = ggx_g1(alpha, cos_i) * ggx_g1(alpha, cos_o);
+    let f = schlick_f(f0, v_dot_h);
+    let bsdf = rho * d * g * f / (4.0 * cos_i * cos_o);
+    let pdf = d * cos_h / (4.0 * v_dot_h);
+    return GgxEval(bsdf, pdf);
 }
 
 // --- Specular bridges (the eye walk's diffuse sampling mixture) ---
@@ -755,7 +1193,8 @@ fn mixture_pdf(p: vec3<f32>, normal: vec3<f32>, dir_in: vec3<f32>, dir_out: vec3
 // f·cos/pdf under that density, so the estimator stays unbiased for
 // every direction the mixture can propose.
 fn sample_diffuse_mixture(albedo: vec3<f32>, p: vec3<f32>, normal: vec3<f32>,
-                          dir_in: vec3<f32>, state: ptr<function, u32>) -> BsdfSample {
+                          dir_in: vec3<f32>, lambda: f32,
+                          state: ptr<function, u32>) -> BsdfSample {
     let n_qual = qualifying_bridge_count(p, normal);
     var dir_out = cosine_hemisphere(normal, state);
     if (n_qual > 0u && pcg(state) < BRIDGE_PROB) {
@@ -792,68 +1231,83 @@ fn sample_diffuse_mixture(albedo: vec3<f32>, p: vec3<f32>, normal: vec3<f32>,
     // sample carries no light — the weight must be 0, not
     // albedo·cos/(π·0) = ±inf. (Unbiased: those directions contribute
     // nothing to the integral; the draw is merely wasted.)
-    var weight = vec3<f32>(0.0);
+    var weight = 0.0;
     if (pdf > 0.0) {
-        weight = albedo * dot(normal, dir_out) / (PI * pdf);
+        weight = rgb_to_albedo(albedo, lambda) * dot(normal, dir_out) / (PI * pdf);
     }
     return BsdfSample(dir_out, pdf, weight);
 }
 
 // f (the raw BSDF, no cosine) and the solid-angle pdf of `dir_out`
 // under the BSDF's sampling distribution, for an arbitrary direction
-// pair. Delta BSDFs return (0, 0) — exactly what invalidates
-// connections through them. Emissive materials carry a diffuse BSDF
-// with albedo 0 (same as the CPU), so they fall into the same branch.
+// pair at wavelength `lambda`. Delta BSDFs return (0, 0) — exactly what
+// invalidates connections through them. Glossy (§9.5) is *not* delta:
+// its lobe evaluates nonzero, which is what makes connections through
+// it valid. Emissive materials carry a diffuse BSDF with albedo 0
+// (same as the CPU), so they fall into the same branch.
 struct BsdfEval {
-    f: vec3<f32>,
+    f: f32,
     pdf: f32,
 };
 
-fn eval_bsdf(albedo: vec3<f32>, mat_type: u32, normal: vec3<f32>,
-             dir_in: vec3<f32>, dir_out: vec3<f32>) -> BsdfEval {
+fn eval_bsdf(albedo: vec3<f32>, mat_type: u32, rough: f32, f0: f32,
+             normal: vec3<f32>, dir_in: vec3<f32>, dir_out: vec3<f32>,
+             lambda: f32) -> BsdfEval {
     if (is_delta_type(mat_type)) {
-        return BsdfEval(vec3<f32>(0.0), 0.0);
+        return BsdfEval(0.0, 0.0);
+    }
+    if (mat_type == MAT_GLOSSY) {
+        let e = ggx_eval_pdf(rough, f0, rgb_to_albedo(albedo, lambda), normal, dir_in, dir_out);
+        return BsdfEval(e.f, e.pdf);
     }
     let cos_i = -dot(normal, dir_in);
     let cos_o = dot(normal, dir_out);
     if (cos_i > 0.0 && cos_o > 0.0) {
-        return BsdfEval(albedo * (1.0 / PI), cos_o / PI);
+        return BsdfEval(rgb_to_albedo(albedo, lambda) * (1.0 / PI), cos_o / PI);
     }
-    return BsdfEval(vec3<f32>(0.0), 0.0);
+    return BsdfEval(0.0, 0.0);
 }
 
 // The deterministic sample weight of a SPECULAR direction pair at a
 // delta BSDF — needed for hypothetical path extensions, where the rolls
 // never happened but the path geometry fixes the directions. valid =
 // false if the pair is not the specular pair. `normal`/`front_face`
-// describe the event being weighted.
+// describe the event being weighted; `lambda` evaluates dispersive
+// glass (the hypothetical extension uses the same hero wavelength as
+// the realized walk — λ is fixed per path).
 struct SpecularWeight {
-    weight: vec3<f32>,
+    weight: f32,
     valid: bool,
 };
 
-fn specular_weight(albedo: vec3<f32>, mat_type: u32, ior: f32, normal: vec3<f32>,
+fn specular_weight(albedo: vec3<f32>, mat_type: u32, ior: f32,
+                   sellmeier: array<f32, 6>, normal: vec3<f32>,
                    front_face: bool, dir_in: vec3<f32>, dir_out: vec3<f32>,
-                   transport: u32) -> SpecularWeight {
+                   transport: u32, lambda: f32) -> SpecularWeight {
+    let rho = rgb_to_albedo(albedo, lambda);
     if (mat_type == MAT_MIRROR) {
         if (dot(reflect_dir(dir_in, normal), dir_out) > SPEC_DOT_EPS) {
-            return SpecularWeight(albedo, true);
+            return SpecularWeight(rho, true);
         }
-        return SpecularWeight(vec3<f32>(0.0), false);
+        return SpecularWeight(0.0, false);
     }
     if (mat_type == MAT_GLASS) {
-        let eta_i = select(ior, 1.0, front_face);
-        let eta_t = select(1.0, ior, front_face);
+        let n = glass_n(ior, sellmeier, lambda);
+        let eta_i = select(n, 1.0, front_face);
+        let eta_t = select(1.0, n, front_face);
         if (dot(reflect_dir(dir_in, normal), dir_out) > SPEC_DOT_EPS) {
-            return SpecularWeight(albedo, true);
+            return SpecularWeight(rho, true);
         }
         let refr = refract_dir(dir_in, normal, eta_i, eta_t);
         if (refr.valid && dot(refr.dir, dir_out) > SPEC_DOT_EPS) {
-            return SpecularWeight(albedo * eta_factor(transport, eta_i, eta_t), true);
+            return SpecularWeight(rho * eta_factor(transport, eta_i, eta_t), true);
         }
-        return SpecularWeight(vec3<f32>(0.0), false);
+        return SpecularWeight(0.0, false);
     }
-    return SpecularWeight(vec3<f32>(0.0), false);
+    // Glossy has no specular pair (its density is continuous — the MIS
+    // machinery uses `eval_bsdf` for it instead); pure emitters never
+    // scatter.
+    return SpecularWeight(0.0, false);
 }
 
 // --- PathView helpers (the WGSL shape of bdpt.rs's PathView methods) ---
@@ -921,14 +1375,16 @@ fn pv_event_pdf(eye: ptr<function, array<PathVertex, 8>>,
     let d_out = pv_dir(eye, light_path, view, m, to);
     let o = pv_oriented(eye, light_path, view, m, d_in);
     if (is_delta_type(v.mat_type)) {
-        let sw = specular_weight(v.albedo, v.mat_type, v.ior, o.normal, o.front_face,
-                                 d_in, d_out, TRANSPORT_RADIANCE);
+        let sw = specular_weight(v.albedo, v.mat_type, v.ior, v.sellmeier, o.normal,
+                                 o.front_face, d_in, d_out, TRANSPORT_RADIANCE,
+                                 view.lambda);
         return select(0.0, 1.0, sw.valid);
     }
     if (walk == WALK_EYE && v.mat_type == MAT_DIFFUSE) {
         return mixture_pdf(v.p, o.normal, d_in, d_out);
     }
-    return eval_bsdf(v.albedo, v.mat_type, o.normal, d_in, d_out).pdf;
+    return eval_bsdf(v.albedo, v.mat_type, v.rough, v.f0, o.normal, d_in, d_out,
+                     view.lambda).pdf;
 }
 
 // The sample weight (f.|cos|/pdf) of the scattering event at position m
@@ -939,25 +1395,26 @@ fn pv_event_pdf(eye: ptr<function, array<PathVertex, 8>>,
 fn pv_event_weight(eye: ptr<function, array<PathVertex, 8>>,
                    light_path: ptr<function, array<PathVertex, 8>>,
                    view: PathView, m: u32, arrival: u32, to: u32,
-                   transport: u32, walk: u32) -> vec3<f32> {
+                   transport: u32, walk: u32) -> f32 {
     let v = pv_vertex(eye, light_path, view, m);
     let d_in = pv_dir(eye, light_path, view, arrival, m);
     let d_out = pv_dir(eye, light_path, view, m, to);
     let o = pv_oriented(eye, light_path, view, m, d_in);
     if (is_delta_type(v.mat_type)) {
-        let sw = specular_weight(v.albedo, v.mat_type, v.ior, o.normal, o.front_face,
-                                 d_in, d_out, transport);
-        return select(vec3<f32>(0.0), sw.weight, sw.valid);
+        let sw = specular_weight(v.albedo, v.mat_type, v.ior, v.sellmeier, o.normal,
+                                 o.front_face, d_in, d_out, transport, view.lambda);
+        return select(0.0, sw.weight, sw.valid);
     }
     if (walk == WALK_EYE && v.mat_type == MAT_DIFFUSE) {
         let pdf = mixture_pdf(v.p, o.normal, d_in, d_out);
-        if (pdf <= 0.0) { return vec3<f32>(0.0); }
-        // f·cos/pdf with f = albedo/π (the diffuse BSDF); only the
+        if (pdf <= 0.0) { return 0.0; }
+        // f·cos/pdf with f = ρ(λ)/π (the diffuse BSDF); only the
         // sampling distribution changed, not the BSDF.
-        return v.albedo * (1.0 / PI) * (dot(o.normal, d_out) / pdf);
+        return rgb_to_albedo(v.albedo, view.lambda) * (1.0 / PI) * (dot(o.normal, d_out) / pdf);
     }
-    let e = eval_bsdf(v.albedo, v.mat_type, o.normal, d_in, d_out);
-    if (e.pdf <= 0.0) { return vec3<f32>(0.0); }
+    let e = eval_bsdf(v.albedo, v.mat_type, v.rough, v.f0, o.normal, d_in, d_out,
+                      view.lambda);
+    if (e.pdf <= 0.0) { return 0.0; }
     return e.f * (dot(o.normal, d_out) / e.pdf);
 }
 
@@ -1141,11 +1598,12 @@ fn mis_weight(eye: ptr<function, array<PathVertex, 8>>,
 // --- Russian roulette ---
 
 // Survival probability for extending a subpath whose post-scatter
-// throughput is `beta`, on extension number `ext` (1-based: the
-// extension x_l -> x_{l+1} is number l, y_j -> y_{j+1} is number j+1).
-fn rr_survival(beta: vec3<f32>, ext: u32) -> f32 {
+// throughput is `beta` (a spectral scalar at the hero wavelength), on
+// extension number `ext` (1-based: the extension x_l -> x_{l+1} is
+// number l, y_j -> y_{j+1} is number j+1).
+fn rr_survival(beta: f32, ext: u32) -> f32 {
     if (ext < RR_START) { return 1.0; }
-    return clamp(max(beta.x, max(beta.y, beta.z)), RR_MIN, 1.0);
+    return clamp(beta, RR_MIN, 1.0);
 }
 
 // Compute the Russian-roulette prefix products the MIS weights need:
@@ -1169,7 +1627,7 @@ fn rr_survival(beta: vec3<f32>, ext: u32) -> f32 {
 // the emitter hit.
 fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
                       light_path: ptr<function, array<PathVertex, 8>>,
-                      view: PathView, alpha_light0: vec3<f32>,
+                      view: PathView, alpha_light0: f32,
                       qe: ptr<function, array<f32, 9>>,
                       ql: ptr<function, array<f32, 9>>) {
     let k = view.k;
@@ -1177,7 +1635,7 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
     // Eye-side sweep: the roll at x_l governs the extension to x_{l+1},
     // whose factor is the sample weight of the event at x_l toward
     // x_{l+1}. The eye subpath carries radiance.
-    var alpha = vec3<f32>(1.0);
+    var alpha = 1.0;
     (*qe)[1u] = 1.0;
     for (var l = 1u; l < k; l = l + 1u) {
         let factor = pv_event_weight(eye, light_path, view, l, l - 1u, l + 1u,
@@ -1197,7 +1655,7 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
     var alpha_l = alpha_light0;
     (*ql)[0u] = 1.0;
     for (var j = 0u; j < k - min(k, 2u); j = j + 1u) {
-        var factor: vec3<f32>;
+        var factor: f32;
         if (j == 0u) {
             // The emitter event at x_k = y_0, scattering toward x_{k-1}.
             let v = pv_vertex(eye, light_path, view, k);
@@ -1206,13 +1664,12 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
             if (v.mat_type == MAT_LASER) {
                 let cos_theta = v.ior;
                 if (cos0 >= cos_theta) {
-                    let f = cos0 * 2.0 * PI * (1.0 - cos_theta);
-                    factor = vec3<f32>(f);
+                    factor = cos0 * 2.0 * PI * (1.0 - cos_theta);
                 } else {
-                    factor = vec3<f32>(0.0);
+                    factor = 0.0;
                 }
             } else {
-                factor = vec3<f32>(PI);
+                factor = PI;
             }
         } else {
             factor = pv_event_weight(eye, light_path, view, k - j, k - j + 1u, k - j - 1u,
@@ -1306,19 +1763,56 @@ fn light_normal(l: GpuLight, p: vec3<f32>) -> vec3<f32> {
 
 fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u32>) -> vec3<f32> {
     let max_depth = min(uniforms.max_depth, MAX_PATH_VERTICES);
-    var total = vec3<f32>(0.0);
+
+    // ---- The hero wavelength (paper §9.2) ----
+    // Sampled once per path from the mixture over the emitters, before
+    // the eye walk (glass refraction directions depend on n(λ)). The
+    // light subpath below starts on an *active* emitter — one that
+    // radiates at this λ — and every strategy in this trace uses the
+    // same active count, so the pick pdf and the MIS machinery's
+    // inv_light_pdf = n_active·A stay consistent.
+    let wave = sample_wavelength(state);
+    let lambda = wave.lambda;
+    // The active lights: those that radiate at the drawn λ (the branch
+    // rule — see the header comment).
+    var n_active = 0u;
+    for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
+        if (light_active(lights[li], lambda, wave.line_branch)) { n_active = n_active + 1u; }
+    }
+    // The per-sample clamp bound at this λ (0 = disabled).
+    let clamp_bound = spectral_clamp_bound(wave);
+
+    var total = 0.0;
 
     // ---- Eye subpath: x_1 .. x_s ----
     var eye: array<PathVertex, 8>;
     var eye_len = 0u;
-    var throughput = vec3<f32>(1.0);
+    var throughput = 1.0;
     var cur_origin = ray_origin;
     var cur_dir = ray_dir;
 
     for (var bounce = 0u; bounce < max_depth; bounce = bounce + 1u) {
         let hit = intersect_scene(cur_origin, cur_dir);
         if (!has_hit(hit)) {
-            if (eye_len == 0u) { return BACKGROUND; }
+            if (eye_len == 0u) {
+                // The background is a smooth (incoherent) spectrum: it
+                // radiates only on the smooth branch. Its spectral
+                // radiance at λ is the CMF-basis SPD value of the RGB
+                // intent; the 1/p(λ) sensor weighting is applied at the
+                // conversion below.
+                var bg = 0.0;
+                if (!wave.line_branch) {
+                    // The CMF-basis coefficients of the background's
+                    // intent, evaluated at λ. The coefficients are
+                    // G⁻¹·XYZ(BACKGROUND); the CPU computes them once —
+                    // here they are inlined as constants (the same
+                    // values spectrum.rs's background_coeffs produces,
+                    // pinned by a test).
+                    let coeffs = vec3<f32>(5.4379e-5, 2.1023e-4, 3.3559e-4);
+                    bg = dot(cmf(lambda), coeffs);
+                }
+                return clamp_sample(sensor_rgb(lambda, bg, wave.inv_pdf), clamp_bound);
+            }
             break;
         }
         // Orient the normal toward the side the ray arrived from.
@@ -1332,8 +1826,9 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         // MAT_LASER is an emitter too (a laser aperture): the walk stops
         // there, exactly like MAT_EMISSIVE.
         let on_light = hit.mat_type == MAT_EMISSIVE || hit.mat_type == MAT_LASER;
-        eye[eye_len] = PathVertex(hit.p, normal, front_face, hit.albedo, hit.emission,
-                                  hit.mat_type, hit.ior, throughput, on_light);
+        eye[eye_len] = PathVertex(hit.p, normal, front_face, hit.albedo,
+                                  hit.mat_type, hit.ior, hit.sellmeier, hit.rough,
+                                  hit.f0, throughput, on_light);
         eye_len = eye_len + 1u;
         if (on_light) { break; }
         // Sample the BSDF, then roll the roulette on the post-scatter
@@ -1344,10 +1839,11 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         // BRIDGE_PROB it aims at a laser aperture's mirror image, so
         // the beam's path camera → wall → mirror → aperture is carried
         // by ordinary subpath walking.
-        var s = bsdf_sample(hit.albedo, hit.mat_type, hit.ior, normal, front_face,
-                            cur_dir, TRANSPORT_RADIANCE, state);
+        var s = bsdf_sample(hit.albedo, hit.mat_type, hit.ior, hit.sellmeier,
+                            hit.rough, hit.f0, normal, front_face,
+                            cur_dir, TRANSPORT_RADIANCE, lambda, state);
         if (hit.mat_type == MAT_DIFFUSE) {
-            s = sample_diffuse_mixture(hit.albedo, hit.p, normal, cur_dir, state);
+            s = sample_diffuse_mixture(hit.albedo, hit.p, normal, cur_dir, lambda, state);
         }
         let beta = throughput * s.weight;
         let q = rr_survival(beta, eye_len);
@@ -1362,13 +1858,25 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
     }
 
     // ---- Light subpath: y_0 .. y_t ----
+    // Starts on an *active* emitter (one that radiates at the drawn λ):
+    // the pick pdf is 1/n_active and the MIS machinery's inv_light_pdf
+    // is n_active·A — consistent for every strategy in this trace.
     var light_path: array<PathVertex, 8>;
     var light_len = 0u;
     var inv_light_pdf = 0.0;
-    if (uniforms.n_lights > 0u) {
-        let pick = u32(f32(uniforms.n_lights) * pcg(state));
-        let light = lights[min(pick, uniforms.n_lights - 1u)];
-        inv_light_pdf = f32(uniforms.n_lights) * light_area(light);
+    if (n_active > 0u) {
+        // Pick uniformly among the active lights.
+        let pick = min(u32(f32(n_active) * pcg(state)), n_active - 1u);
+        var light = lights[0];
+        var seen = 0u;
+        for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
+            let l = lights[li];
+            if (light_active(l, lambda, wave.line_branch)) {
+                if (seen == pick) { light = l; }
+                seen = seen + 1u;
+            }
+        }
+        inv_light_pdf = f32(n_active) * light_area(light);
         let p0 = sample_light(light, state);
         let n0 = light_normal(light, p0);
         // The direction the subpath leaves the aperture in: uniform in
@@ -1392,13 +1900,18 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                 edge_factor = 0.0;
             }
         }
-        var ltp = light.emission * inv_light_pdf;
+        // The spectral radiance at the drawn λ (the branch rule gates
+        // it: only the active emitters radiate, and the pick above
+        // already filtered on exactly that).
+        let le = light_eval(light, lambda, wave.line_branch);
+        var ltp = le * inv_light_pdf;
         // The y_0 vertex material carries the emission cone so the MIS
         // pdf machinery (pv_pdf_light at m = k) can see it.
         let y0_mat = select(MAT_EMISSIVE, MAT_LASER, is_laser);
         let y0_ior = select(1.0, cos(light.half_w), is_laser);
-        light_path[0] = PathVertex(p0, n0, true, vec3<f32>(0.0), light.emission,
-                                   y0_mat, y0_ior, ltp, true);
+        light_path[0] = PathVertex(p0, n0, true, vec3<f32>(0.0),
+                                   y0_mat, y0_ior, array<f32, 6>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                                   0.0, 0.0, ltp, true);
         light_len = 1u;
 
         if (edge_factor > 0.0) {
@@ -1418,15 +1931,16 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                 if (!front_face && !is_delta_type(hit.mat_type)) { break; }
                 let normal = select(hit.normal * -1.0, hit.normal, front_face);
                 light_path[light_len] = PathVertex(hit.p, normal, front_face, hit.albedo,
-                                                   hit.emission, hit.mat_type, hit.ior,
-                                                   ltp, false);
+                                                   hit.mat_type, hit.ior, hit.sellmeier,
+                                                   hit.rough, hit.f0, ltp, false);
                 light_len = light_len + 1u;
                 // Russian roulette for the extension y_j -> y_{j+1}
                 // (j = light_len - 1u >= 1, number j + 1). Surviving divides
                 // ltp by q, which also applies the factor for the next vertex.
                 let j = light_len - 1u;
-                let s = bsdf_sample(hit.albedo, hit.mat_type, hit.ior, normal, front_face,
-                                   cur_dir, TRANSPORT_IMPORTANCE, state);
+                let s = bsdf_sample(hit.albedo, hit.mat_type, hit.ior, hit.sellmeier,
+                                    hit.rough, hit.f0, normal, front_face,
+                                    cur_dir, TRANSPORT_IMPORTANCE, lambda, state);
                 let beta = ltp * s.weight;
                 let q = rr_survival(beta, j + 1u);
                 if (q < 1.0 && pcg(state) >= q) { break; }
@@ -1445,11 +1959,12 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         // Default 0: a hit on emissive geometry that is no sampleable
         // light surface (the dark curved side of the laser's aperture
         // puck) carries no emission. A found light overwrites this.
-        var w = 0.0;
+        var contribution = 0.0;
         if (uniforms.n_lights > 0u) {
             var found = false;
             for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
-                if (!found && light_contains(lights[li], last.p)) {
+                let l = lights[li];
+                if (!found && light_contains(l, last.p)) {
                     found = true;
                     // A laser aperture radiates only into its cone: a hit
                     // outside the beam (the dark side of the housing, or
@@ -1469,25 +1984,32 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                         let cos_theta = last.ior;
                         in_beam = dot(last.normal, d_in * -1.0) >= cos_theta;
                     }
+                    // The branch rule: only an emitter active at the
+                    // drawn λ radiates. Nested ifs, not `&&` (see
+                    // light_eval — the NVIDIA 615.78.08 compiler bug).
+                    let active_here = light_active(l, lambda, wave.line_branch);
                     if (in_beam) {
-                        let inv_pdf = f32(uniforms.n_lights) * light_area(lights[li]);
-                        let view = PathView(k, k, inv_pdf, ray_dir);
-                        var qe = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-                        var ql = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-                        // The hypothetical light subpath of the other
-                        // strategies starts at this hit point with the
-                        // emitter's throughput (emission * n * A, the
-                        // inverse light-sampling pdf).
-                        rr_prefix_products(&eye, &light_path, view,
-                                           lights[li].emission * inv_pdf, &qe, &ql);
-                        w = mis_weight(&eye, &light_path, view, &qe, &ql, k);
-                    } else {
-                        w = 0.0;
+                        if (active_here) {
+                            let inv_pdf = f32(n_active) * light_area(l);
+                            let view = PathView(k, k, inv_pdf, ray_dir, lambda);
+                            var qe = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                            var ql = array<f32, 9>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                            // The hypothetical light subpath of the other
+                            // strategies starts at this hit point with the
+                            // emitter's throughput (emission(λ) * n * A, the
+                            // inverse light-sampling pdf).
+                            rr_prefix_products(&eye, &light_path, view,
+                                               light_eval(l, lambda, wave.line_branch) * inv_pdf,
+                                               &qe, &ql);
+                            let w = mis_weight(&eye, &light_path, view, &qe, &ql, k);
+                            contribution = last.throughput
+                                * light_eval(l, lambda, wave.line_branch) * w;
+                        }
                     }
                 }
             }
         }
-        total += last.throughput * last.emission * w;
+        total += contribution;
     }
 
     // ---- Connection strategies: eye vertex x_{i+1} to light vertex y_j ----
@@ -1497,11 +2019,13 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
             let k = i + j + 2u; // vertices after the camera
             if (k > max_depth) { break; }
             // Delta BSDFs cannot be connection endpoints: their eval is
-            // 0, so the contribution would be 0 anyway.
+            // 0, so the contribution would be 0 anyway. (Glossy
+            // vertices are *not* delta — §9.5 — so connections through
+            // them are valid and carried by the generic eval path.)
             if (is_delta_type(eye[i].mat_type) || is_delta_type(light_path[j].mat_type)) {
                 continue;
             }
-            let view = PathView(k, i + 1u, inv_light_pdf, ray_dir);
+            let view = PathView(k, i + 1u, inv_light_pdf, ray_dir, lambda);
 
             // Contribution: alpha_eye * f(x) * G * f(y) * alpha_light.
             // The path arrives at x_{i+1} from x_i (the camera for i = 0)
@@ -1512,9 +2036,9 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                 d_in_eye = pv_dir(&eye, &light_path, view, i, i + 1u);
             }
             let o_eye = pv_oriented(&eye, &light_path, view, i + 1u, d_in_eye);
-            let e_eye = eval_bsdf(eye[i].albedo, eye[i].mat_type, o_eye.normal,
-                                  d_in_eye, d_conn);
-            var f_light = vec3<f32>(1.0);
+            let e_eye = eval_bsdf(eye[i].albedo, eye[i].mat_type, eye[i].rough, eye[i].f0,
+                                  o_eye.normal, d_in_eye, d_conn, lambda);
+            var f_light = 1.0;
             var n_light_end = light_path[j].normal;
             if (j == 0u) {
                 // y_0 is the emitter itself: no BSDF applies there — but
@@ -1528,7 +2052,7 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                 if (y0.mat_type == MAT_LASER) {
                     let cos_theta = y0.ior;
                     if (dot(y0.normal, d_conn * -1.0) < cos_theta) {
-                        f_light = vec3<f32>(0.0);
+                        f_light = 0.0;
                     }
                 }
             }
@@ -1537,11 +2061,12 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                 let d_out_light = pv_dir(&eye, &light_path, view, i + 2u, i + 3u);
                 let o_light = pv_oriented(&eye, &light_path, view, i + 2u, d_in_light);
                 f_light = eval_bsdf(light_path[j].albedo, light_path[j].mat_type,
-                                   o_light.normal, d_in_light, d_out_light).f;
+                                    light_path[j].rough, light_path[j].f0,
+                                    o_light.normal, d_in_light, d_out_light, lambda).f;
                 n_light_end = o_light.normal;
             }
             let g_conn = g_term(eye[i].p, o_eye.normal, light_path[j].p, n_light_end);
-            if (g_conn <= 0.0 || all(e_eye.f == vec3<f32>(0.0)) || all(f_light == vec3<f32>(0.0))) {
+            if (g_conn <= 0.0 || e_eye.f == 0.0 || f_light == 0.0) {
                 continue;
             }
             if (!visible(eye[i].p, o_eye.normal, light_path[j].p)) { continue; }
@@ -1556,7 +2081,12 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         }
     }
 
-    return total;
+    // ---- The sensor conversion (paper §9.2) ----
+    // The spectral estimate at the hero wavelength, weighted by 1/p(λ)
+    // and converted to linear sRGB through the CIE CMFs. Out-of-gamut
+    // samples (a pure 532 nm green) carry negative channels by design;
+    // the display stage gamut-maps them.
+    return clamp_sample(sensor_rgb(lambda, total, wave.inv_pdf), clamp_bound);
 }
 
 // --- Firefly rejection ---
@@ -1579,14 +2109,14 @@ fn luminance(c: vec3<f32>) -> f32 {
 }
 
 // Clamp one sample's luminance to `bound`, preserving its chroma.
-// `bound` comes from the `firefly_clamp` uniform, computed on the CPU
-// (src/bdpt.rs::firefly_clamp_bound) as a loose multiple of the
-// brightest emitter's luminance — loose because a rare legitimate
-// caustic sample is per-sample indistinguishable from a firefly (both
-// are huge relative to the pixel mean; the caustic's estimator is a
-// rare-event one), so only the physically implausible tail is clamped
-// here and the mean-aware temporal rejection handles the rest.
-// 0 disables the clamp.
+// `bound` is the *spectral* clamp bound at the drawn hero wavelength
+// (see spectral_clamp_bound): a loose multiple of the brightest active
+// emitter's direct-view sample luminance at λ — loose because a rare
+// legitimate caustic sample is per-sample indistinguishable from a
+// firefly (both are huge relative to the pixel mean; the caustic's
+// estimator is a rare-event one), so only the physically implausible
+// tail is clamped here and the mean-aware temporal rejection handles
+// the rest. 0 disables the clamp.
 fn clamp_sample(c: vec3<f32>, bound: f32) -> vec3<f32> {
     if (bound <= 0.0) { return c; }
     let lum = luminance(c);
@@ -1626,8 +2156,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let px = (u * 2.0 - 1.0) * uniforms.fov_h;
         let py = -(v * 2.0 - 1.0) * uniforms.fov_v;
         let dir = normalize3(uniforms.cam_right * px + uniforms.cam_up * py + uniforms.cam_forward);
-        color += clamp_sample(bdpt_trace(uniforms.cam_origin, dir, &state),
-                              uniforms.firefly_clamp);
+        // The per-sample firefly clamp is applied *inside* bdpt_trace,
+        // at the drawn hero wavelength (the bound is a spectral
+        // quantity — paper §9.2 — computed per-λ from the active
+        // emitters' spectra and the λ sample; see spectral_clamp_bound).
+        color += bdpt_trace(uniforms.cam_origin, dir, &state);
     }
     color = color / f32(uniforms.spp);
 

@@ -10,6 +10,7 @@ use crate::geometry::{
     Material, Plane, Quad, Ray, Sphere,
 };
 use crate::math::{EPS_NEAR, Vec3};
+use crate::spectrum::{SpectrumKind, BK7};
 
 /// The laser housing's material: a normal diffuse surface, so the
 /// cylinder shades like any other object in the scene (the laser
@@ -34,12 +35,14 @@ const LASER_PUCK_FRACTION: f32 = 0.1;
 /// not spin forever; 8 matches the path tracer's vertex budget.
 pub const MAX_BEAM_BOUNCES: usize = 8;
 
-/// A surface material in flat, GPU-friendly form. `emission != 0` marks a
-/// pure emitter: the BSDF is ignored and the surface does not scatter.
+/// A surface material in flat, GPU-friendly form. `spectrum != None`
+/// marks a pure emitter: the BSDF is ignored and the surface does not
+/// scatter. The emission is spectral (paper §9.2) — a smooth SPD or a
+/// monochromatic line — evaluated at the path's hero wavelength.
 #[derive(Clone, Copy, Debug)]
 pub struct MaterialData {
     pub albedo: Vec3,
-    pub emission: Vec3,
+    pub spectrum: SpectrumKind,
     pub bsdf: Bsdf,
 }
 
@@ -47,7 +50,7 @@ impl MaterialData {
     pub fn diffuse(albedo: Vec3) -> Self {
         Self {
             albedo,
-            emission: Vec3::new(0.0, 0.0, 0.0),
+            spectrum: SpectrumKind::None,
             bsdf: Bsdf::Diffuse,
         }
     }
@@ -55,15 +58,35 @@ impl MaterialData {
     pub fn emissive(emission: Vec3) -> Self {
         Self {
             albedo: Vec3::new(0.0, 0.0, 0.0),
-            emission,
+            spectrum: SpectrumKind::smooth_from_rgb(emission),
             bsdf: Bsdf::Diffuse,
         }
+    }
+
+    /// An emitter with an explicit spectrum (a laser line, for instance).
+    pub fn emissive_spec(spectrum: SpectrumKind) -> Self {
+        Self {
+            albedo: Vec3::new(0.0, 0.0, 0.0),
+            spectrum,
+            bsdf: Bsdf::Diffuse,
+        }
+    }
+
+    /// Attach the laser emission cone to an emissive material: the BSDF
+    /// slot is the one place the cone can travel with the material so
+    /// the BDPT pdf/weight/gate helpers can read it from any path
+    /// vertex (see `Bsdf::Laser`).
+    pub fn with_laser_bsdf(mut self, theta: f32) -> Self {
+        self.bsdf = Bsdf::Laser {
+            cos_theta: theta.cos(),
+        };
+        self
     }
 
     pub fn mirror(albedo: Vec3) -> Self {
         Self {
             albedo,
-            emission: Vec3::new(0.0, 0.0, 0.0),
+            spectrum: SpectrumKind::None,
             bsdf: Bsdf::Mirror,
         }
     }
@@ -71,17 +94,57 @@ impl MaterialData {
     pub fn glass(ior: f32) -> Self {
         Self {
             albedo: Vec3::new(1.0, 1.0, 1.0),
-            emission: Vec3::new(0.0, 0.0, 0.0),
-            bsdf: Bsdf::Glass { ior },
+            spectrum: SpectrumKind::None,
+            bsdf: Bsdf::Glass {
+                ior,
+                sellmeier: [0.0; 6],
+            },
         }
     }
 
-    /// A laser emitter: radiates `emission` only into the cone of
-    /// half-angle `theta` around the geometric normal (the beam).
+    /// Dispersive glass from Sellmeier coefficients (paper §9.2).
+    pub fn glass_sellmeier(ior: f32, sellmeier: [f32; 6]) -> Self {
+        Self {
+            albedo: Vec3::new(1.0, 1.0, 1.0),
+            spectrum: SpectrumKind::None,
+            bsdf: Bsdf::Glass { ior, sellmeier },
+        }
+    }
+
+    /// N-BK7 borosilicate glass — the demo's dispersive glass cube.
+    pub fn glass_bk7() -> Self {
+        Self::glass_sellmeier(1.5168, BK7)
+    }
+
+    /// A GGX microfacet "rough mirror" (paper §9.5): `alpha` is the
+    /// roughness, `f0` the normal-incidence reflectance.
+    pub fn glossy(albedo: Vec3, alpha: f32, f0: f32) -> Self {
+        Self {
+            albedo,
+            spectrum: SpectrumKind::None,
+            bsdf: Bsdf::Glossy { alpha, f0 },
+        }
+    }
+
+    /// A cone-gated emitter with a smooth spectrum (an RGB spotlight).
     pub fn laser(emission: Vec3, theta: f32) -> Self {
         Self {
             albedo: Vec3::new(0.0, 0.0, 0.0),
-            emission,
+            spectrum: SpectrumKind::smooth_from_rgb(emission),
+            bsdf: Bsdf::Laser {
+                cos_theta: theta.cos(),
+            },
+        }
+    }
+
+    /// A *laser*: a monochromatic line emitter, cone-gated (paper §9.2:
+    /// "a laser is monochromatic, so λ is deterministic"). All `power`
+    /// (spectral radiance) radiates at `lambda` (nm) inside the cone of
+    /// half-angle `theta`.
+    pub fn laser_line(lambda: f32, power: f32, theta: f32) -> Self {
+        Self {
+            albedo: Vec3::new(0.0, 0.0, 0.0),
+            spectrum: SpectrumKind::Line { lambda, power },
             bsdf: Bsdf::Laser {
                 cos_theta: theta.cos(),
             },
@@ -95,7 +158,7 @@ impl MaterialData {
 
     /// Pure emitters do not scatter; the BSDF is ignored for them.
     pub fn is_emissive(&self) -> bool {
-        self.emission != Vec3::new(0.0, 0.0, 0.0)
+        self.spectrum.is_emissive()
     }
 
     /// Delta BSDFs cannot be connection endpoints. Kept as API surface
@@ -109,7 +172,7 @@ impl MaterialData {
     fn to_material(self) -> Material {
         Material {
             albedo: self.albedo,
-            emission: self.emission,
+            spectrum: self.spectrum,
             bsdf: self.bsdf,
         }
     }
@@ -129,10 +192,15 @@ pub struct LightData {
     pub tangent: Vec3,
     /// Quad bitangent (unused for spheres).
     pub bitangent: Vec3,
-    /// Quad half-extents (unused for spheres).
+    /// Quad half-width (unused for spheres); for a laser the cone
+    /// half-angle rides in this slot.
     pub half_w: f32,
+    /// Quad half-height (unused for spheres); for a laser the housing
+    /// height rides in this slot.
     pub half_h: f32,
-    pub emission: Vec3,
+    /// The emission spectrum (paper §9.2): a smooth SPD or a
+    /// monochromatic line, evaluated at the path's hero wavelength.
+    pub spectrum: SpectrumKind,
 }
 
 impl LightData {
@@ -146,7 +214,7 @@ impl LightData {
             bitangent: Vec3::new(0.0, 0.0, 0.0),
             half_w: 0.0,
             half_h: 0.0,
-            emission,
+            spectrum: SpectrumKind::smooth_from_rgb(emission),
         }
     }
 
@@ -168,7 +236,7 @@ impl LightData {
             bitangent,
             half_w,
             half_h,
-            emission,
+            spectrum: SpectrumKind::smooth_from_rgb(emission),
         }
     }
 
@@ -186,6 +254,49 @@ impl LightData {
         height: f32,
         emission: Vec3,
     ) -> Self {
+        Self::from_laser_spec(
+            center,
+            normal,
+            radius,
+            theta,
+            height,
+            SpectrumKind::smooth_from_rgb(emission),
+        )
+    }
+
+    /// A *laser*: a monochromatic line emitter, cone-gated (paper §9.2).
+    /// All `power` (spectral radiance) radiates at `lambda` (nm) inside
+    /// the cone of half-angle `theta`.
+    pub fn from_laser_line(
+        center: Vec3,
+        normal: Vec3,
+        radius: f32,
+        theta: f32,
+        height: f32,
+        lambda: f32,
+        power: f32,
+    ) -> Self {
+        Self::from_laser_spec(
+            center,
+            normal,
+            radius,
+            theta,
+            height,
+            SpectrumKind::Line { lambda, power },
+        )
+    }
+
+    /// The shared laser-aperture constructor: the spectrum rides in the
+    /// `spectrum` field; the cone half-angle and housing height ride in
+    /// the unused quad slots (`half_w`/`half_h`).
+    fn from_laser_spec(
+        center: Vec3,
+        normal: Vec3,
+        radius: f32,
+        theta: f32,
+        height: f32,
+        spectrum: SpectrumKind,
+    ) -> Self {
         Self {
             shape: 2,
             center,
@@ -195,7 +306,7 @@ impl LightData {
             bitangent: Vec3::new(0.0, 0.0, 0.0),
             half_w: theta,   // the cone half-angle rides in the unused slot
             half_h: height, // the housing height rides in the unused slot
-            emission,
+            spectrum,
         }
     }
 
@@ -568,7 +679,7 @@ impl SceneData {
     /// Because this registers the primitive, do not also add the same
     /// shape via `add_sphere`/`add_quad` — that would duplicate it.
     pub fn add_light(&mut self, light: LightData) {
-        let mat = MaterialData::emissive(light.emission);
+        let mat = MaterialData::emissive_spec(light.spectrum);
         if light.shape == 0 {
             self.spheres.push(SphereData {
                 center: light.center,
@@ -609,7 +720,7 @@ impl SceneData {
                 axis,
                 radius: light.radius,
                 half_h: height * LASER_PUCK_FRACTION * 0.5,
-                mat: MaterialData::laser(light.emission, theta),
+                mat: MaterialData::emissive_spec(light.spectrum).with_laser_bsdf(theta),
             });
         } else {
             self.quads.push(QuadData {
@@ -656,6 +767,28 @@ impl SceneData {
         let axis = axis.normalize();
         let aperture = center + axis * (height * 0.5);
         let light = LightData::from_laser(aperture, axis, radius, theta, height, emission);
+        self.add_light(light);
+    }
+
+    /// Add a *laser*: a monochromatic line emitter (paper §9.2) — the
+    /// physically correct replacement for the RGB channel-stuffing hack.
+    /// All `power` (spectral radiance) radiates at `lambda` (nm) inside
+    /// the cone of half-angle `theta` around the beam axis.
+    pub fn add_laser_line(
+        &mut self,
+        center: Vec3,
+        axis: Vec3,
+        height: f32,
+        radius: f32,
+        theta: f32,
+        lambda: f32,
+        power: f32,
+    ) {
+        let axis = axis.normalize();
+        let aperture = center + axis * (height * 0.5);
+        let light = LightData::from_laser_line(
+            aperture, axis, radius, theta, height, lambda, power,
+        );
         self.add_light(light);
     }
 
@@ -751,7 +884,7 @@ impl SceneData {
                 hit.normal * -1.0
             };
             match hit.mat.bsdf {
-                Bsdf::Mirror => {
+                Bsdf::Mirror | Bsdf::Glossy { .. } => {
                     // Unfold: reflect the current image across this
                     // mirror plane. The plane is the perpendicular
                     // bisector of image ↔ reflected image, so a ray
@@ -760,6 +893,19 @@ impl SceneData {
                     // the aperture itself. Every intermediate image is
                     // a valid bridge for the prefix of the chain so
                     // far: push it as a rung.
+                    //
+                    // A glossy mirror crosses like a perfect one: the
+                    // beam's central ray follows the lobe's mean (the
+                    // specular direction), and the unfolding is exact
+                    // for that ray. The rung stays the *exact* image
+                    // disc — as a sampling technique it remains unbiased
+                    // regardless of what happens downstream; the eye
+                    // walk aims at the rung, hits the glossy surface,
+                    // and the GGX draw there must be near-specular to
+                    // continue. That is precisely §9.5's "the bridge is
+                    // the small-roughness limit of the glossy
+                    // connection": the technique helps exactly where
+                    // the lobe is narrow.
                     let d = image - hit.p;
                     image = image - normal * (2.0 * d.dot(normal));
                     ladder.push(crate::bdpt::Bridge {
@@ -774,25 +920,6 @@ impl SceneData {
             }
         }
         ladder
-    }
-
-    /// The highest luminance any physically valid sample can carry:
-    /// the brightest emitter's luminance. Radiance along a path is
-    /// bounded by the emitter's emission (albedo ≤ 1, MIS weights ≤ 1,
-    /// the eta² transmission factor is compensated by the BSDF's
-    /// 1/eta²), so a sample above this bound is a statistical outlier
-    /// — a firefly — and clamping it toward the bound is the standard
-    /// outlier-rejection trade (small bias on rare samples for a large
-    /// variance cut).
-    ///
-    /// Shared by both backends: the CPU clamps in `bdpt_trace`, the GPU
-    /// uploads it as a uniform so the WGSL clamp and the CPU clamp use
-    /// the same threshold.
-    pub fn max_light_luminance(&self) -> f32 {
-        self.lights
-            .iter()
-            .map(|l| l.emission.luminance())
-            .fold(0.0f32, f32::max)
     }
 
     /// Trace the laser beam through the scene: follow the aperture's
@@ -834,7 +961,7 @@ impl SceneData {
             legs.push((origin, hit.p));
             let mat = MaterialData {
                 albedo: hit.mat.albedo,
-                emission: hit.mat.emission,
+                spectrum: hit.mat.spectrum,
                 bsdf: hit.mat.bsdf,
             };
             // Orient the normal toward the side the beam arrives from
@@ -867,8 +994,18 @@ impl SceneData {
                     throughput = throughput * mat.albedo;
                     reflect_dir(dir, normal)
                 }
-                Bsdf::Glass { ior } => {
-                    let (eta_i, eta_t) = if front_face { (1.0, ior) } else { (ior, 1.0) };
+                Bsdf::Glossy { .. } => {
+                    // A glossy mirror: the central ray follows the lobe's
+                    // mean (the specular direction). The traced branch
+                    // carries the lobe's specular-albedo approximation
+                    // (the near-mirror limit); the spot's softening is
+                    // the visible §9.5 effect.
+                    throughput = throughput * mat.albedo;
+                    reflect_dir(dir, normal)
+                }
+                Bsdf::Glass { .. } => {
+                    let n = mat.bsdf.glass_n(550.0);
+                    let (eta_i, eta_t) = if front_face { (1.0, n) } else { (n, 1.0) };
                     let r = fresnel_dielectric(cos_i, eta_i, eta_t);
                     match refract_dir(dir, normal, eta_i, eta_t) {
                         Some(refracted) => {
@@ -886,7 +1023,7 @@ impl SceneData {
                         }
                     }
                 }
-                _ => unreachable!("only Mirror and Glass are delta BSDFs"),
+                _ => unreachable!("only Mirror, Glossy and Glass are delta-like here"),
             };
             // Offset along the side the new ray travels to (a refracted
             // ray leaves through the surface, so offsetting by the
@@ -963,10 +1100,10 @@ impl SceneData {
             AreaLight::from_sphere(&Sphere {
                 center: l.center,
                 radius: l.radius,
-                mat: Material::emissive(l.emission),
+                mat: Material::emissive_spec(l.spectrum),
             })
         } else if l.shape == 2 {
-            AreaLight::from_laser(l.center, l.normal, l.radius, l.half_w, l.emission)
+            AreaLight::from_laser(l.center, l.normal, l.radius, l.half_w, l.spectrum)
         } else {
             AreaLight::from_quad(&Quad {
                 center: l.center,
@@ -975,7 +1112,7 @@ impl SceneData {
                 bitangent: l.bitangent,
                 half_w: l.half_w,
                 half_h: l.half_h,
-                mat: Material::emissive(l.emission),
+                mat: Material::emissive_spec(l.spectrum),
             })
         }
     }
@@ -1279,7 +1416,13 @@ mod tests {
         // Registered exactly once as geometry (no duplicate registration).
         assert_eq!(scene.spheres.len(), 1);
         assert!(scene.spheres[0].mat.is_emissive());
-        assert_eq!(scene.spheres[0].mat.emission, Vec3::new(5.0, 5.0, 5.0));
+        // The spectrum is the smooth reconstruction of the RGB intent:
+        // its tristimulus integral is exactly (5, 5, 5) — pinned by the
+        // spectrum tests; here it suffices that it is a smooth SPD.
+        assert!(matches!(
+            scene.spheres[0].mat.spectrum,
+            crate::spectrum::SpectrumKind::Smooth { .. }
+        ));
         // ...and the CPU BVH hits it with the emissive material.
         let (cpu_scene, lights) = scene.build_cpu_scene();
         assert_eq!(lights.len(), 1);

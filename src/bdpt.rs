@@ -1,12 +1,29 @@
 //! Bidirectional path tracing (BDPT) with multiple-importance sampling.
 //!
-//! Surfaces carry a general BSDF (diffuse, mirror, glass). Subpaths sample
-//! directions with the BSDF's own distribution, and the MIS weights are
-//! computed with Veach's incremental-ratio walk over the *actual* pdfs of
-//! every edge — computed on the fly from the path geometry via `PathView`,
+//! Surfaces carry a general BSDF (diffuse, mirror, glass, glossy). Subpaths
+//! sample directions with the BSDF's own distribution, and the MIS weights
+//! are computed with Veach's incremental-ratio walk over the *actual* pdfs
+//! of every edge — computed on the fly from the path geometry via `PathView`,
 //! which addresses the unified path positions x_1..x_k (the eye prefix
 //! followed by the light vertices in reverse). Weights use the power
 //! heuristic (beta = 2).
+//!
+//! # Spectral transport (paper §9.2)
+//!
+//! Radiance is transported as a spectral density at one *hero wavelength*
+//! per path, sampled once from a mixture over the emitters before the eye
+//! walk (glass refraction directions depend on n(λ)). The λ sampling is
+//! independent of all direction sampling, so every strategy pdf factorizes
+//! as `p(directions)·p(λ)` and the λ factors cancel in every MIS ratio —
+//! **the MIS machinery is untouched**. The 1/p(λ) weighting is applied
+//! exactly once, at the sensor conversion (`spectrum::sensor_rgb`).
+//!
+//! The λ mixture is *branch-aware* (see `spectrum`): on a line branch only
+//! the lines at that λ radiate (their full power — the atom's mass), on a
+//! smooth branch only the smooth SPDs (their density). The light subpath
+//! starts on an *active* emitter — one that radiates at the drawn λ — and
+//! every strategy in one trace uses the same active count, so the pick pdf
+//! and the MIS machinery's `inv_light_pdf = n_active·A` stay consistent.
 //!
 //! Delta BSDFs (mirror, glass) scatter into a single direction: their
 //! solid-angle pdf is a Dirac delta, which has no numeric value. The
@@ -19,7 +36,8 @@
 //! it. Connections through delta vertices are invalid (their `eval` is 0)
 //! and are excluded from the MIS normalization; specular transport is
 //! handled purely by subpath sampling, which is the whole BDPT story for
-//! caustics.
+//! caustics. Glossy vertices (§9.5) are *not* delta: connections through
+//! them are valid and carried by the generic eval path.
 //!
 //! Paths are terminated by Russian roulette rather than a short fixed
 //! depth: from extension `RR_START` on, a subpath survives each bounce with
@@ -36,6 +54,7 @@ use crate::geometry::{
     AreaLight, Bsdf, BsdfSample, Intersectable, Material, Ray, Transport, cosine_hemisphere,
 };
 use crate::math::{Vec3, EPS_NEAR, VEC_ZERO};
+use crate::spectrum::{cmf, sample_wavelength, sensor_rgb, WaveSample};
 use rand::Rng;
 
 const PI: f32 = std::f32::consts::PI;
@@ -305,6 +324,7 @@ fn sample_diffuse_mixture(
     p: Vec3,
     normal: Vec3,
     dir_in: Vec3,
+    lambda: f32,
     bridges: &[Bridge],
     rng: &mut impl Rng,
 ) -> BsdfSample {
@@ -334,9 +354,9 @@ fn sample_diffuse_mixture(
         dir_out,
         pdf_omega: pdf,
         weight: if pdf > 0.0 {
-            mat.albedo * normal.dot(dir_out) / (PI * pdf)
+            crate::spectrum::rgb_to_albedo(mat.albedo, lambda) * normal.dot(dir_out) / (PI * pdf)
         } else {
-            VEC_ZERO
+            0.0
         },
     }
 }
@@ -354,8 +374,9 @@ struct PathVertex {
     front_face: bool,
     mat: Material,
     /// Path throughput up to this vertex, excluding the BSDF applied when
-    /// *leaving* it (that factor belongs to the connection term).
-    throughput: Vec3,
+    /// *leaving* it (that factor belongs to the connection term). A
+    /// *spectral* scalar at the path's hero wavelength.
+    throughput: f32,
     on_light: bool,
 }
 
@@ -375,13 +396,19 @@ struct PathView<'a> {
     n_eye: usize,
     /// The primary camera ray direction (the incoming direction at x_1).
     cam_dir: Vec3,
-    /// n_lights * area of the light the path ends on.
+    /// n_lights * area of the light the path ends on — over the
+    /// *active* lights (those that radiate at the drawn λ; see the
+    /// module doc on the branch rule).
     inv_light_pdf: f64,
     /// The specular bridges (the eye walk's diffuse sampling mixture):
     /// each laser's whole ladder, one rung per mirror its beam crosses.
     /// The light walk samples plain cosine, so only eye-side diffuse
     /// events query them.
     bridges: &'a [Bridge],
+    /// The path's hero wavelength (nm). Fixed per path, so realized and
+    /// hypothetical events evaluate the same spectral quantities — the
+    /// PathView discipline is preserved.
+    lambda: f32,
 }
 
 impl<'a> PathView<'a> {
@@ -453,7 +480,7 @@ impl<'a> PathView<'a> {
         } else if walk == Walk::Eye && v.mat.bsdf == Bsdf::Diffuse {
             mixture_pdf(v.p, normal, d_in, d_out, self.bridges) as f64
         } else {
-            v.mat.eval_bsdf(normal, d_in, d_out).1 as f64
+            v.mat.eval_bsdf(normal, d_in, d_out, self.lambda).1 as f64
         }
     }
 
@@ -469,28 +496,30 @@ impl<'a> PathView<'a> {
         to: usize,
         transport: Transport,
         walk: Walk,
-    ) -> Vec3 {
+    ) -> f32 {
         let v = self.vertex(m);
         let d_in = self.dir(arrival, m);
         let d_out = self.dir(m, to);
         let (normal, front_face) = self.oriented(m, d_in);
         if v.mat.bsdf.is_delta() {
             v.mat
-                .specular_weight(normal, front_face, d_in, d_out, transport)
-                .unwrap_or(VEC_ZERO)
+                .specular_weight(normal, front_face, d_in, d_out, transport, self.lambda)
+                .unwrap_or(0.0)
         } else if walk == Walk::Eye && v.mat.bsdf == Bsdf::Diffuse {
             let pdf = mixture_pdf(v.p, normal, d_in, d_out, self.bridges);
             if pdf <= 0.0 {
-                VEC_ZERO
+                0.0
             } else {
-                // f·cos/pdf with f = albedo/π (the diffuse BSDF); only
+                // f·cos/pdf with f = ρ(λ)/π (the diffuse BSDF); only
                 // the sampling distribution changed, not the BSDF.
-                v.mat.albedo * (1.0 / PI) * (normal.dot(d_out) / pdf)
+                crate::spectrum::rgb_to_albedo(v.mat.albedo, self.lambda)
+                    * (1.0 / PI)
+                    * (normal.dot(d_out) / pdf)
             }
         } else {
-            let (f, pdf) = v.mat.eval_bsdf(normal, d_in, d_out);
+            let (f, pdf) = v.mat.eval_bsdf(normal, d_in, d_out, self.lambda);
             if pdf <= 0.0 {
-                VEC_ZERO
+                0.0
             } else {
                 f * (normal.dot(d_out) / pdf)
             }
@@ -718,11 +747,11 @@ fn mis_weight(path: &PathView, qe: &[f64], ql: &[f64], s: usize) -> f32 {
 ///
 /// The caller divides the throughput by the returned q when the path
 /// survives, which leaves the expected contribution unchanged.
-fn rr_survival(beta: Vec3, ext: usize) -> f32 {
+fn rr_survival(beta: f32, ext: usize) -> f32 {
     if ext < RR_START {
         return 1.0;
     }
-    beta.x.max(beta.y).max(beta.z).clamp(RR_MIN, 1.0)
+    beta.clamp(RR_MIN, 1.0)
 }
 
 /// Russian-roulette prefix products the MIS weights need: `qe[m]` is
@@ -745,10 +774,10 @@ struct RrProducts {
 /// never happened.
 ///
 /// `alpha_light0` is the light-subpath throughput at y_0: the realized
-/// `emission * n * A` for connection strategies, or the same expression
+/// `emission(λ) · n · A` for connection strategies, or the same expression
 /// for the direct-hit strategy's hypothetical light subpath starting at
 /// the emitter hit.
-fn rr_prefix_products(path: &PathView, alpha_light0: Vec3) -> RrProducts {
+fn rr_prefix_products(path: &PathView, alpha_light0: f32) -> RrProducts {
     let k = path.k;
     let mut out = RrProducts {
         qe: [0.0; MAX_PATH_VERTICES + 1],
@@ -758,7 +787,7 @@ fn rr_prefix_products(path: &PathView, alpha_light0: Vec3) -> RrProducts {
     // Eye-side sweep: the roll at x_l governs the extension to x_{l+1},
     // whose factor is the sample weight of the event at x_l toward
     // x_{l+1}. The eye subpath carries radiance.
-    let mut alpha = Vec3::new(1.0, 1.0, 1.0);
+    let mut alpha = 1.0f32;
     out.qe[1] = 1.0;
     for l in 1..k {
         let factor = path.event_weight(l, l - 1, l + 1, Transport::Radiance, Walk::Eye);
@@ -785,13 +814,12 @@ fn rr_prefix_products(path: &PathView, alpha_light0: Vec3) -> RrProducts {
             match v.mat.bsdf {
                 Bsdf::Laser { cos_theta } => {
                     if cos0 >= cos_theta {
-                        let f = cos0 * 2.0 * PI * (1.0 - cos_theta);
-                        Vec3::new(f, f, f)
+                        cos0 * 2.0 * PI * (1.0 - cos_theta)
                     } else {
-                        VEC_ZERO
+                        0.0
                     }
                 }
-                _ => Vec3::new(PI, PI, PI),
+                _ => PI,
             }
         } else {
             path.event_weight(k - j, k - j + 1, k - j - 1, Transport::Importance, Walk::Light)
@@ -805,15 +833,47 @@ fn rr_prefix_products(path: &PathView, alpha_light0: Vec3) -> RrProducts {
     out
 }
 
-/// Trace one camera ray with BDPT. Returns the estimated radiance.
+/// The per-sample firefly clamp bound at the drawn wavelength (paper
+/// §9.2: "the bound becomes a spectral quantity — 8× the brightest
+/// emitter's luminance *at the sampled λ*").
 ///
-/// The returned sample is firefly-clamped (see `firefly_clamp_bound`):
-/// a loose, physically motivated bound (a multiple of the brightest
-/// emitter's luminance) that removes only implausible samples. The
-/// tight, mean-aware firefly removal happens in the accumulation layer
-/// (`accumulate` in renderer.rs / the accumulation block in
-/// shaders/bdpt.wgsl), where temporal persistence separates a caustic
-/// from a firefly.
+/// The direct-view sample luminance of emitter `e` at λ is
+/// `ȳ(λ)·Le_e(λ)/p(λ)` — the Rec. 709 luminance of sRGB(XYZ) is Y by
+/// the duality of the matrices, and the sensor conversion carries the
+/// 1/p(λ) — so the faithful generalization of the old
+/// `8·max emission luminance` (which was exactly "8× the direct-hit
+/// sample's luminance") is
+/// `bound(λ) = 8·max_e[ȳ(λ)·Le_e(λ)]/p(λ)` over the *active* emitters.
+/// The max is clamped at 0: a smooth CMF-basis spectrum can evaluate
+/// negative at some wavelengths (a legitimate part of the response
+/// integral — see `WaveSample::active`), and a negative bound would
+/// disable the clamp. 0 when no active emitter radiates positively
+/// (the clamp is disabled — there is no physical bound to appeal to).
+fn spectral_clamp_bound(lights: &[AreaLight], wave: &WaveSample) -> f32 {
+    let mut max_le = 0.0f32;
+    for l in lights {
+        if wave.active(&l.spectrum) {
+            max_le = max_le.max(l.spectrum.eval(wave.lambda, wave.line_branch));
+        }
+    }
+    if max_le <= 0.0 {
+        return 0.0;
+    }
+    FIREFLY_LIGHT_MULT * cmf(wave.lambda).y * max_le * wave.inv_pdf
+}
+
+/// Trace one camera ray with BDPT. Returns the estimated *linear-sRGB*
+/// sample: the spectral estimate at the hero wavelength, converted
+/// through the CIE CMFs and weighted by 1/p(λ) (see
+/// `spectrum::sensor_rgb`).
+///
+/// The returned sample is firefly-clamped (see
+/// `spectral_clamp_bound`): a loose, physically motivated bound (a
+/// multiple of the brightest emitter's luminance at the sampled λ)
+/// that removes only implausible samples. The tight, mean-aware
+/// firefly removal happens in the accumulation layer (`accumulate` in
+/// renderer.rs / the accumulation block in shaders/bdpt.wgsl), where
+/// temporal persistence separates a caustic from a firefly.
 pub fn bdpt_trace(
     ray: &Ray,
     scene: &dyn Intersectable,
@@ -823,26 +883,45 @@ pub fn bdpt_trace(
     rng: &mut impl Rng,
 ) -> Vec3 {
     let max_depth = max_depth.min(MAX_PATH_VERTICES);
-    let mut total = VEC_ZERO;
-    // The clamp bound: a loose multiple of the brightest emitter's
-    // luminance (0 = no lights, clamp disabled). Computed once per
-    // call; the lights slice is tiny.
-    let clamp_bound = firefly_clamp_bound(
-        lights
-            .iter()
-            .map(|l| l.emission.luminance())
-            .fold(0.0f32, f32::max),
-    );
+
+    // ---- The hero wavelength (paper §9.2) ----
+    // Sampled once per path from the mixture over the emitters, before
+    // the eye walk (glass refraction directions depend on n(λ)). The
+    // light subpath below starts on an *active* emitter — one that
+    // radiates at this λ — and every strategy in this trace uses the
+    // same active count, so the pick pdf and the MIS machinery's
+    // inv_light_pdf = n_active·A stay consistent.
+    let wave = sample_wavelength(lights, |l| l.spectrum, rng);
+    let lambda = wave.lambda;
+    // The active lights: those that radiate at the drawn λ (the branch
+    // rule — see the module doc).
+    let active: Vec<&AreaLight> = lights.iter().filter(|l| wave.active(&l.spectrum)).collect();
+    let n_active = active.len();
+    // The per-sample clamp bound at this λ (0 = disabled).
+    let clamp_bound = spectral_clamp_bound(lights, &wave);
+
+    let mut total = 0.0f32;
 
     // ---- Eye subpath: x_1 .. x_s ----
     let mut eye: Vec<PathVertex> = Vec::with_capacity(max_depth);
-    let mut throughput = Vec3::new(1.0, 1.0, 1.0);
+    let mut throughput = 1.0f32;
     let mut cur = ray.clone();
 
     for _ in 0..max_depth {
         let Some(hit) = scene.intersect(&cur) else {
             if eye.is_empty() {
-                return BACKGROUND;
+                // The background is a smooth (incoherent) spectrum: it
+                // radiates only on the smooth branch, like every other
+                // continuous spectrum in the scene. Its spectral
+                // radiance at λ is the CMF-basis SPD value of the RGB
+                // intent; the 1/p(λ) sensor weighting is applied at the
+                // conversion below.
+                let bg = if wave.line_branch {
+                    0.0
+                } else {
+                    crate::spectrum::smooth_spectrum_value(BACKGROUND, lambda)
+                };
+                return clamp_sample(sensor_rgb(lambda, bg, wave.inv_pdf), clamp_bound);
             }
             break;
         };
@@ -882,10 +961,10 @@ pub fn bdpt_trace(
         // prefixes), so the paths camera → wall → mirror → aperture
         // are carried by ordinary subpath walking.
         let s = if hit.mat.bsdf == Bsdf::Diffuse {
-            sample_diffuse_mixture(&hit.mat, hit.p, normal, cur.direction, bridges, rng)
+            sample_diffuse_mixture(&hit.mat, hit.p, normal, cur.direction, lambda, bridges, rng)
         } else {
             hit.mat
-                .sample_bsdf(normal, front_face, cur.direction, Transport::Radiance, rng)
+                .sample_bsdf(normal, front_face, cur.direction, Transport::Radiance, lambda, rng)
         };
         let beta = throughput * s.weight;
         let q = rr_survival(beta, eye.len());
@@ -908,12 +987,14 @@ pub fn bdpt_trace(
     }
 
     // ---- Light subpath: y_0 .. y_t ----
-    let n_lights = lights.len();
+    // Starts on an *active* emitter (one that radiates at the drawn λ):
+    // the pick pdf is 1/n_active and the MIS machinery's inv_light_pdf
+    // is n_active·A — consistent for every strategy in this trace.
     let mut light_path: Vec<PathVertex> = Vec::with_capacity(max_depth);
     let mut inv_light_pdf = 0.0f64;
-    if n_lights > 0 {
-        let light = &lights[rng.gen_range(0..n_lights)];
-        inv_light_pdf = n_lights as f64 * light.area() as f64;
+    if n_active > 0 {
+        let light = active[rng.gen_range(0..n_active)];
+        inv_light_pdf = n_active as f64 * light.area() as f64;
         let (p0, n0) = light.sample(rng);
         let d0 = light.sample_dir(n0, rng);
         // The first light extension (y_0 -> y_1) is unconditional
@@ -927,17 +1008,17 @@ pub fn bdpt_trace(
         let is_laser = light.shape_is_laser();
         let cos0 = n0.dot(d0);
         let first_edge_factor = if !is_laser {
-            Vec3::new(PI, PI, PI)
+            PI
         } else if cos0 >= light.cone_cos() {
-            Vec3::new(
-                cos0 * 2.0 * PI * (1.0 - light.cone_cos()),
-                cos0 * 2.0 * PI * (1.0 - light.cone_cos()),
-                cos0 * 2.0 * PI * (1.0 - light.cone_cos()),
-            )
+            cos0 * 2.0 * PI * (1.0 - light.cone_cos())
         } else {
-            VEC_ZERO
+            0.0
         };
-        let mut ltp = light.emission * inv_light_pdf as f32;
+        // The spectral radiance at the drawn λ (the branch rule gates
+        // it: only the active emitters radiate, and `active` already
+        // filtered on exactly that).
+        let le = light.spectrum.eval(lambda, wave.line_branch);
+        let mut ltp = le * inv_light_pdf as f32;
         light_path.push(PathVertex {
             p: p0,
             normal: n0,
@@ -947,15 +1028,15 @@ pub fn bdpt_trace(
             // ordinary emitters the diffuse material reproduces the old
             // cosine-weighted pdf.
             mat: if is_laser {
-                Material::laser(light.emission, light.cone_theta())
+                Material::laser(Vec3::new(1.0, 1.0, 1.0), light.cone_theta())
             } else {
-                Material::emissive(light.emission)
+                Material::emissive(Vec3::new(1.0, 1.0, 1.0))
             },
             throughput: ltp,
             on_light: true,
         });
 
-        if first_edge_factor != VEC_ZERO {
+        if first_edge_factor > 0.0 {
             ltp = ltp * first_edge_factor;
             let mut cur = Ray {
                 origin: p0 + n0 * EPS_NEAR,
@@ -997,6 +1078,7 @@ pub fn bdpt_trace(
                     front_face,
                     cur.direction,
                     Transport::Importance,
+                    lambda,
                     rng,
                 );
                 let beta = ltp * s.weight;
@@ -1021,48 +1103,55 @@ pub fn bdpt_trace(
     // ---- Strategy "eye subpath hits a light" ----
     if let Some(last) = eye.last().filter(|v| v.on_light) {
         let k = eye.len();
-        let w = match lights.iter().find(|l| l.contains(last.p)) {
-            Some(light) => {
-                // A laser aperture radiates only into its cone: a hit
-                // outside the beam (the dark side of the housing, or the
-                // aperture seen from behind) carries no emission. The
-                // eye vertex's stored normal is the aperture's outward
-                // normal; the incoming direction is the direction of the
-                // *last* segment — the segment that actually arrives at
-                // the aperture (the primary ray for a direct hit, the
-                // wall -> mirror segment for a bridged path).
-                let d_in = if k >= 2 {
-                    (last.p - eye[k - 2].p).normalize()
-                } else {
-                    ray.direction
+        let mut contribution = 0.0f32;
+        if let Some(light) = lights.iter().find(|l| l.contains(last.p)) {
+            // A laser aperture radiates only into its cone: a hit
+            // outside the beam (the dark side of the housing, or the
+            // aperture seen from behind) carries no emission. The
+            // eye vertex's stored normal is the aperture's outward
+            // normal; the incoming direction is the direction of the
+            // *last* segment — the segment that actually arrives at
+            // the aperture (the primary ray for a direct hit, the
+            // wall -> mirror segment for a bridged path).
+            let d_in = if k >= 2 {
+                (last.p - eye[k - 2].p).normalize()
+            } else {
+                ray.direction
+            };
+            let in_beam = light.in_beam(last.p, last.p - d_in);
+            // The branch rule: only an emitter active at the drawn λ
+            // radiates (a smooth panel is dark on a line branch, a
+            // laser line is dark on a smooth branch).
+            let active_here = wave.active(&light.spectrum);
+            if in_beam && active_here {
+                let inv_pdf = n_active as f64 * light.area() as f64;
+                let path = PathView {
+                    eye: &eye,
+                    light_path: &light_path,
+                    k,
+                    n_eye: k,
+                    cam_dir: ray.direction,
+                    inv_light_pdf: inv_pdf,
+                    bridges,
+                    lambda,
                 };
-                let in_beam = light.in_beam(last.p, last.p - d_in);
-                if in_beam {
-                    let inv_pdf = n_lights as f64 * light.area() as f64;
-                    let path = PathView {
-                        eye: &eye,
-                        light_path: &light_path,
-                        k,
-                        n_eye: k,
-                        cam_dir: ray.direction,
-                        inv_light_pdf: inv_pdf,
-                        bridges,
-                    };
-                    // The hypothetical light subpath of the other strategies
-                    // starts at this hit point with the emitter's throughput
-                    // (emission * n * A, the inverse light-sampling pdf).
-                    let rr = rr_prefix_products(&path, light.emission * inv_pdf as f32);
-                    mis_weight(&path, &rr.qe, &rr.ql, k)
-                } else {
-                    0.0
-                }
+                // The hypothetical light subpath of the other strategies
+                // starts at this hit point with the emitter's throughput
+                // (emission(λ) · n · A, the inverse light-sampling pdf).
+                let rr = rr_prefix_products(
+                    &path,
+                    light.spectrum.eval(lambda, wave.line_branch) * inv_pdf as f32,
+                );
+                let w = mis_weight(&path, &rr.qe, &rr.ql, k);
+                contribution = last.throughput
+                    * light.spectrum.eval(lambda, wave.line_branch)
+                    * w;
             }
-            // The hit is on no sampleable light (e.g. the dark curved
-            // side of the laser's aperture puck, which is emissive-tagged
-            // geometry but not the aperture): no emission there.
-            None => 0.0,
-        };
-        total = total + last.throughput * last.mat.emission * w;
+        }
+        // A hit on no sampleable light (e.g. the dark curved side of
+        // the laser's aperture puck) carries no emission: contribution
+        // stays 0.
+        total += contribution;
     }
 
     // ---- Connection strategies: eye vertex x_{i+1} to light vertex y_j ----
@@ -1075,8 +1164,10 @@ pub fn bdpt_trace(
             if k > max_depth {
                 break;
             }
-            // Delta BSDFs cannot be connection endpoints: their eval is 0,
-            // so the contribution would be 0 anyway.
+            // Delta BSDFs cannot be connection endpoints: their eval is
+            // 0, so the contribution would be 0 anyway. (Glossy
+            // vertices are *not* delta — §9.5 — so connections through
+            // them are valid and carried by the generic eval path.)
             if eye[i].mat.is_delta() || light_path[j].mat.is_delta() {
                 continue;
             }
@@ -1088,6 +1179,7 @@ pub fn bdpt_trace(
                 cam_dir: ray.direction,
                 inv_light_pdf,
                 bridges,
+                lambda,
             };
 
             // Contribution: alpha_eye * f(x) * G * f(y) * alpha_light.
@@ -1100,10 +1192,11 @@ pub fn bdpt_trace(
                 path.dir(i, i + 1)
             };
             let (n_eye_end, _) = path.oriented(i + 1, d_in_eye);
-            let (f_eye, _) = path
+            let f_eye = path
                 .vertex(i + 1)
                 .mat
-                .eval_bsdf(n_eye_end, d_in_eye, d_conn);
+                .eval_bsdf(n_eye_end, d_in_eye, d_conn, lambda)
+                .0;
             let (f_light, n_light_end) = if j == 0 {
                 // y_0 is the emitter itself: no BSDF applies there — but
                 // a laser aperture radiates only into its cone, so the
@@ -1113,46 +1206,49 @@ pub fn bdpt_trace(
                         .mat
                         .in_beam(path.vertex(k).normal, path.vertex(k).p, path.vertex(i + 1).p);
                 if in_beam {
-                    (Vec3::new(1.0, 1.0, 1.0), path.vertex(k).normal)
+                    (1.0, path.vertex(k).normal)
                 } else {
-                    (VEC_ZERO, path.vertex(k).normal)
+                    (0.0, path.vertex(k).normal)
                 }
             } else {
                 let d_in_light = d_conn * -1.0;
                 let d_out_light = path.dir(i + 2, i + 3);
                 let (n, _) = path.oriented(i + 2, d_in_light);
-                let (f, _) = path
+                let f = path
                     .vertex(i + 2)
                     .mat
-                    .eval_bsdf(n, d_in_light, d_out_light);
+                    .eval_bsdf(n, d_in_light, d_out_light, lambda)
+                    .0;
                 (f, n)
             };
             let g_conn = g_term(path.vertex(i + 1).p, n_eye_end, path.vertex(i + 2).p, n_light_end);
-            if g_conn <= 0.0 || f_eye == VEC_ZERO || f_light == VEC_ZERO {
+            if g_conn <= 0.0 || f_eye == 0.0 || f_light == 0.0 {
                 continue;
             }
             if !visible(path.vertex(i + 1).p, n_eye_end, path.vertex(i + 2).p, scene) {
                 continue;
             }
-            let contrib = eye[i].throughput
-                * f_eye
-                * g_conn
-                * f_light
-                * light_path[j].throughput;
+            let contrib = eye[i].throughput * f_eye * g_conn * f_light * light_path[j].throughput;
 
             let rr = rr_prefix_products(&path, light_path[0].throughput);
             let w = mis_weight(&path, &rr.qe, &rr.ql, i + 1);
-            total = total + contrib * w;
+            total += contrib * w;
         }
     }
 
-    clamp_sample(total, clamp_bound)
+    // ---- The sensor conversion (paper §9.2) ----
+    // The spectral estimate at the hero wavelength, weighted by 1/p(λ)
+    // and converted to linear sRGB through the CIE CMFs. Out-of-gamut
+    // samples (a pure 532 nm green) carry negative channels by design;
+    // the display stage gamut-maps them.
+    clamp_sample(sensor_rgb(lambda, total, wave.inv_pdf), clamp_bound)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::geometry::{Cube, Cylinder, Material, Plane, Quad, Sphere, cosine_hemisphere};
+    use crate::spectrum::{sellmeier_n, SpectrumKind};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
@@ -1258,7 +1354,7 @@ mod tests {
                 },
                 front_face: true,
                 mat: diffuse(albedo),
-                throughput: VEC_ZERO,
+                throughput: 0.0,
                 on_light: false,
             }
         };
@@ -1301,8 +1397,9 @@ mod tests {
             cam_dir,
             inv_light_pdf: 2.0,
             bridges: NO_BRIDGES,
+            lambda: 555.0,
         };
-        let rr = rr_prefix_products(&path, Vec3::new(1.0, 1.0, 1.0));
+        let rr = rr_prefix_products(&path, 1.0);
         let mut sum = 0.0f32;
         for s in 1..=4 {
             sum += mis_weight(&path, &rr.qe, &rr.ql, s);
@@ -1338,7 +1435,7 @@ mod tests {
             normal,
             front_face: true,
             mat,
-            throughput: VEC_ZERO,
+            throughput: 0.0,
             on_light: false,
         };
         let eye = vec![
@@ -1367,8 +1464,9 @@ mod tests {
             cam_dir,
             inv_light_pdf: 2.0,
             bridges: NO_BRIDGES,
+            lambda: 555.0,
         };
-        let rr = rr_prefix_products(&path, Vec3::new(1.0, 1.0, 1.0));
+        let rr = rr_prefix_products(&path, 1.0);
         let mut w = [0.0f32; 5];
         for s in 1..=4 {
             w[s] = mis_weight(&path, &rr.qe, &rr.ql, s);
@@ -1383,17 +1481,51 @@ mod tests {
         );
     }
 
+    /// Sum-to-one with a *glossy* vertex on the path (paper §9.5): glossy
+    /// is not delta, so connections through it are valid and every
+    /// strategy competes — the weights must sum to 1 over all of them.
+    #[test]
+    fn mis_weights_sum_to_one_with_a_glossy_vertex() {
+        mark("mis_weights_sum_to_one_with_a_glossy_vertex");
+        // The same k=4 layout as the asymmetric test, with x_2 a glossy
+        // "rough mirror" instead of diffuse. The connection edge e_3
+        // (x_2 ↔ x_3) now has a nonzero eval from both sides, so
+        // strategy 2 is valid — the §9.5 point: the blind spot softens
+        // on its own.
+        let albedo = Vec3::new(0.5, 0.5, 0.5);
+        let (eye, light_path, cam_dir) = synthetic_path(4, albedo, 2.0);
+        // Replace x_2 (the second eye vertex) with a glossy vertex.
+        let mut eye = eye;
+        eye[1].mat = Material::glossy(Vec3::new(0.9, 0.9, 0.9), 0.1, 0.9);
+        let path = PathView {
+            eye: &eye,
+            light_path: &light_path,
+            k: 4,
+            n_eye: 2,
+            cam_dir,
+            inv_light_pdf: 2.0,
+            bridges: NO_BRIDGES,
+            lambda: 555.0,
+        };
+        let rr = rr_prefix_products(&path, 1.0);
+        let mut sum = 0.0f32;
+        for s in 1..=4 {
+            sum += mis_weight(&path, &rr.qe, &rr.ql, s);
+        }
+        assert!((sum - 1.0).abs() < 1e-4, "weights sum to {sum}");
+    }
+
     #[test]
     fn rr_survival_is_one_before_start_and_clamped_after() {
-        let beta = Vec3::new(0.3, 0.7, 0.2);
+        let beta = 0.3f32;
         // Before RR_START every extension is unconditional.
         for ext in 0..RR_START {
             assert_eq!(rr_survival(beta, ext), 1.0);
         }
-        // From RR_START on: the max channel, clamped to [RR_MIN, 1].
-        assert!((rr_survival(beta, RR_START) - 0.7).abs() < 1e-6);
-        assert!((rr_survival(Vec3::new(2.0, 3.0, 1.0), RR_START) - 1.0).abs() < 1e-6);
-        assert!((rr_survival(VEC_ZERO, RR_START) - RR_MIN).abs() < 1e-6);
+        // From RR_START on: the value, clamped to [RR_MIN, 1].
+        assert!((rr_survival(beta, RR_START) - 0.3).abs() < 1e-6);
+        assert!((rr_survival(2.0, RR_START) - 1.0).abs() < 1e-6);
+        assert!((rr_survival(0.0, RR_START) - RR_MIN).abs() < 1e-6);
     }
 
     /// The firefly clamp: luminance above the bound is scaled down with
@@ -1420,10 +1552,7 @@ mod tests {
         assert_eq!(clamp_sample(VEC_ZERO, 10.0), VEC_ZERO);
 
         // firefly_clamp_bound: no lights -> disabled (0); otherwise a
-        // loose multiple of the emitter luminance. The demo light
-        // (luminance 1000) clamps at 8000 — far above the caustic's
-        // rare-event samples (~1.1x Le), so a genuine caustic passes
-        // through untouched.
+        // loose multiple of the emitter luminance.
         assert_eq!(firefly_clamp_bound(0.0), 0.0);
         assert!((firefly_clamp_bound(1.0) - 8.0).abs() < 1e-6);
         assert!((firefly_clamp_bound(1000.0) - 8000.0).abs() < 1e-6);
@@ -1433,10 +1562,10 @@ mod tests {
     fn rr_prefix_products_match_hand_computation() {
         mark("rr_prefix_products_match_hand_computation");
         // Path x_1 x_2 x_3 | y_1 y_0 connected at (i=2, j=1):
-        // k = 5, n_eye = 3, n_light = 2. All albedos 0.5, emitter
-        // throughput 0.1. This exercises both cross-over reads: the eye
-        // sweep extends hypothetically through y_1 (l = 4) and the light
-        // sweep through x_3 (j = 2).
+        // k = 5, n_eye = 3, n_light = 2. All albedos 0.5 (gray: ρ(λ) =
+        // 0.5 at every λ), emitter throughput 0.1. This exercises both
+        // cross-over reads: the eye sweep extends hypothetically through
+        // y_1 (l = 4) and the light sweep through x_3 (j = 2).
         let albedo = Vec3::new(0.5, 0.5, 0.5);
         let (eye, light_path, cam_dir) = synthetic_path(5, albedo, 1.0);
         let path = PathView {
@@ -1447,19 +1576,20 @@ mod tests {
             cam_dir,
             inv_light_pdf: 1.0,
             bridges: NO_BRIDGES,
+            lambda: 555.0,
         };
-        let rr = rr_prefix_products(&path, Vec3::new(0.1, 0.1, 0.1));
+        let rr = rr_prefix_products(&path, 0.1);
 
         // Eye sweep: ext 1, 2 unconditional; ext 3: beta = 0.5^3 = 0.125;
-        // ext 4: alpha = 0.125/0.125 = 1, beta = 1 * albedo(y_1) = 0.5.
+        // ext 4: alpha = 0.125/0.125 = 1, beta = 1 * ρ(y_1) = 0.5.
         assert!((rr.qe[1] - 1.0).abs() < 1e-12);
         assert!((rr.qe[2] - 1.0).abs() < 1e-12);
         assert!((rr.qe[3] - 1.0).abs() < 1e-12);
         assert!((rr.qe[4] - 0.125).abs() < 1e-6, "qe[4] = {}", rr.qe[4]);
         assert!((rr.qe[5] - 0.0625).abs() < 1e-6, "qe[5] = {}", rr.qe[5]);
 
-        // Light sweep: ext 1 (PI factor, q = 1), ext 2 (albedo(y_1), q = 1),
-        // ext 3: factor = albedo(x_3), beta = 0.1 * PI * 0.5 * 0.5.
+        // Light sweep: ext 1 (PI factor, q = 1), ext 2 (ρ(y_1), q = 1),
+        // ext 3: factor = ρ(x_3), beta = 0.1 * PI * 0.5 * 0.5.
         assert!((rr.ql[0] - 1.0).abs() < 1e-12);
         assert!((rr.ql[1] - 1.0).abs() < 1e-12);
         assert!((rr.ql[2] - 1.0).abs() < 1e-12);
@@ -1471,33 +1601,51 @@ mod tests {
         );
     }
 
+    /// A direct hit at x_1 involves no roulette at all; with RR armed
+    /// (max_depth 8) the exact emission must still come back — as a
+    /// mean over N samples, since a spectral sample is random per-λ
+    /// (the RGB pipeline returned a deterministic value; the spectral
+    /// one estimates the same expectation). The per-sample SD of a
+    /// uniform-λ direct view is ~2× the mean, so the SE at N = 65536
+    /// is ~0.8%; 3% is ~4σ.
     #[test]
     fn rr_leaves_short_paths_exact() {
-        // A direct hit at x_1 involves no roulette at all; with RR armed
-        // (max_depth 8) the exact emission must still come back.
         let (scene, lights) = test_scene();
         let mut rng = StdRng::seed_from_u64(7);
         let r = ray(Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        let c = bdpt_trace(&r, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
-        assert!((c.x - 1.0).abs() < 1e-4, "got {c:?}");
-        assert!((c.y - 1.0).abs() < 1e-4);
-        assert!((c.z - 1.0).abs() < 1e-4);
+        const N: usize = 65536;
+        let mut mean = VEC_ZERO;
+        for _ in 0..N {
+            let c = bdpt_trace(&r, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
+            mean = mean + c;
+        }
+        mean = mean * (1.0 / N as f32);
+        // The emitter renders to exactly its RGB intent in expectation
+        // (the CMF-comb construction).
+        assert!(
+            (mean.x - 1.0).abs() < 0.03 && (mean.y - 1.0).abs() < 0.03 && (mean.z - 1.0).abs() < 0.03,
+            "got {mean:?}"
+        );
     }
 
     /// Reference unidirectional path tracer: no MIS, no roulette, fixed
-    /// depth. Correct by inspection — it sums `throughput * emission` over
-    /// every emissive surface the eye path hits, with the same BSDF
+    /// depth. Correct by inspection — it sums `throughput * emission`
+    /// over every emissive surface the eye path hits, with the same BSDF
     /// sampling and one-sided-surface rules as `bdpt_trace`. Used as the
     /// oracle for the roulette unbiasedness check and the caustic
-    /// differential.
+    /// differential. Spectral: it carries the same hero wavelength and
+    /// converts through the same sensor.
     fn reference_pt(
         ray: &Ray,
         scene: &dyn Intersectable,
         max_depth: usize,
+        lights: &[AreaLight],
         rng: &mut impl Rng,
     ) -> Vec3 {
-        let mut total = VEC_ZERO;
-        let mut throughput = Vec3::new(1.0, 1.0, 1.0);
+        let wave = sample_wavelength(lights, |l| l.spectrum, rng);
+        let lambda = wave.lambda;
+        let mut total = 0.0f32;
+        let mut throughput = 1.0f32;
         let mut cur = ray.clone();
         for _ in 0..max_depth {
             let Some(hit) = scene.intersect(&cur) else {
@@ -1512,14 +1660,29 @@ mod tests {
             } else {
                 hit.normal * -1.0
             };
-            total = total + throughput * hit.mat.emission;
+            // The emission at the drawn λ, from the light whose surface
+            // the path hit (the branch rule gates inactive emitters).
             if hit.mat.is_emissive() {
+                if let Some(light) = lights.iter().find(|l| l.contains(hit.p)) {
+                    if wave.active(&light.spectrum) {
+                        let in_beam = !hit.mat.is_laser()
+                            || hit.mat.in_beam(normal, hit.p, hit.p - cur.direction);
+                        if in_beam {
+                            total += throughput * light.spectrum.eval(lambda, wave.line_branch);
+                        }
+                    }
+                }
                 break;
             }
-            let s = hit
-                .mat
-                .sample_bsdf(normal, front_face, cur.direction, Transport::Radiance, rng);
-            throughput = throughput * s.weight;
+            let s = hit.mat.sample_bsdf(
+                normal,
+                front_face,
+                cur.direction,
+                Transport::Radiance,
+                lambda,
+                rng,
+            );
+            throughput *= s.weight;
             let offset = if s.dir_out.dot(normal) > 0.0 {
                 normal
             } else {
@@ -1530,7 +1693,7 @@ mod tests {
                 direction: s.dir_out,
             };
         }
-        total
+        sensor_rgb(lambda, total, wave.inv_pdf)
     }
 
     #[test]
@@ -1557,7 +1720,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(456);
         let mut mean_ref = VEC_ZERO;
         for _ in 0..N {
-            mean_ref = mean_ref + reference_pt(&r, &*scene, DEPTH, &mut rng);
+            mean_ref = mean_ref + reference_pt(&r, &*scene, DEPTH, &lights, &mut rng);
         }
         mean_ref = mean_ref * (1.0 / N as f32);
 
@@ -1568,15 +1731,91 @@ mod tests {
         );
     }
 
+    /// The killer spectral test: a smooth emitter renders to *exactly*
+    /// its RGB intent in expectation — the CMF-comb construction's
+    /// whole point. A direct view of the light must average to the
+    /// intent's RGB. The per-sample SD of a uniform-λ direct view is
+    /// ~2× the mean, so the SE at N = 65536 is ~0.8%; 3% is ~4σ.
     #[test]
-    fn looking_straight_at_the_light_returns_its_emission() {
+    fn smooth_emitter_renders_exactly_its_intent() {
         let (scene, lights) = test_scene();
         let mut rng = StdRng::seed_from_u64(7);
         let r = ray(Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        let c = bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
-        assert!((c.x - 1.0).abs() < 1e-4, "got {c:?}");
-        assert!((c.y - 1.0).abs() < 1e-4);
-        assert!((c.z - 1.0).abs() < 1e-4);
+        const N: usize = 65536;
+        let mut mean = VEC_ZERO;
+        for _ in 0..N {
+            mean = mean + bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
+        }
+        mean = mean * (1.0 / N as f32);
+        // The intent is (1, 1, 1).
+        assert!(
+            (mean.x - 1.0).abs() < 0.03 && (mean.y - 1.0).abs() < 0.03 && (mean.z - 1.0).abs() < 0.03,
+            "smooth emitter does not render its intent: {mean:?}"
+        );
+    }
+
+    /// A laser line renders a saturated color: a 650 nm line's rendered
+    /// RGB is dominated by red (the CMF at 650 nm: x̄ = 0.2835,
+    /// ȳ = 0.107, z̄ = 0 — deep red, out of the sRGB gamut on the
+    /// negative-G side, clamped at display but visible in the sample).
+    #[test]
+    fn laser_line_renders_a_saturated_color() {
+        let theta = 0.1f32;
+        let le = 50.0f32;
+        let housing = Cylinder::new(
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            0.4,
+            0.1,
+            Material::laser_line(650.0, le, theta),
+        );
+        let objects: Vec<Box<dyn Intersectable>> = vec![
+            Box::new(Plane {
+                point: Vec3::new(0.0, 0.0, 0.0),
+                normal: Vec3::new(0.0, 1.0, 0.0),
+                mat: diffuse(Vec3::new(0.8, 0.8, 0.8)),
+            }),
+            Box::new(housing.clone()),
+        ];
+        let lights = vec![AreaLight::from_laser(
+            housing.top_center(),
+            housing.axis,
+            housing.radius,
+            theta,
+            SpectrumKind::Line {
+                lambda: 650.0,
+                power: le,
+            },
+        )];
+        let scene = crate::bvh::BVHNode::build(objects).unwrap();
+
+        // Straight up the beam axis at the aperture: the rendered sample
+        // is CMF(650)·Le·inv_pdf converted to sRGB — red-dominant.
+        let mut rng = StdRng::seed_from_u64(21);
+        let r = ray(Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
+        const N: usize = 256;
+        let mut mean = VEC_ZERO;
+        for _ in 0..N {
+            mean = mean + bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
+        }
+        mean = mean * (1.0 / N as f32);
+        // The exact expectation: sRGB(XYZ(CMF(650)·Le)) — a single line,
+        // so every sample is identical (λ deterministic on the line
+        // branch) and the mean is exact.
+        let expected = sensor_rgb(650.0, le, 1.0);
+        assert!(
+            (mean.x - expected.x).abs() < 1e-3 * expected.x.max(1.0),
+            "line render {mean:?} vs expected {expected:?}"
+        );
+        assert!(
+            (mean.y - expected.y).abs() < 1e-3 * expected.y.max(1.0),
+            "line render {mean:?} vs expected {expected:?}"
+        );
+        // Red-dominant: the rendered color is deep red (650 nm is
+        // outside the sRGB gamut, so G/B go negative — clamped at
+        // display, but the sample carries them).
+        assert!(mean.x > 0.0);
+        assert!(mean.x > mean.y + mean.x * 0.5, "not red: {mean:?}");
     }
 
     #[test]
@@ -1585,10 +1824,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(11);
         let r = ray(Vec3::new(0.0, 1.5, 2.0), Vec3::new(0.0, -1.0, -0.5));
         let mut mean = VEC_ZERO;
-        for _ in 0..64 {
+        for _ in 0..256 {
             mean = mean + bdpt_trace(&r, &*scene, 8, &lights, NO_BRIDGES, &mut rng);
         }
-        mean = mean * (1.0 / 64.0);
+        mean = mean * (1.0 / 256.0);
         assert!(mean.x.is_finite() && mean.y.is_finite() && mean.z.is_finite());
         assert!(mean.x > 0.0 && mean.y > 0.0 && mean.z > 0.0, "got {mean:?}");
         // The floor cannot reflect more energy than the light emits.
@@ -1721,8 +1960,17 @@ mod tests {
 
         let mut rng = StdRng::seed_from_u64(9);
         let r = ray(Vec3::new(0.0, 0.5, 2.0), Vec3::new(0.0, 1.0, -1.0));
-        let c = bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
-        assert!((c.x - 4.0).abs() < 1e-3, "got {c:?}");
+        const N: usize = 4096;
+        let mut mean = VEC_ZERO;
+        for _ in 0..N {
+            mean = mean + bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
+        }
+        mean = mean * (1.0 / N as f32);
+        // The intent is (4, 4, 4); the SE at N = 4096 is ~1.5%.
+        assert!(
+            (mean.x - 4.0).abs() < 4.0 * 0.05,
+            "got {mean:?}"
+        );
     }
 
     /// The laser: a cylinder housing whose top cap emits a narrow cone.
@@ -1739,13 +1987,13 @@ mod tests {
         // cone half-angle ~5.7°: the beam disc on the floor has radius
         // 2 * tan(5.7°) ≈ 0.2.
         let theta = 0.1f32;
-        let le = Vec3::new(50.0, 50.0, 50.0);
+        let le = 50.0f32;
         let housing = Cylinder::new(
             Vec3::new(0.0, 2.0, 0.0),
             Vec3::new(0.0, -1.0, 0.0),
             0.4,
             0.1,
-            Material::laser(le, theta),
+            Material::laser_line(650.0, le, theta),
         );
         let objects: Vec<Box<dyn Intersectable>> = vec![
             Box::new(Plane {
@@ -1760,16 +2008,24 @@ mod tests {
             housing.axis,
             housing.radius,
             theta,
-            le,
+            SpectrumKind::Line {
+                lambda: 650.0,
+                power: le,
+            },
         )];
         let scene = crate::bvh::BVHNode::build(objects).unwrap();
 
         // 1. Straight up the beam axis at the aperture (from below, the
-        // side the cone opens to): full emission.
+        // side the cone opens to): full emission — the exact rendered
+        // value of the line (λ deterministic on the line branch).
         let mut rng = StdRng::seed_from_u64(21);
         let r = ray(Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
         let c = bdpt_trace(&r, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
-        assert!((c.x - le.x).abs() < 1e-3, "beam-axis view: {c:?}");
+        let expected = sensor_rgb(650.0, le, 1.0);
+        assert!(
+            (c.x - expected.x).abs() < 1e-3 * expected.x.max(1.0),
+            "beam-axis view: {c:?} vs {expected:?}"
+        );
 
         // 1b. An off-center aperture hit: the disc has radius 0.1, and a
         // ray striking it 0.05 off the axis is still a front-face hit
@@ -1779,7 +2035,10 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(25);
         let off_center = ray(Vec3::new(0.05, 0.5, 0.0), Vec3::new(0.0, 1.0, 0.0));
         let c = bdpt_trace(&off_center, &*scene, 4, &lights, NO_BRIDGES, &mut rng);
-        assert!((c.x - le.x).abs() < 1e-3, "off-center aperture view: {c:?}");
+        assert!(
+            (c.x - expected.x).abs() < 1e-3 * expected.x.max(1.0),
+            "off-center aperture view: {c:?} vs {expected:?}"
+        );
 
         // 2. Inside vs outside the beam on the floor. The beam disc has
         // radius 2 * tan(0.1) ≈ 0.2 centered at the origin; the camera
@@ -1845,6 +2104,10 @@ mod tests {
     /// the walls (the surfaces that see the ceiling most edge-on) are a
     /// small fraction of the surface and sit directly beneath the
     /// emitter's edge. Measured tail in this geometry: < 0.5%.
+    ///
+    /// Spectral note: the emitter renders to exactly its RGB intent in
+    /// expectation (the CMF-comb construction), so the furnace's
+    /// assertion keeps its exact meaning as a mean over N samples.
     #[test]
     fn white_furnace() {
         mark("white_furnace");
@@ -2026,8 +2289,6 @@ mod tests {
         // through the sphere, to the floor.
         let r = ray(Vec3::new(0.0, 0.24, 0.0), Vec3::new(0.05, -1.0, 0.0));
 
-        const N: usize = 4096;
-        const DEPTH: usize = 8;
         // The room builder, called twice: once with the glass sphere and
         // once without (the control). Box<dyn Intersectable> is not
         // Clone, so the lists are built fresh.
@@ -2069,7 +2330,11 @@ mod tests {
         let mut sweep = String::new();
         let mut means = std::collections::HashMap::new();
         // Glass scene and no-sphere control, same seed: the difference is
-        // the glass-specific energy loss (truncation cancels).
+        // the glass-specific energy loss (truncation cancels). The
+        // spectral per-sample SD is ~2x the mean, so N = 65536 keeps the
+        // SE under 1%.
+        const N: usize = 65536;
+        const DEPTH: usize = 8;
         for (name, objects) in [
             ("glass", build_room(true)),
             ("control", build_room(false)),
@@ -2286,7 +2551,7 @@ mod tests {
         let mut mean_pt = VEC_ZERO;
         let mut sq_sum_pt = 0.0f32;
         for _ in 0..N {
-            let c = reference_pt(&r, &*scene, 8, &mut rng);
+            let c = reference_pt(&r, &*scene, 8, &lights, &mut rng);
             mean_pt = mean_pt + c;
             sq_sum_pt += c.x * c.x;
         }
@@ -2316,5 +2581,159 @@ mod tests {
             ),
         )
         .ok();
+    }
+
+    /// Dispersion (paper §9.2): a dispersive glass sphere must fan
+    /// light into a spectrum — the caustic's red and blue components
+    /// land at *different* radii. The scene carries *both* lines
+    /// simultaneously (450 nm and 650 nm), so each rendered sample
+    /// draws one line's branch and the accumulated image contains both
+    /// colors. The measure is the R/B ratio's *swing across the
+    /// caustic ring*: the lines' constant power ratio appears at every
+    /// position equally and cancels, so what remains isolates the
+    /// dispersion — the blue focus sits at a different radius than the
+    /// red one. The achromatic control (constant n, the same mean
+    /// index) must show no swing: both lines land identically.
+    ///
+    /// The test glass is a *strongly* dispersive Sellmeier (Δn ≈ 0.11
+    /// across the visible, ~7× BK7): the test's job is to verify the
+    /// machinery — that n(λ) steers the transport per-λ — not BK7's
+    /// specific magnitude, which the BSDF-level test pins
+    /// (`dispersive_glass_bends_blue_more_than_red`). With real BK7
+    /// the red/blue foci separate by less than a probe spacing and the
+    /// signal drowns in noise; amplifying the effect isolates it.
+    #[test]
+    fn dispersive_glass_splits_the_caustic() {
+        // A strongly dispersive "glass": n(450) ≈ 1.77, n(650) ≈ 1.66
+        // (one active Sellmeier term; the mean index is the achromatic
+        // control's constant n).
+        let strong = [1.5f32, 0.0, 0.0, 0.06, 1.0, 1.0];
+        let n_blue = sellmeier_n(&strong, 450.0);
+        let n_red = sellmeier_n(&strong, 650.0);
+        assert!((n_blue - n_red).abs() > 0.08, "the test glass must disperse");
+        let n_mean = 0.5 * (n_blue + n_red);
+        // A dark room, two line emitters (blue + red) on the ceiling, a
+        // glass sphere resting on the floor under them. The caustic
+        // ring lands on the floor around the sphere's shadow.
+        let dark = diffuse(Vec3::new(0.1, 0.1, 0.1));
+        let build = |glass: Material| -> (Box<dyn Intersectable>, Vec<AreaLight>) {
+            let blue = Quad::new(
+                Vec3::new(-0.15, 3.0, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                0.2,
+                0.2,
+                Material::emissive_spec(SpectrumKind::Line {
+                    lambda: 450.0,
+                    power: 20.0,
+                }),
+            );
+            let red = Quad::new(
+                Vec3::new(0.15, 3.0, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                0.2,
+                0.2,
+                Material::emissive_spec(SpectrumKind::Line {
+                    lambda: 650.0,
+                    power: 20.0,
+                }),
+            );
+            let objects: Vec<Box<dyn Intersectable>> = vec![
+                Box::new(Plane {
+                    point: Vec3::new(0.0, 0.0, 0.0),
+                    normal: Vec3::new(0.0, 1.0, 0.0),
+                    mat: dark,
+                }),
+                Box::new(Plane {
+                    point: Vec3::new(0.0, 3.0, 0.0),
+                    normal: Vec3::new(0.0, -1.0, 0.0),
+                    mat: dark,
+                }),
+                Box::new(Plane {
+                    point: Vec3::new(-2.0, 1.5, 0.0),
+                    normal: Vec3::new(1.0, 0.0, 0.0),
+                    mat: dark,
+                }),
+                Box::new(Plane {
+                    point: Vec3::new(2.0, 1.5, 0.0),
+                    normal: Vec3::new(-1.0, 0.0, 0.0),
+                    mat: dark,
+                }),
+                Box::new(Plane {
+                    point: Vec3::new(0.0, 1.5, -2.0),
+                    normal: Vec3::new(0.0, 0.0, 1.0),
+                    mat: dark,
+                }),
+                Box::new(Plane {
+                    point: Vec3::new(0.0, 1.5, 2.0),
+                    normal: Vec3::new(0.0, 0.0, -1.0),
+                    mat: dark,
+                }),
+                Box::new(blue.clone()),
+                Box::new(red.clone()),
+                Box::new(Sphere {
+                    center: Vec3::new(0.0, 0.5, 0.0),
+                    radius: 0.5,
+                    mat: glass,
+                }),
+            ];
+            let lights = vec![AreaLight::from_quad(&blue), AreaLight::from_quad(&red)];
+            (crate::bvh::BVHNode::build(objects).unwrap(), lights)
+        };
+
+        // The R/B ratio at one floor probe. R and B are each means over
+        // ~half the samples (each line draws ~half the λ branches), so
+        // the ratio's noise is geometric only — a few percent at
+        // N = 16384. The probes aim at floor points *inside the
+        // sphere's shadow* (the direct light is blocked there; only the
+        // refracted caustic lands), straddling the shadow's edge where
+        // the ring concentrates.
+        const N: usize = 16384;
+        let probe_rb = |scene: &dyn Intersectable, lights: &[AreaLight], target: Vec3| -> f32 {
+            let mut rng = StdRng::seed_from_u64(77);
+            // The camera hovers above the target, looking straight down:
+            // the ray hits the floor at the target (the sphere is off
+            // to the sides of these probes).
+            let r = ray(Vec3::new(target.x, 1.0, target.z + 0.001), target - Vec3::new(target.x, 1.0, target.z + 0.001));
+            let mut mean = VEC_ZERO;
+            for _ in 0..N {
+                mean = mean + bdpt_trace(&r, scene, 8, lights, NO_BRIDGES, &mut rng);
+            }
+            mean = mean * (1.0 / N as f32);
+            // The rendered 650 nm sample is red-dominant (R channel),
+            // the 450 nm blue-dominant (B channel) — the R/B ratio
+            // compares where each line's caustic landed.
+            mean.x / mean.z.max(1e-6)
+        };
+
+        // Scan across the sphere's shadow edge, where the caustic ring
+        // concentrates. The dispersion moves the blue focus relative to
+        // the red one, so at some probe the two scenes' R/B ratios must
+        // differ far beyond the geometric noise — the achromatic control
+        // has the same mean n, so its two lines land identically and any
+        // R/B difference between the scenes is the dispersion itself.
+        let (scene_disp, lights) = build(Material::glass_sellmeier(n_mean, strong));
+        let (scene_ach, lights_ach) = build(Material::glass(n_mean));
+        let mut rb_disp = Vec::new();
+        let mut rb_ach = Vec::new();
+        // The sphere rests at the origin with radius 0.5; the shadow on
+        // the floor spans |x| ≲ 0.5 and the caustic ring hugs its edge.
+        // Scan just inside and just outside the edge.
+        for &x in &[0.30f32, 0.40, 0.50, 0.60, 0.70] {
+            let target = Vec3::new(x, 0.0, 0.0);
+            rb_disp.push(probe_rb(&*scene_disp, &lights, target));
+            rb_ach.push(probe_rb(&*scene_ach, &lights_ach, target));
+        }
+        // The largest relative R/B difference between the scenes across
+        // the scan, guarded against both values being ~0.
+        let mut best = 0.0f32;
+        for (&d, &a) in rb_disp.iter().zip(&rb_ach) {
+            let denom = (d + a).max(1e-3);
+            best = best.max((d - a).abs() / denom);
+        }
+        assert!(
+            best > 0.25,
+            "dispersion did not split the caustic: best relative R/B difference {best:.4} \
+             (disp {rb_disp:?} ach {rb_ach:?})"
+        );
     }
 }

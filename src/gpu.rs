@@ -37,9 +37,12 @@ struct Uniforms {
     spp: u32,
     /// Scene prims; 0 = empty scene, the shader skips traversal.
     n_prims: u32,
-    /// Per-sample firefly clamp bound (0 = disable). Computed by
-    /// `bdpt::firefly_clamp_bound` as a loose multiple of the scene's
-    /// brightest emitter luminance.
+    /// The per-sample firefly clamp *multiplier* (paper §9.2: the bound
+    /// is now a spectral quantity — 8× the brightest emitter's
+    /// luminance at the sampled λ — computed per-λ in the shader from
+    /// the active emitters' spectra and the λ sample). Always
+    /// `FIREFLY_LIGHT_MULT`; kept as a uniform so the WGSL clamp and
+    /// the CPU clamp share one source of truth for the multiplier.
     firefly_clamp: f32,
     _pad2: u32,
 }
@@ -52,6 +55,15 @@ struct Uniforms {
 /// `center`/`normal`, the quad's `half_w` lives in `radius`, the
 /// cylinder's base lives in `center`, its axis in `tangent`, its radius in
 /// `radius` and its half-height in `half_h`.
+///
+/// Spectral fields (paper §9.2): `sellmeier` carries the glass
+/// dispersion coefficients (all zeros = achromatic, the constant
+/// `ior`); `rough` carries the GGX roughness for a glossy material
+/// (§9.5) and `f0` its normal-incidence reflectance (both 0 for
+/// non-glossy). The emission spectrum is carried by the *light* buffer
+/// for sampleable emitters; a prim's own `spectrum_kind` marks it
+/// emissive (the shader never needs the prim's spectrum — emission is
+/// credited only through the light buffer, exactly as before).
 ///
 /// Layout rule: every `vec3<f32>` is immediately followed by an `f32` so
 /// WGSL's implicit 16-byte alignment never inserts padding that Rust's
@@ -73,8 +85,9 @@ struct GpuPrim {
     _pad2: f32,
     albedo: [f32; 3],
     _pad3: f32,
-    emission: [f32; 3],
-    _pad4: f32,
+    sellmeier: [f32; 6],
+    rough: f32,
+    f0: f32,
 }
 
 /// One flat BVH node in GPU form (matches `BvhNode` in shaders/bdpt.wgsl).
@@ -100,11 +113,25 @@ struct GpuBvhNode {
 /// aperture (disc + cone). For a laser, `half_w` carries the cone
 /// half-angle `theta` (the slot is unused by the disc) — the same
 /// piggyback the CPU-side `LightData` uses.
+///
+/// Spectral fields (paper §9.2): `spectrum_kind` is 0 = smooth, 1 = a
+/// monochromatic line. A smooth spectrum is the CMF-basis combination
+/// `S(λ) = coeffs·CMF(λ)` (the unique SPD whose tristimulus integral is
+/// the RGB intent — see `spectrum::SpectrumKind::smooth_from_rgb`); a
+/// line carries `lambda` (nm) and `power` (spectral radiance). The
+/// shader evaluates the spectrum at the path's hero wavelength under
+/// the branch rule (lines radiate only on line branches, smooth SPDs
+/// only on smooth branches).
+///
+/// The coefficients ride as three *scalars* (not a vec3): WGSL aligns
+/// vec3 to 16 bytes, which would misalign `bridge_rungs` (an
+/// array<vec4>, 16-byte elements) between the two languages. Scalars
+/// are 4-aligned in both, so the layouts agree byte-for-byte.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuLight {
     shape: u32,
-    _pad0: f32,
+    spectrum_kind: u32,
     _pad1: f32,
     _pad2: f32,
     center: [f32; 3],
@@ -116,11 +143,17 @@ struct GpuLight {
     bitangent: [f32; 3],
     half_w: f32,
     half_h: f32,
-    _pad5: f32,
-    _pad6: f32,
-    _pad7: f32,
-    emission: [f32; 3],
+    /// The smooth spectrum's CMF-basis coefficients (a line ignores
+    /// them), as three scalars — see the struct doc.
+    coeff_x: f32,
+    coeff_y: f32,
+    coeff_z: f32,
+    /// The line's wavelength (nm); 0 for a smooth spectrum.
+    lambda: f32,
+    /// The line's spectral radiance; 0 for a smooth spectrum.
+    power: f32,
     _pad8: f32,
+    _pad8b: f32,
     /// The specular bridge *ladder* (a laser only), packed one rung per
     /// `vec4`: xyz = the rung's image-center, w = its radius. Rung j is
     /// the aperture's mirror image unfolded across the first j mirrors
@@ -158,9 +191,18 @@ impl GpuLight {
                 b.radius,
             ];
         }
+        let (spectrum_kind, coeffs, lambda, power) = match l.spectrum {
+            crate::spectrum::SpectrumKind::Smooth { coeffs } => {
+                (0u32, [coeffs.x, coeffs.y, coeffs.z], 0.0f32, 0.0f32)
+            }
+            crate::spectrum::SpectrumKind::Line { lambda, power } => {
+                (1u32, [0.0f32; 3], lambda, power)
+            }
+            crate::spectrum::SpectrumKind::None => (0u32, [0.0f32; 3], 0.0, 0.0),
+        };
         Self {
             shape: l.shape,
-            _pad0: 0.0,
+            spectrum_kind,
             _pad1: 0.0,
             _pad2: 0.0,
             center: [l.center.x, l.center.y, l.center.z],
@@ -172,11 +214,13 @@ impl GpuLight {
             bitangent: [l.bitangent.x, l.bitangent.y, l.bitangent.z],
             half_w: l.half_w,
             half_h: l.half_h,
-            _pad5: 0.0,
-            _pad6: 0.0,
-            _pad7: 0.0,
-            emission: [l.emission.x, l.emission.y, l.emission.z],
+            coeff_x: coeffs[0],
+            coeff_y: coeffs[1],
+            coeff_z: coeffs[2],
+            lambda,
+            power,
             _pad8: 0.0,
+            _pad8b: 0.0,
             bridge_rungs,
             n_bridges: ladder.len().min(MAX_BEAM_BOUNCES) as u32,
             _pad9: [0.0; 3],
@@ -191,6 +235,10 @@ const MAT_GLASS: u32 = 3;
 /// A laser aperture: emissive, but radiating only into a cone. The cone's
 /// cosine rides in the prim's `ior` slot (unused by emitters).
 const MAT_LASER: u32 = 4;
+/// A GGX microfacet "rough mirror" (paper §9.5): a continuous lobe, so
+/// connections through it are valid. The roughness rides in `rough`,
+/// the normal-incidence reflectance in `f0`.
+const MAT_GLOSSY: u32 = 5;
 
 // Prim kind tags, shared with shaders/bdpt.wgsl.
 const KIND_SPHERE: u32 = 0;
@@ -203,7 +251,7 @@ const KIND_CYLINDER: u32 = 4;
 /// structs byte-for-byte. WGSL aligns vec3<f32> to 16 bytes, so every
 /// vec3 is followed by an explicit f32 pad in both languages.
 const _: () = {
-    assert!(std::mem::size_of::<GpuPrim>() == 112);
+    assert!(std::mem::size_of::<GpuPrim>() == 128);
     assert!(std::mem::size_of::<GpuBvhNode>() == 32);
     assert!(std::mem::size_of::<GpuLight>() == 256);
     assert!(std::mem::size_of::<Uniforms>() == 96);
@@ -386,6 +434,7 @@ fn mat_type_u32(m: &crate::scene::MaterialData) -> u32 {
             crate::geometry::Bsdf::Diffuse => MAT_DIFFUSE,
             crate::geometry::Bsdf::Mirror => MAT_MIRROR,
             crate::geometry::Bsdf::Glass { .. } => MAT_GLASS,
+            crate::geometry::Bsdf::Glossy { .. } => MAT_GLOSSY,
             crate::geometry::Bsdf::Laser { .. } => MAT_DIFFUSE, // unreachable
         }
     }
@@ -396,9 +445,34 @@ fn mat_type_u32(m: &crate::scene::MaterialData) -> u32 {
 /// the emission cone's cosine instead (see `MAT_LASER`).
 fn mat_ior(m: &crate::scene::MaterialData) -> f32 {
     match m.bsdf {
-        crate::geometry::Bsdf::Glass { ior } => ior,
+        crate::geometry::Bsdf::Glass { ior, .. } => ior,
         crate::geometry::Bsdf::Laser { cos_theta } => cos_theta,
         _ => 1.0,
+    }
+}
+
+/// The GGX roughness of a glossy material (0 for everything else).
+fn mat_rough(m: &crate::scene::MaterialData) -> f32 {
+    match m.bsdf {
+        crate::geometry::Bsdf::Glossy { alpha, .. } => alpha,
+        _ => 0.0,
+    }
+}
+
+/// The normal-incidence reflectance of a glossy material (0 otherwise).
+fn mat_f0(m: &crate::scene::MaterialData) -> f32 {
+    match m.bsdf {
+        crate::geometry::Bsdf::Glossy { f0, .. } => f0,
+        _ => 0.0,
+    }
+}
+
+/// The Sellmeier dispersion coefficients of a glass material (all zeros
+/// = achromatic, the constant `ior`).
+fn mat_sellmeier(m: &crate::scene::MaterialData) -> [f32; 6] {
+    match m.bsdf {
+        crate::geometry::Bsdf::Glass { sellmeier, .. } => sellmeier,
+        _ => [0.0; 6],
     }
 }
 
@@ -636,107 +710,97 @@ impl GpuRenderer {
     ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, u32, u32, f32) {
         // All four prim families share one kind-tagged array so a BVH
         // leaf can reference a contiguous range with no per-prim
-        // indirection.
+        // indirection. The spectral fields (Sellmeier, roughness) are
+        // shared by every family through this helper.
+        let mk_prim = |kind: u32,
+                       mat: &crate::scene::MaterialData,
+                       center: Vec3,
+                       radius: f32,
+                       normal: Vec3,
+                       half_h: f32,
+                       tangent: Vec3,
+                       bitangent: Vec3|
+         -> GpuPrim {
+            GpuPrim {
+                kind,
+                ior: mat_ior(mat),
+                mat_type: mat_type_u32(mat),
+                _pad0: 0.0,
+                center: vec3s(center),
+                radius,
+                normal: vec3s(normal),
+                half_h,
+                tangent: vec3s(tangent),
+                _pad1: 0.0,
+                bitangent: vec3s(bitangent),
+                _pad2: 0.0,
+                albedo: vec3s(mat.albedo),
+                _pad3: 0.0,
+                sellmeier: mat_sellmeier(mat),
+                rough: mat_rough(mat),
+                f0: mat_f0(mat),
+            }
+        };
         let mut prims: Vec<GpuPrim> = Vec::new();
         for s in &scene.spheres {
-            prims.push(GpuPrim {
-                kind: KIND_SPHERE,
-                ior: mat_ior(&s.mat),
-                mat_type: mat_type_u32(&s.mat),
-                _pad0: 0.0,
-                center: vec3s(s.center),
-                radius: s.radius,
-                normal: [0.0; 3],
-                half_h: 0.0,
-                tangent: [0.0; 3],
-                _pad1: 0.0,
-                bitangent: [0.0; 3],
-                _pad2: 0.0,
-                albedo: vec3s(s.mat.albedo),
-                _pad3: 0.0,
-                emission: vec3s(s.mat.emission),
-                _pad4: 0.0,
-            });
+            prims.push(mk_prim(
+                KIND_SPHERE,
+                &s.mat,
+                s.center,
+                s.radius,
+                Vec3::new(0.0, 0.0, 0.0),
+                0.0,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ));
         }
         for q in &scene.quads {
-            prims.push(GpuPrim {
-                kind: KIND_QUAD,
-                ior: mat_ior(&q.mat),
-                mat_type: mat_type_u32(&q.mat),
-                _pad0: 0.0,
-                center: vec3s(q.center),
-                radius: q.half_w,
-                normal: vec3s(q.normal),
-                half_h: q.half_h,
-                tangent: vec3s(q.tangent),
-                _pad1: 0.0,
-                bitangent: vec3s(q.bitangent),
-                _pad2: 0.0,
-                albedo: vec3s(q.mat.albedo),
-                _pad3: 0.0,
-                emission: vec3s(q.mat.emission),
-                _pad4: 0.0,
-            });
+            prims.push(mk_prim(
+                KIND_QUAD,
+                &q.mat,
+                q.center,
+                q.half_w,
+                q.normal,
+                q.half_h,
+                q.tangent,
+                q.bitangent,
+            ));
         }
         for c in &scene.cubes {
-            prims.push(GpuPrim {
-                kind: KIND_CUBE,
-                ior: mat_ior(&c.mat),
-                mat_type: mat_type_u32(&c.mat),
-                _pad0: 0.0,
-                center: vec3s(c.min),
-                radius: 0.0,
-                normal: vec3s(c.max),
-                half_h: 0.0,
-                tangent: [0.0; 3],
-                _pad1: 0.0,
-                bitangent: [0.0; 3],
-                _pad2: 0.0,
-                albedo: vec3s(c.mat.albedo),
-                _pad3: 0.0,
-                emission: vec3s(c.mat.emission),
-                _pad4: 0.0,
-            });
+            prims.push(mk_prim(
+                KIND_CUBE,
+                &c.mat,
+                c.min,
+                0.0,
+                c.max,
+                0.0,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ));
         }
         for p in &scene.planes {
-            prims.push(GpuPrim {
-                kind: KIND_PLANE,
-                ior: mat_ior(&p.mat),
-                mat_type: mat_type_u32(&p.mat),
-                _pad0: 0.0,
-                center: vec3s(p.point),
-                radius: 0.0,
-                normal: vec3s(p.normal),
-                half_h: 0.0,
-                tangent: [0.0; 3],
-                _pad1: 0.0,
-                bitangent: [0.0; 3],
-                _pad2: 0.0,
-                albedo: vec3s(p.mat.albedo),
-                _pad3: 0.0,
-                emission: vec3s(p.mat.emission),
-                _pad4: 0.0,
-            });
+            prims.push(mk_prim(
+                KIND_PLANE,
+                &p.mat,
+                p.point,
+                0.0,
+                p.normal,
+                0.0,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ));
         }
         for c in &scene.cylinders {
-            prims.push(GpuPrim {
-                kind: KIND_CYLINDER,
-                ior: mat_ior(&c.mat),
-                mat_type: mat_type_u32(&c.mat),
-                _pad0: 0.0,
-                center: vec3s(c.base),
-                radius: c.radius,
-                normal: [0.0; 3],
-                half_h: c.half_h,
-                tangent: vec3s(c.axis),
-                _pad1: 0.0,
-                bitangent: [0.0; 3],
-                _pad2: 0.0,
-                albedo: vec3s(c.mat.albedo),
-                _pad3: 0.0,
-                emission: vec3s(c.mat.emission),
-                _pad4: 0.0,
-            });
+            prims.push(mk_prim(
+                KIND_CYLINDER,
+                &c.mat,
+                c.base,
+                c.radius,
+                Vec3::new(0.0, 0.0, 0.0),
+                c.half_h,
+                c.axis,
+                Vec3::new(0.0, 0.0, 0.0),
+            ));
         }
         let n_prims = prims.len() as u32;
         let bvh_nodes = build_bvh(&mut prims).unwrap_or_default();
@@ -760,7 +824,13 @@ impl GpuRenderer {
             .enumerate()
             .map(|(i, l)| GpuLight::from_light_data(l, &ladders[i]))
             .collect();
-        let firefly_clamp = crate::bdpt::firefly_clamp_bound(scene.max_light_luminance());
+        // The per-sample firefly clamp is now a *spectral* quantity
+        // (paper §9.2): the bound is computed per-λ in the shader from
+        // the active emitters' spectra and the λ sample. The uniform
+        // carries the multiplier (FIREFLY_LIGHT_MULT) instead of a
+        // scene-level bound; 0 would disable the clamp, so the
+        // multiplier is always sent.
+        let firefly_clamp = crate::bdpt::FIREFLY_LIGHT_MULT;
 
         // Storage buffers must be non-empty for WGSL arrayLength to be valid;
         // pad empty families to one zeroed element of the right stride.
@@ -1105,6 +1175,30 @@ mod tests {
         assert!(!module.entry_points.is_empty());
     }
 
+    /// A minimal prim for the BVH tests: a sphere at `center` with the
+    /// given radius (the spectral fields are irrelevant to the tree).
+    fn test_prim(center: [f32; 3], radius: f32) -> GpuPrim {
+        GpuPrim {
+            kind: KIND_SPHERE,
+            ior: 1.0,
+            mat_type: 0,
+            _pad0: 0.0,
+            center,
+            radius,
+            normal: [0.0; 3],
+            half_h: 0.0,
+            tangent: [0.0; 3],
+            _pad1: 0.0,
+            bitangent: [0.0; 3],
+            _pad2: 0.0,
+            albedo: [0.0; 3],
+            _pad3: 0.0,
+            sellmeier: [0.0; 6],
+            rough: 0.0,
+            f0: 0.0,
+        }
+    }
+
     /// The flat BVH must be a valid traversal structure:
     /// * every prim appears in exactly one leaf;
     /// * leaf prim ranges are disjoint and cover all prims;
@@ -1142,86 +1236,33 @@ mod tests {
             MaterialData::diffuse(crate::math::Vec3::new(0.8, 0.8, 0.8)),
         );
 
+        // The BVH tests only exercise the tree structure, so the prims
+        // are built through the same helper the scene upload uses —
+        // kind-tagged, with the geometry the tests place.
         let mut prims: Vec<GpuPrim> = Vec::new();
         for s in &scene.spheres {
-            prims.push(GpuPrim {
-                kind: KIND_SPHERE,
-                ior: 1.0,
-                mat_type: 0,
-                _pad0: 0.0,
-                center: vec3s(s.center),
-                radius: s.radius,
-                normal: [0.0; 3],
-                half_h: 0.0,
-                tangent: [0.0; 3],
-                _pad1: 0.0,
-                bitangent: [0.0; 3],
-                _pad2: 0.0,
-                albedo: [0.0; 3],
-                _pad3: 0.0,
-                emission: [0.0; 3],
-                _pad4: 0.0,
-            });
+            prims.push(test_prim(vec3s(s.center), s.radius));
         }
         for q in &scene.quads {
-            prims.push(GpuPrim {
-                kind: KIND_QUAD,
-                ior: 1.0,
-                mat_type: 0,
-                _pad0: 0.0,
-                center: vec3s(q.center),
-                radius: q.half_w,
-                normal: vec3s(q.normal),
-                half_h: q.half_h,
-                tangent: vec3s(q.tangent),
-                _pad1: 0.0,
-                bitangent: vec3s(q.bitangent),
-                _pad2: 0.0,
-                albedo: [0.0; 3],
-                _pad3: 0.0,
-                emission: [0.0; 3],
-                _pad4: 0.0,
-            });
+            let mut p = test_prim(vec3s(q.center), q.half_w);
+            p.kind = KIND_QUAD;
+            p.normal = vec3s(q.normal);
+            p.half_h = q.half_h;
+            p.tangent = vec3s(q.tangent);
+            p.bitangent = vec3s(q.bitangent);
+            prims.push(p);
         }
         for c in &scene.cubes {
-            prims.push(GpuPrim {
-                kind: KIND_CUBE,
-                ior: 1.0,
-                mat_type: 0,
-                _pad0: 0.0,
-                center: vec3s(c.min),
-                radius: 0.0,
-                normal: vec3s(c.max),
-                half_h: 0.0,
-                tangent: [0.0; 3],
-                _pad1: 0.0,
-                bitangent: [0.0; 3],
-                _pad2: 0.0,
-                albedo: [0.0; 3],
-                _pad3: 0.0,
-                emission: [0.0; 3],
-                _pad4: 0.0,
-            });
+            let mut p = test_prim(vec3s(c.min), 0.0);
+            p.kind = KIND_CUBE;
+            p.normal = vec3s(c.max);
+            prims.push(p);
         }
         for p in &scene.planes {
-            prims.push(GpuPrim {
-                kind: KIND_PLANE,
-                ior: 1.0,
-                mat_type: 0,
-                _pad0: 0.0,
-                center: vec3s(p.point),
-                radius: 0.0,
-                normal: vec3s(p.normal),
-                half_h: 0.0,
-                tangent: [0.0; 3],
-                _pad1: 0.0,
-                bitangent: [0.0; 3],
-                _pad2: 0.0,
-                albedo: [0.0; 3],
-                _pad3: 0.0,
-                emission: [0.0; 3],
-                _pad4: 0.0,
-            });
+            let mut prim = test_prim(vec3s(p.point), 0.0);
+            prim.kind = KIND_PLANE;
+            prim.normal = vec3s(p.normal);
+            prims.push(prim);
         }
         let n = prims.len();
         let nodes = build_bvh(&mut prims).expect("non-empty scene must build a BVH");
@@ -1265,24 +1306,7 @@ mod tests {
     fn flat_bvh_handles_degenerate_scenes() {
         let mut prims: Vec<GpuPrim> = Vec::new();
         for _ in 0..16 {
-            prims.push(GpuPrim {
-                kind: KIND_SPHERE,
-                ior: 1.0,
-                mat_type: 0,
-                _pad0: 0.0,
-                center: [0.0, 0.0, 0.0],
-                radius: 0.5,
-                normal: [0.0; 3],
-                half_h: 0.0,
-                tangent: [0.0; 3],
-                _pad1: 0.0,
-                bitangent: [0.0; 3],
-                _pad2: 0.0,
-                albedo: [0.0; 3],
-                _pad3: 0.0,
-                emission: [0.0; 3],
-                _pad4: 0.0,
-            });
+            prims.push(test_prim([0.0, 0.0, 0.0], 0.5));
         }
         let nodes = build_bvh(&mut prims).expect("non-empty scene must build a BVH");
         // 16 prims, median split: 15 inner nodes + 16 leaves = 31 nodes.
@@ -1306,7 +1330,16 @@ mod tests {
     /// clean error (never panic). On machines with any adapter (including
     /// software rasterizers like llvmpipe) it also renders one frame and
     /// checks the pixels are finite.
+    ///
+    /// Ignored by default: it needs a real GPU adapter. Run with
+    /// `cargo test -- --ignored gpu_renderer_smoke`.
+    ///
+    /// History: the NVIDIA 615.78.08 shader compiler crashed the whole
+    /// test process with SIGILL here (see the comment on
+    /// `lambda_eq` in shaders/bdpt.wgsl); the shader-side workaround
+    /// fixed it, and this test is the regression guard.
     #[test]
+    #[ignore]
     fn gpu_renderer_smoke() {
         // Capture any panic message to a file (test harness hides stdout).
         // Written under target/ so the working tree stays clean.

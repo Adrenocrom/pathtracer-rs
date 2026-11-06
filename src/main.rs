@@ -8,6 +8,7 @@ mod math;
 mod output;
 mod renderer;
 mod scene;
+mod spectrum;
 mod window;
 
 use crate::camera::Cam;
@@ -42,7 +43,7 @@ fn build_scene() -> SceneData {
     build_scene_with(1.0)
 }
 
-fn build_scene_with(laser_aim_y: f32) -> SceneData {
+fn build_scene_with(_laser_aim_y: f32) -> SceneData {
     let emission = Vec3::new(1000.0, 1000.0, 1000.0);
     let room_size = 2.5;
     let room_height = 2.0;
@@ -215,17 +216,26 @@ fn build_scene_with(laser_aim_y: f32) -> SceneData {
     // key): the laser pivots on its table mount, scanning the beam up
     // and down the back-wall mirror; the spot slides up and down the
     // partition, and the derived ladder follows.
+    //
+    // Spectral (paper §9.2): the laser is a *monochromatic line* —
+    // 650 nm, the physically correct replacement for the old RGB trick
+    // of putting 4×10⁸ in the red channel. The line's power is chosen
+    // so the rendered spot's luminance matches the old RGB hack (the
+    // 1/p(λ) sensor factor ≈ ×3 replaces the channel stuffing); the
+    // out-of-gamut negative channels clamp at display, where they
+    // belong.
     let laser_pos = Vec3::new(-1.3, 0.62, 1.8);
     let back_mirror_center = Vec3::new(0.0, 1.0, -(room_size - 0.01));
     //let aim_point = Vec3::new(0.0, laser_aim_y, -(room_size - 0.01));
     let aim = Vec3::new(1.0, 0.0, -room_size).normalize();
-    scene.add_laser(
+    scene.add_laser_line(
         laser_pos,
         aim,
         0.2,                        // housing height
         0.01,                       // aperture radius
         0.01,                       // beam half-angle (radians, ~0.57°)
-        Vec3::new(4.0e8, 800.0, 800.0), // red laser
+        650.0,                      // nm — the red laser line
+        1.2e9,                      // spectral radiance at the line
     );
     scene.add_quad(
         back_mirror_center,
@@ -235,8 +245,25 @@ fn build_scene_with(laser_aim_y: f32) -> SceneData {
         MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
     );
 
-    scene.add_box( Vec3::new(-1.4, 0.65, 1.5), Vec3::new(0.1, 0.1, 0.1), MaterialData::glass(1.5));
-    scene.add_box( Vec3::new(-1.9, 0.65, 1.7), Vec3::new(0.001, 0.1, 0.2), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
+    // The glass cube: N-BK7 borosilicate (paper §9.2) — a dispersive
+    // dielectric, so its caustic picks up chromatic fringes (blue bends
+    // more than red). The Sellmeier coefficients replace the constant
+    // n = 1.5.
+    scene.add_box(
+        Vec3::new(-1.4, 0.65, 1.5),
+        Vec3::new(0.1, 0.1, 0.1),
+        MaterialData::glass_bk7(),
+    );
+    // The green laser's ping-pong tiles: the first is a GGX *rough
+    // mirror* (paper §9.5) — the tile picks up soft reflections of the
+    // room, the beam still lands (the trace follows the lobe's mean),
+    // the ladder still derives rung-per-crossing, and the spot softens.
+    // The second stays a perfect mirror — the visible contrast.
+    scene.add_box(
+        Vec3::new(-1.9, 0.65, 1.7),
+        Vec3::new(0.001, 0.1, 0.2),
+        MaterialData::glossy(Vec3::new(1.0, 1.0, 1.0), 0.08, 0.9),
+    );
     scene.add_box( Vec3::new(-1.7, 0.65, 1.6), Vec3::new(0.001, 0.1, 0.4), MaterialData::mirror(Vec3::new(1.0, 1.0, 1.0)));
 
     let pos = Vec3::new(-1.7, 0.6, 1.7);
@@ -254,13 +281,20 @@ fn build_scene_with(laser_aim_y: f32) -> SceneData {
     // what the bridge ladder's rungs carry — before the ladder, only
     // the first leg (direct light) and the last leg (the whole-chain
     // rung) glowed.
-    scene.add_laser(
+    //
+    // Spectral (paper §9.2): a 532 nm line — the classic green laser
+    // wavelength. A pure 532 nm green is outside the sRGB gamut, so the
+    // rendered sample carries negative R/B channels; the display stage
+    // gamut-maps them (§9.2: "the out-of-gamut problem moves to the
+    // display stage where it belongs").
+    scene.add_laser_line(
         Vec3::new(-1.6, 0.62, 1.9),
         Vec3::new(-1.0, 0.0, -0.5),
         0.2,
         0.01,
         0.01,
-        Vec3::new(800.0, 4.0e8, 800.0),
+        532.0,                      // nm — the green laser line
+        1.2e9,
     );
 
     scene.add_table(Vec3::new(0.0, 0.7, 0.0), Vec3::new(1.0, 0.05, 0.7), brown); // top slab + 4 legs to the floor
@@ -600,7 +634,6 @@ fn render_fhd(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Bsdf;
 
     #[test]
     fn scene_builds_and_is_sampleable() {
@@ -611,8 +644,21 @@ mod tests {
         assert_eq!(scene.lights.len(), 3);
         for light in &scene.lights {
             assert!(light.area() > 0.0);
-            assert!(light.emission.x > 0.0 || light.emission.y > 0.0 || light.emission.z > 0.0);
+            assert!(light.spectrum.is_emissive());
         }
+        // The two lasers are monochromatic lines (paper §9.2): 650 nm
+        // (red) and 532 nm (green).
+        let lambdas: Vec<f32> = scene
+            .lights
+            .iter()
+            .filter_map(|l| match l.spectrum {
+                crate::spectrum::SpectrumKind::Line { lambda, .. } => Some(lambda),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lambdas.len(), 2, "the two lasers must be line emitters");
+        assert!(lambdas.contains(&650.0), "the red laser: {lambdas:?}");
+        assert!(lambdas.contains(&532.0), "the green laser: {lambdas:?}");
         // A ray from the camera position must hit the scene.
         let (cpu_scene, lights) = scene.build_cpu_scene();
         let ray = crate::geometry::Ray {

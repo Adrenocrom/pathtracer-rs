@@ -1,4 +1,5 @@
 use crate::math::{BBox, Vec3, EPS_NEAR, VEC_ZERO};
+use crate::spectrum::{rgb_to_albedo, sellmeier_n, SpectrumKind};
 use rand::Rng;
 
 const PI: f32 = std::f32::consts::PI;
@@ -64,7 +65,22 @@ pub enum Bsdf {
     /// Fresnel splits reflection and refraction, total internal reflection
     /// falls back to reflection. `ior` is the interior index of refraction;
     /// the exterior is vacuum (ior = 1), so glass objects must be closed.
-    Glass { ior: f32 },
+    /// `sellmeier` carries the Sellmeier dispersion coefficients
+    /// `[B₁, B₂, B₃, C₁, C₂, C₃]` (C in µm²) — all zeros means achromatic
+    /// glass with the constant `ior` (paper §9.2: real dielectrics
+    /// disperse, n(λ), so a prism fans white light into a spectrum).
+    Glass {
+        ior: f32,
+        sellmeier: [f32; 6],
+    },
+    /// A GGX microfacet reflection lobe (paper §9.5): the "rough mirror".
+    /// `alpha` is the GGX roughness (α = 0 is the perfect-mirror limit);
+    /// `f0` is the normal-incidence reflectance (Schlick's F0 — a
+    /// mirror-like coating sits near 0.9, a bare dielectric at
+    /// ((ior−1)/(ior+1))² ≈ 0.04). Unlike Mirror this is a *continuous*
+    /// distribution: connections through glossy vertices are valid
+    /// (nonzero eval), so the BDPT blind spot softens on its own.
+    Glossy { alpha: f32, f0: f32 },
     /// Tag for a *laser emitter*: an emissive surface that radiates only
     /// into a narrow cone of half-angle `acos(cos_theta)` around its
     /// geometric normal (the beam). Not a scattering model at all — pure
@@ -83,8 +99,26 @@ impl Bsdf {
     /// through them are invalid and their pdfs cancel in MIS ratios.
     /// `Laser` is excluded: its cone is a continuous (if narrow)
     /// distribution, so the aperture remains a valid connection endpoint.
+    /// `Glossy` is excluded too — its lobe is continuous, which is the
+    /// whole §9.5 point: connections through it are valid.
     pub fn is_delta(&self) -> bool {
         matches!(self, Bsdf::Mirror | Bsdf::Glass { .. })
+    }
+
+    /// The refractive index at `lambda` (nm): Sellmeier's dispersion
+    /// formula when the coefficients are set, the constant otherwise.
+    /// Only meaningful for `Glass`.
+    pub fn glass_n(&self, lambda: f32) -> f32 {
+        match self {
+            Bsdf::Glass { ior, sellmeier } => {
+                if sellmeier.iter().any(|c| *c != 0.0) {
+                    sellmeier_n(sellmeier, lambda)
+                } else {
+                    *ior
+                }
+            }
+            _ => 1.0,
+        }
     }
 }
 
@@ -100,12 +134,15 @@ pub enum Transport {
     Importance,
 }
 
-/// A surface material. `emission != 0` marks a pure emitter: the BSDF is
-/// ignored and the surface does not scatter.
+/// A surface material. `spectrum != None` marks a pure emitter: the BSDF
+/// is ignored and the surface does not scatter. The emission is a
+/// *spectral* quantity (paper §9.2) — a smooth SPD reconstructed from
+/// the RGB intent, or a monochromatic line for a laser — evaluated at
+/// the path's hero wavelength.
 #[derive(Clone, Copy)]
 pub struct Material {
     pub albedo: Vec3,
-    pub emission: Vec3,
+    pub spectrum: SpectrumKind,
     pub bsdf: Bsdf,
 }
 
@@ -113,15 +150,27 @@ impl Material {
     pub fn diffuse(albedo: Vec3) -> Self {
         Self {
             albedo,
-            emission: VEC_ZERO,
+            spectrum: SpectrumKind::None,
             bsdf: Bsdf::Diffuse,
         }
     }
 
+    /// A smooth emitter radiating the RGB `intent` (in expectation — the
+    /// SPD is the unique CMF-basis spectrum whose tristimulus integral
+    /// is exactly the intent; see `SpectrumKind::smooth_from_rgb`).
     pub fn emissive(emission: Vec3) -> Self {
         Self {
             albedo: VEC_ZERO,
-            emission,
+            spectrum: SpectrumKind::smooth_from_rgb(emission),
+            bsdf: Bsdf::Diffuse,
+        }
+    }
+
+    /// An emitter with an explicit spectrum (a laser line, for instance).
+    pub fn emissive_spec(spectrum: SpectrumKind) -> Self {
+        Self {
+            albedo: VEC_ZERO,
+            spectrum,
             bsdf: Bsdf::Diffuse,
         }
     }
@@ -129,26 +178,67 @@ impl Material {
     pub fn mirror(albedo: Vec3) -> Self {
         Self {
             albedo,
-            emission: VEC_ZERO,
+            spectrum: SpectrumKind::None,
             bsdf: Bsdf::Mirror,
         }
     }
 
+    /// Achromatic glass with the constant index `ior` (no dispersion).
     pub fn glass(ior: f32) -> Self {
         Self {
             albedo: Vec3::new(1.0, 1.0, 1.0),
-            emission: VEC_ZERO,
-            bsdf: Bsdf::Glass { ior },
+            spectrum: SpectrumKind::None,
+            bsdf: Bsdf::Glass {
+                ior,
+                sellmeier: [0.0; 6],
+            },
         }
     }
 
-    /// A laser emitter: radiates `emission` only into the cone of
-    /// half-angle `theta` around the geometric normal. The cone is
-    /// stored as its cosine so the gate is a single dot product.
+    /// Dispersive glass from Sellmeier coefficients (paper §9.2). `ior`
+    /// is the mid-visible fallback, unused while `sellmeier` is set.
+    pub fn glass_sellmeier(ior: f32, sellmeier: [f32; 6]) -> Self {
+        Self {
+            albedo: Vec3::new(1.0, 1.0, 1.0),
+            spectrum: SpectrumKind::None,
+            bsdf: Bsdf::Glass { ior, sellmeier },
+        }
+    }
+
+    /// A GGX microfacet "rough mirror" (paper §9.5): `alpha` is the
+    /// roughness, `f0` the normal-incidence reflectance. The albedo
+    /// scales the lobe per wavelength.
+    pub fn glossy(albedo: Vec3, alpha: f32, f0: f32) -> Self {
+        Self {
+            albedo,
+            spectrum: SpectrumKind::None,
+            bsdf: Bsdf::Glossy { alpha, f0 },
+        }
+    }
+
+    /// A cone-gated emitter with a *smooth* spectrum (an RGB spotlight):
+    /// radiates `intent` only into the cone of half-angle `theta` around
+    /// the geometric normal. The cone is stored as its cosine so the
+    /// gate is a single dot product.
     pub fn laser(emission: Vec3, theta: f32) -> Self {
         Self {
             albedo: VEC_ZERO,
-            emission,
+            spectrum: SpectrumKind::smooth_from_rgb(emission),
+            bsdf: Bsdf::Laser {
+                cos_theta: theta.cos(),
+            },
+        }
+    }
+
+    /// A *laser*: a monochromatic line emitter, cone-gated — the
+    /// physically correct replacement for the old RGB trick of putting
+    /// 4×10⁸ in one channel (paper §9.2: "a laser is monochromatic, so
+    /// λ is deterministic"). All `power` (spectral radiance) radiates at
+    /// `lambda` (nm) inside the cone of half-angle `theta`.
+    pub fn laser_line(lambda: f32, power: f32, theta: f32) -> Self {
+        Self {
+            albedo: VEC_ZERO,
+            spectrum: SpectrumKind::Line { lambda, power },
             bsdf: Bsdf::Laser {
                 cos_theta: theta.cos(),
             },
@@ -180,13 +270,21 @@ impl Material {
 
     /// Pure emitters do not scatter; the BSDF is ignored for them.
     pub fn is_emissive(&self) -> bool {
-        self.emission != VEC_ZERO
+        self.spectrum.is_emissive()
     }
 
     /// Delta BSDFs cannot be connection endpoints. Emitters are never
     /// delta (they do not scatter at all).
     pub fn is_delta(&self) -> bool {
         !self.is_emissive() && self.bsdf.is_delta()
+    }
+
+    /// The spectral reflectance at `lambda`: the RGB albedo intent
+    /// reconstructed through the complementary-ramp partition of unity
+    /// (grays exact, energy conservation automatic; see
+    /// `spectrum::rgb_to_albedo`).
+    fn rho(&self, lambda: f32) -> f32 {
+        rgb_to_albedo(self.albedo, lambda)
     }
 }
 
@@ -197,10 +295,11 @@ pub struct BsdfSample {
     /// Solid-angle pdf of `dir_out`. 0 for delta BSDFs: their density is a
     /// Dirac delta, which the MIS machinery replaces symbolically.
     pub pdf_omega: f32,
-    /// f · |cos| / pdf, the throughput multiplier of the event. For delta
+    /// f · |cos| / pdf, the throughput multiplier of the event — a
+    /// *spectral* scalar at the path's hero wavelength. For delta
     /// BSDFs the delta cancels and this is the deterministic specular
     /// weight; the Fresnel probability cancels against the BSDF value.
-    pub weight: Vec3,
+    pub weight: f32,
 }
 
 /// Cosine-weighted direction in the hemisphere around `normal` (pdf = cos/pi).
@@ -257,8 +356,96 @@ pub(crate) fn reflect_dir(dir_in: Vec3, normal: Vec3) -> Vec3 {
     dir_in - normal * (2.0 * normal.dot(dir_in))
 }
 
-/// The eta^2 transmission factor for the transport mode: radiance picks up
-/// (eta_t/eta_i)^2 crossing a refractive boundary, importance does not.
+// --- GGX microfacet BSDF (paper §9.5) ---
+//
+// The "rough mirror": a GGX lobe replaces the perfect mirror's delta.
+// The convention matches the rest of the file — `dir_in` is the *travel*
+// direction (normal · dir_in < 0), `normal` orients the hemisphere — so
+// the microfacet half-vector is h = normalize(−dir_in + dir_out) and the
+// reflection about it is dir_out = dir_in − 2(dir_in·h)h (which reduces
+// to reflect_dir at h = normal).
+
+/// The GGX normal distribution D(h) for roughness `alpha` and
+/// cos θ_h = normal·h.
+fn ggx_d(alpha: f32, cos_h: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let d = cos_h * cos_h * (a2 - 1.0) + 1.0;
+    a2 / (PI * d * d)
+}
+
+/// The Smith GGX masking term G1 for roughness `alpha` and
+/// cos θ_v = normal·v (Walter et al. 2007, eq. 99):
+/// G1 = 2c / (c + sqrt(α² + c²(1−α²))).
+fn ggx_g1(alpha: f32, cos_v: f32) -> f32 {
+    let c = cos_v.clamp(1e-6, 1.0);
+    let a2 = alpha * alpha;
+    2.0 * c / (c + (a2 + c * c * (1.0 - a2)).sqrt())
+}
+
+/// Schlick's Fresnel approximation from the normal-incidence
+/// reflectance `f0` at incidence cosine `cos`.
+fn schlick_f(f0: f32, cos: f32) -> f32 {
+    let c = cos.clamp(0.0, 1.0);
+    f0 + (1.0 - f0) * (1.0 - c).powi(5)
+}
+
+/// Sample a GGX half-vector around `normal` for roughness `alpha`
+/// (the standard NDF inversion: cos θ_h = sqrt((1−u)/(1+(α²−1)u))).
+fn ggx_sample_half_vector(alpha: f32, normal: Vec3, rng: &mut impl Rng) -> Vec3 {
+    let u = rng.gen::<f32>().clamp(1e-6, 1.0 - 1e-6);
+    let v = rng.gen::<f32>();
+    let a2 = alpha * alpha;
+    let cos_h = ((1.0 - u) / (1.0 + (a2 - 1.0) * u)).sqrt();
+    let sin_h = (1.0 - cos_h * cos_h).sqrt();
+    let phi = 2.0 * PI * v;
+    let a = if normal.x.abs() > 0.9 {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
+    };
+    let t = a.cross(normal).normalize();
+    let b = normal.cross(t);
+    t * (sin_h * phi.cos()) + b * (sin_h * phi.sin()) + normal * cos_h
+}
+
+/// The GGX microfacet BSDF value f (no cosine) and its NDF-sampling pdf
+/// for the direction pair, at spectral reflectance `rho`. `normal` is
+/// oriented toward the side `dir_in` arrives from. (0, 0) outside the
+/// hemisphere — the same convention as the diffuse eval, and consistent
+/// with the sampler: a below-horizon draw is possible at high roughness
+/// and simply carries no light.)
+fn ggx_eval_pdf(
+    alpha: f32,
+    f0: f32,
+    rho: f32,
+    normal: Vec3,
+    dir_in: Vec3,
+    dir_out: Vec3,
+) -> (f32, f32) {
+    let cos_i = -normal.dot(dir_in);
+    let cos_o = normal.dot(dir_out);
+    if cos_i <= 0.0 || cos_o <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let h = (dir_out - dir_in).normalize();
+    let cos_h = normal.dot(h);
+    if cos_h <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let v_dot_h = -(dir_in.dot(h)); // ω_i·h, positive on a reflection pair
+    if v_dot_h <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let d = ggx_d(alpha, cos_h);
+    let g = ggx_g1(alpha, cos_i) * ggx_g1(alpha, cos_o);
+    let f = schlick_f(f0, v_dot_h);
+    let bsdf = rho * d * g * f / (4.0 * cos_i * cos_o);
+    let pdf = d * cos_h / (4.0 * v_dot_h);
+    (bsdf, pdf)
+}
+
+/// The eta^2 transmission factor for the transport mode: radiance picks
+/// up (eta_t/eta_i)^2 crossing a refractive boundary, importance does not.
 fn eta_factor(transport: Transport, eta_i: f32, eta_t: f32) -> f32 {
     if transport == Transport::Radiance {
         (eta_t / eta_i) * (eta_t / eta_i)
@@ -271,15 +458,19 @@ impl Material {
     /// Sample a scattering direction. `normal` must be oriented toward the
     /// side the ray arrives from (normal · dir_in < 0); `front_face` says
     /// whether the geometric normal faces that side (for glass: which
-    /// medium is incident). Delta BSDFs sample deterministically.
+    /// medium is incident); `lambda` is the path's hero wavelength (nm) —
+    /// the albedo evaluates to ρ(λ) and dispersive glass to n(λ). Delta
+    /// BSDFs sample deterministically.
     pub fn sample_bsdf(
         &self,
         normal: Vec3,
         front_face: bool,
         dir_in: Vec3,
         transport: Transport,
+        lambda: f32,
         rng: &mut impl Rng,
     ) -> BsdfSample {
+        let rho = self.rho(lambda);
         match self.bsdf {
             Bsdf::Diffuse => {
                 let dir_out = cosine_hemisphere(normal, rng);
@@ -287,16 +478,17 @@ impl Material {
                 BsdfSample {
                     dir_out,
                     pdf_omega: pdf,
-                    weight: self.albedo,
+                    weight: rho,
                 }
             }
             Bsdf::Mirror => BsdfSample {
                 dir_out: reflect_dir(dir_in, normal),
                 pdf_omega: 0.0,
-                weight: self.albedo,
+                weight: rho,
             },
-            Bsdf::Glass { ior } => {
-                let (eta_i, eta_t) = if front_face { (1.0, ior) } else { (ior, 1.0) };
+            Bsdf::Glass { .. } => {
+                let n = self.bsdf.glass_n(lambda);
+                let (eta_i, eta_t) = if front_face { (1.0, n) } else { (n, 1.0) };
                 let cos_i = -normal.dot(dir_in);
                 let f = fresnel_dielectric(cos_i, eta_i, eta_t);
                 if rng.gen::<f32>() < f {
@@ -306,7 +498,7 @@ impl Material {
                     BsdfSample {
                         dir_out: reflect_dir(dir_in, normal),
                         pdf_omega: 0.0,
-                        weight: self.albedo,
+                        weight: rho,
                     }
                 } else {
                     // Refraction (total internal reflection cannot reach
@@ -316,8 +508,25 @@ impl Material {
                     BsdfSample {
                         dir_out,
                         pdf_omega: 0.0,
-                        weight: self.albedo * eta_factor(transport, eta_i, eta_t),
+                        weight: rho * eta_factor(transport, eta_i, eta_t),
                     }
+                }
+            }
+            Bsdf::Glossy { alpha, f0 } => {
+                let h = ggx_sample_half_vector(alpha, normal, rng);
+                let dir_out = dir_in - h * (2.0 * dir_in.dot(h));
+                let (f, pdf) = ggx_eval_pdf(alpha, f0, rho, normal, dir_in, dir_out);
+                BsdfSample {
+                    dir_out,
+                    pdf_omega: pdf,
+                    // f·cos/pdf; 0 for a below-horizon draw (f = 0 there —
+                    // the draw is merely wasted, exactly like a bridge
+                    // direction that dips below the horizon).
+                    weight: if pdf > 0.0 {
+                        f * normal.dot(dir_out) / pdf
+                    } else {
+                        0.0
+                    },
                 }
             }
             // A laser material is a pure emitter: it never scatters, so
@@ -327,28 +536,37 @@ impl Material {
             Bsdf::Laser { .. } => BsdfSample {
                 dir_out: normal,
                 pdf_omega: 0.0,
-                weight: VEC_ZERO,
+                weight: 0.0,
             },
         }
     }
 
     /// f (the raw BSDF, no cosine) and the solid-angle pdf of `dir_out`
     /// under the BSDF's sampling distribution, for an arbitrary direction
-    /// pair. Delta BSDFs return (0, 0) — exactly what invalidates
-    /// connections through them. `normal` must be oriented toward the side
-    /// `dir_in` arrives from.
-    pub fn eval_bsdf(&self, normal: Vec3, dir_in: Vec3, dir_out: Vec3) -> (Vec3, f32) {
+    /// pair at wavelength `lambda`. Delta BSDFs return (0, 0) — exactly
+    /// what invalidates connections through them. `normal` must be
+    /// oriented toward the side `dir_in` arrives from.
+    pub fn eval_bsdf(
+        &self,
+        normal: Vec3,
+        dir_in: Vec3,
+        dir_out: Vec3,
+        lambda: f32,
+    ) -> (f32, f32) {
         match self.bsdf {
             Bsdf::Diffuse => {
                 let cos_i = -normal.dot(dir_in);
                 let cos_o = normal.dot(dir_out);
                 if cos_i > 0.0 && cos_o > 0.0 {
-                    (self.albedo * (1.0 / PI), cos_o / PI)
+                    (self.rho(lambda) / PI, cos_o / PI)
                 } else {
-                    (VEC_ZERO, 0.0)
+                    (0.0, 0.0)
                 }
             }
-            _ => (VEC_ZERO, 0.0),
+            Bsdf::Glossy { alpha, f0 } => {
+                ggx_eval_pdf(alpha, f0, self.rho(lambda), normal, dir_in, dir_out)
+            }
+            _ => (0.0, 0.0),
         }
     }
 
@@ -362,7 +580,7 @@ impl Material {
         dir_in: Vec3,
         dir_out: Vec3,
     ) -> bool {
-        self.specular_weight(normal, front_face, dir_in, dir_out, Transport::Radiance)
+        self.specular_weight(normal, front_face, dir_in, dir_out, Transport::Radiance, 550.0)
             .is_some()
     }
 
@@ -370,7 +588,10 @@ impl Material {
     /// delta BSDF — needed for hypothetical path extensions, where the
     /// rolls never happened but the path geometry fixes the directions.
     /// None if the pair is not the specular pair. `normal`/`front_face`
-    /// describe the event being weighted.
+    /// describe the event being weighted; `lambda` evaluates dispersive
+    /// glass (the hypothetical extension uses the same hero wavelength
+    /// as the realized walk — λ is fixed per path, so the PathView
+    /// discipline is preserved).
     pub fn specular_weight(
         &self,
         normal: Vec3,
@@ -378,30 +599,35 @@ impl Material {
         dir_in: Vec3,
         dir_out: Vec3,
         transport: Transport,
-    ) -> Option<Vec3> {
+        lambda: f32,
+    ) -> Option<f32> {
         const DOT_EPS: f32 = 1.0 - 1e-4;
+        let rho = self.rho(lambda);
         match self.bsdf {
             Bsdf::Mirror => {
                 if reflect_dir(dir_in, normal).dot(dir_out) > DOT_EPS {
-                    Some(self.albedo)
+                    Some(rho)
                 } else {
                     None
                 }
             }
-            Bsdf::Glass { ior } => {
-                let (eta_i, eta_t) = if front_face { (1.0, ior) } else { (ior, 1.0) };
+            Bsdf::Glass { .. } => {
+                let n = self.bsdf.glass_n(lambda);
+                let (eta_i, eta_t) = if front_face { (1.0, n) } else { (n, 1.0) };
                 if reflect_dir(dir_in, normal).dot(dir_out) > DOT_EPS {
-                    return Some(self.albedo);
+                    return Some(rho);
                 }
                 let refr = refract_dir(dir_in, normal, eta_i, eta_t)?;
                 if refr.dot(dir_out) > DOT_EPS {
-                    Some(self.albedo * eta_factor(transport, eta_i, eta_t))
+                    Some(rho * eta_factor(transport, eta_i, eta_t))
                 } else {
                     None
                 }
             }
-            // Pure emitters never scatter (see sample_bsdf).
-            Bsdf::Laser { .. } | Bsdf::Diffuse => None,
+            // Pure emitters never scatter; glossy has no specular pair
+            // (its density is continuous — the MIS machinery uses
+            // `eval_bsdf` for it instead).
+            Bsdf::Laser { .. } | Bsdf::Diffuse | Bsdf::Glossy { .. } => None,
         }
     }
 }
@@ -883,7 +1109,9 @@ pub enum LightShape {
 #[derive(Clone)]
 pub struct AreaLight {
     pub shape: LightShape,
-    pub emission: Vec3,
+    /// The emission spectrum (paper §9.2): a smooth SPD or a
+    /// monochromatic line, evaluated at the path's hero wavelength.
+    pub spectrum: SpectrumKind,
 }
 
 impl AreaLight {
@@ -893,7 +1121,7 @@ impl AreaLight {
                 center: sphere.center,
                 radius: sphere.radius,
             },
-            emission: sphere.mat.emission,
+            spectrum: sphere.mat.spectrum,
         }
     }
 
@@ -907,7 +1135,7 @@ impl AreaLight {
                 half_w: quad.half_w,
                 half_h: quad.half_h,
             },
-            emission: quad.mat.emission,
+            spectrum: quad.mat.spectrum,
         }
     }
 
@@ -915,7 +1143,13 @@ impl AreaLight {
     /// with outward normal `normal`, radiating into the cone of
     /// half-angle `theta` around the normal. The disc is the emitting
     /// cap of the laser's cylinder housing (see `SceneData::add_laser`).
-    pub fn from_laser(center: Vec3, normal: Vec3, radius: f32, theta: f32, emission: Vec3) -> Self {
+    pub fn from_laser(
+        center: Vec3,
+        normal: Vec3,
+        radius: f32,
+        theta: f32,
+        spectrum: SpectrumKind,
+    ) -> Self {
         Self {
             shape: LightShape::Laser {
                 center,
@@ -923,7 +1157,7 @@ impl AreaLight {
                 radius,
                 theta,
             },
-            emission,
+            spectrum,
         }
     }
 
@@ -1103,6 +1337,7 @@ impl AreaLight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spectrum::{rgb_to_albedo, BK7};
     use rand::SeedableRng;
 
     fn diffuse(albedo: Vec3) -> Material {
@@ -1250,7 +1485,7 @@ mod tests {
             Vec3::new(0.0, 1.0, 0.0),
             0.5,
             0.1, // ~5.7° half-angle
-            Vec3::new(100.0, 100.0, 100.0),
+            SpectrumKind::smooth_from_rgb(Vec3::new(100.0, 100.0, 100.0)),
         );
         assert!(light.shape_is_laser());
         assert!((light.area() - PI * 0.25).abs() < 1e-5);
@@ -1307,28 +1542,38 @@ mod tests {
 
     // --- BSDF tests ---
 
+    /// The diffuse BSDF at a fixed hero wavelength: f = ρ(λ)/π, the
+    /// cosine sampling pdf = cos/π, so the sample weight f·cos/pdf =
+    /// ρ(λ) exactly — the spectral albedo of the RGB intent at λ.
     #[test]
     fn diffuse_bsdf_reduces_to_the_cosine_sampling_constants() {
-        // f = albedo/PI, cosine sampling pdf = cos/PI, so the sample
-        // weight f·cos/pdf = albedo exactly — the constants the old
-        // hand-computed BDPT tests were written against.
         let m = Material::diffuse(Vec3::new(0.5, 0.6, 0.7));
         let n = Vec3::new(0.0, 1.0, 0.0);
         let dir_in = Vec3::new(0.0, -1.0, 0.0);
+        let lambda = 555.0; // green peak: ρ = the G channel exactly
+        let rho = rgb_to_albedo(m.albedo, lambda);
+        assert!((rho - 0.6).abs() < 1e-6, "ρ(555) = {rho}");
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         for _ in 0..100 {
-            let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, &mut rng);
+            let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, lambda, &mut rng);
             assert!(s.dir_out.dot(n) > 0.0);
             assert!((s.pdf_omega - s.dir_out.dot(n) / PI).abs() < 1e-6);
-            assert_eq!(s.weight, m.albedo);
-            let (f, pdf) = m.eval_bsdf(n, dir_in, s.dir_out);
-            assert_eq!(f, m.albedo * (1.0 / PI));
+            assert!((s.weight - rho).abs() < 1e-6);
+            let (f, pdf) = m.eval_bsdf(n, dir_in, s.dir_out, lambda);
+            assert!((f - rho / PI).abs() < 1e-6);
             assert!((pdf - s.pdf_omega).abs() < 1e-6);
         }
         // Below the horizon: no density.
-        let (f, pdf) = m.eval_bsdf(n, dir_in, Vec3::new(0.0, -1.0, 0.0));
-        assert_eq!(f, VEC_ZERO);
+        let (f, pdf) = m.eval_bsdf(n, dir_in, Vec3::new(0.0, -1.0, 0.0), lambda);
+        assert_eq!(f, 0.0);
         assert_eq!(pdf, 0.0);
+        // A gray albedo is wavelength-independent: the weight is the
+        // gray value at every λ.
+        let g = Material::diffuse(Vec3::new(0.42, 0.42, 0.42));
+        for lambda in [400.0f32, 480.0, 555.0, 610.0, 700.0] {
+            let s = g.sample_bsdf(n, true, dir_in, Transport::Radiance, lambda, &mut rng);
+            assert!((s.weight - 0.42).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -1337,24 +1582,31 @@ mod tests {
         let n = Vec3::new(0.0, 1.0, 0.0);
         let dir_in = Vec3::new(0.6, -0.8, 0.0);
         let mut rng = rand::rngs::StdRng::seed_from_u64(2);
-        let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, &mut rng);
+        let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, 555.0, &mut rng);
         assert_eq!(s.dir_out, Vec3::new(0.6, 0.8, 0.0));
         assert_eq!(s.pdf_omega, 0.0);
-        assert_eq!(s.weight, m.albedo);
+        assert!((s.weight - 0.9).abs() < 1e-6); // gray albedo: ρ(λ) = 0.9
         // eval is (0, 0) for delta BSDFs — connections through them are
         // invalid.
-        let (f, pdf) = m.eval_bsdf(n, dir_in, s.dir_out);
-        assert_eq!(f, VEC_ZERO);
+        let (f, pdf) = m.eval_bsdf(n, dir_in, s.dir_out, 555.0);
+        assert_eq!(f, 0.0);
         assert_eq!(pdf, 0.0);
         assert!(m.is_delta());
-        // The specular weight of the actual pair is the albedo; any other
+        // The specular weight of the actual pair is ρ(λ); any other
         // direction has none.
         assert_eq!(
-            m.specular_weight(n, true, dir_in, s.dir_out, Transport::Radiance),
-            Some(m.albedo)
+            m.specular_weight(n, true, dir_in, s.dir_out, Transport::Radiance, 555.0),
+            Some(0.9)
         );
         assert_eq!(
-            m.specular_weight(n, true, dir_in, Vec3::new(0.0, 1.0, 0.0), Transport::Radiance),
+            m.specular_weight(
+                n,
+                true,
+                dir_in,
+                Vec3::new(0.0, 1.0, 0.0),
+                Transport::Radiance,
+                555.0
+            ),
             None
         );
     }
@@ -1380,6 +1632,39 @@ mod tests {
         assert!((fresnel_dielectric(1.0, 1.0, 1.5) - 0.04).abs() < 1e-4);
     }
 
+    /// Achromatic glass keeps its exact constant-n behavior (the existing
+    /// tests pin these values); dispersive glass evaluates n(λ) through
+    /// Sellmeier, and blue bends more than red — the prism physics
+    /// (paper §9.2). "Bends more" = closer to the surface normal: the
+    /// refracted direction's *normal* component is larger in magnitude
+    /// for blue (the ray travels down into the glass, so the y
+    /// components are negative — compare magnitudes, not signs).
+    #[test]
+    fn dispersive_glass_bends_blue_more_than_red() {
+        let m = Material::glass_sellmeier(1.5168, BK7);
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.6, -0.8, 0.0); // ~37° incidence
+        let refr_blue = refract_dir(dir_in, n, 1.0, m.bsdf.glass_n(400.0)).unwrap();
+        let refr_red = refract_dir(dir_in, n, 1.0, m.bsdf.glass_n(700.0)).unwrap();
+        // Snell: sin_t = sin_i / n. Blue has the larger n, so it bends
+        // toward the normal more: |cos_t| is larger for blue.
+        assert!(
+            refr_blue.y.abs() > refr_red.y.abs(),
+            "blue must bend more: blue {refr_blue:?} red {refr_red:?}"
+        );
+        // The achromatic control: the same refraction at every λ.
+        let ach = Material::glass(1.5);
+        for lambda in [400.0f32, 555.0, 700.0] {
+            assert!((ach.bsdf.glass_n(lambda) - 1.5).abs() < 1e-6);
+        }
+        // The dispersive n values match the Sellmeier evaluation, and
+        // the datasheet's D-line value lands at 589 nm (n(555) is
+        // *higher* — normal dispersion).
+        assert!((m.bsdf.glass_n(400.0) - sellmeier_n(&BK7, 400.0)).abs() < 1e-6);
+        assert!((m.bsdf.glass_n(589.0) - 1.5168).abs() < 2e-4);
+        assert!(m.bsdf.glass_n(555.0) > 1.5168, "normal dispersion: n(555) > n(589)");
+    }
+
     #[test]
     fn glass_sampling_matches_the_fresnel_split() {
         // Over many samples the reflection/refraction split must follow
@@ -1393,7 +1678,7 @@ mod tests {
         let mut reflected = 0;
         const N: usize = 20000;
         for _ in 0..N {
-            let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, &mut rng);
+            let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, 555.0, &mut rng);
             assert_eq!(s.pdf_omega, 0.0);
             if s.dir_out.y > 0.0 {
                 reflected += 1;
@@ -1403,7 +1688,7 @@ mod tests {
                 let sin_t = (1.0 - s.dir_out.y * s.dir_out.y).sqrt();
                 assert!((sin_t - sin_i / 1.5).abs() < 1e-4);
                 // Radiance transport picks up (eta_t/eta_i)^2 = 1.5^2.
-                assert_eq!(s.weight, Vec3::new(2.25, 2.25, 2.25));
+                assert!((s.weight - 2.25).abs() < 1e-6);
             }
         }
         let frac = reflected as f32 / N as f32;
@@ -1419,13 +1704,20 @@ mod tests {
         let dir_in = Vec3::new(0.9, -0.435889894354067, 0.0); // sin_i = 0.9 > 1/1.5
         let mut rng = rand::rngs::StdRng::seed_from_u64(4);
         for _ in 0..100 {
-            let s = m.sample_bsdf(n, false, dir_in, Transport::Radiance, &mut rng);
+            let s = m.sample_bsdf(n, false, dir_in, Transport::Radiance, 555.0, &mut rng);
             assert!(s.dir_out.y > 0.0, "TIR must reflect: {:?}", s.dir_out);
-            assert_eq!(s.weight, Vec3::new(1.0, 1.0, 1.0));
+            assert!((s.weight - 1.0).abs() < 1e-6);
         }
         // And the specular weight of the refracted pair is None there.
         assert_eq!(
-            m.specular_weight(n, false, dir_in, Vec3::new(0.0, -1.0, 0.0), Transport::Radiance),
+            m.specular_weight(
+                n,
+                false,
+                dir_in,
+                Vec3::new(0.0, -1.0, 0.0),
+                Transport::Radiance,
+                555.0
+            ),
             None
         );
     }
@@ -1439,26 +1731,178 @@ mod tests {
         let dir_in = Vec3::new(0.6, -0.8, 0.0);
         let refr = refract_dir(dir_in, n, 1.0, 1.5).unwrap();
         assert_eq!(
-            m.specular_weight(n, true, dir_in, refr, Transport::Radiance),
-            Some(Vec3::new(2.25, 2.25, 2.25))
+            m.specular_weight(n, true, dir_in, refr, Transport::Radiance, 555.0),
+            Some(2.25)
         );
         assert_eq!(
-            m.specular_weight(n, true, dir_in, refr, Transport::Importance),
-            Some(Vec3::new(1.0, 1.0, 1.0))
+            m.specular_weight(n, true, dir_in, refr, Transport::Importance, 555.0),
+            Some(1.0)
         );
         // Exiting the glass: eta_i = 1.5, eta_t = 1, so radiance gets
         // (1/1.5)^2 and importance 1. Compare within a few ulps: the
         // implementation computes (1/1.5)*(1/1.5), which rounds
         // differently from the literal 1/2.25.
         let refr_out = refract_dir(dir_in, n, 1.5, 1.0).unwrap();
-        let w = m.specular_weight(n, false, dir_in, refr_out, Transport::Radiance);
-        let expected = Vec3::new(1.0 / 2.25, 1.0 / 2.25, 1.0 / 2.25);
+        let w = m.specular_weight(n, false, dir_in, refr_out, Transport::Radiance, 555.0);
+        let expected = 1.0 / 2.25;
         assert!(w.is_some());
         assert!(
-            (w.unwrap().x - expected.x).abs() < 1e-6
-                && (w.unwrap().y - expected.y).abs() < 1e-6
-                && (w.unwrap().z - expected.z).abs() < 1e-6,
-            "got {w:?}, expected {expected:?}"
+            (w.unwrap() - expected).abs() < 1e-6,
+            "got {w:?}, expected {expected}"
         );
+    }
+
+    // --- GGX glossy BSDF (paper §9.5) ---
+
+    /// The sampler and the eval must agree on the pdf — the MIS machinery
+    /// requires one distribution — and the samples must stay in the
+    /// hemisphere (a below-horizon draw is possible at high roughness
+    /// but carries no light; the weight is 0 there, never infinite).
+    #[test]
+    fn glossy_sampler_and_eval_agree() {
+        let m = Material::glossy(Vec3::new(1.0, 1.0, 1.0), 0.08, 0.9);
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.6, -0.8, 0.0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(6);
+        let mut below_horizon = 0usize;
+        const N: usize = 5000;
+        for _ in 0..N {
+            let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, 555.0, &mut rng);
+            let (f, pdf) = m.eval_bsdf(n, dir_in, s.dir_out, 555.0);
+            assert!((pdf - s.pdf_omega).abs() < 1e-5, "pdf {pdf} vs {}", s.pdf_omega);
+            if s.dir_out.dot(n) <= 0.0 {
+                // Below the horizon: f = 0, the weight must be 0 (the
+                // draw is wasted), never ±inf.
+                below_horizon += 1;
+                assert_eq!(s.weight, 0.0);
+                assert_eq!(f, 0.0);
+            } else {
+                assert!(s.weight.is_finite() && s.weight > 0.0);
+                assert!((s.weight - f * s.dir_out.dot(n) / pdf).abs() < 1e-4);
+            }
+        }
+        // At this roughness essentially every draw stays in the
+        // hemisphere; the guard exists for the grazing tail.
+        assert!(below_horizon < N / 10);
+    }
+
+    /// The near-mirror limit (§9.5: "the bridge is the small-roughness
+    /// limit of the glossy connection"): as α → 0 the lobe collapses
+    /// onto the perfect-mirror direction. The GGX NDF has a heavy
+    /// angular tail (a u-draw near 0 produces a large θ_h even at tiny
+    /// α), so the check is on the lobe's *bulk* — the 99th-percentile
+    /// angle — not the maximum.
+    #[test]
+    fn glossy_approaches_the_mirror_direction() {
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.6, -0.8, 0.0);
+        let mirror_dir = reflect_dir(dir_in, n);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        const N: usize = 4000;
+        for alpha in [0.001f32, 0.005, 0.02] {
+            let m = Material::glossy(Vec3::new(1.0, 1.0, 1.0), alpha, 0.9);
+            let mut angles = [0.0f32; N];
+            for i in 0..N {
+                let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, 555.0, &mut rng);
+                let dot = s.dir_out.dot(mirror_dir).clamp(-1.0, 1.0);
+                angles[i] = dot.acos();
+            }
+            angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            // The 99th percentile: the lobe's bulk scales with α; 30α
+            // is a generous envelope over the GGX tail's 1% fringe.
+            let p99 = angles[(N as f32 * 0.99) as usize];
+            assert!(
+                p99 < alpha * 30.0,
+                "α = {alpha}: p99 spread {p99} rad"
+            );
+        }
+    }
+
+    /// Reciprocity: f(ω_i, ω_o) = f(ω_o, ω_i) — the microfacet formula is
+    /// symmetric in the pair (the half-vector bisects, so the Fresnel
+    /// cosine agrees from both sides).
+    #[test]
+    fn glossy_is_reciprocal() {
+        let m = Material::glossy(Vec3::new(1.0, 1.0, 1.0), 0.25, 0.9);
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(8);
+        for _ in 0..500 {
+            let a = cosine_hemisphere(n, &mut rng);
+            let b = cosine_hemisphere(n, &mut rng);
+            let (f_ab, _) = m.eval_bsdf(n, a, b, 555.0);
+            let (f_ba, _) = m.eval_bsdf(n, b, a, 555.0);
+            assert!((f_ab - f_ba).abs() < 1e-4, "{f_ab} vs {f_ba}");
+        }
+    }
+
+    /// The energy guard: the directional-hemispherical reflectance
+    /// ∫ f·cos_o dω_o must stay ≤ 1 (the single-scatter GGX masking term
+    /// *loses* energy at high roughness — multiple scattering between
+    /// microfacets is not modeled — so the demo uses low α and the
+    /// assert has a sane floor).
+    #[test]
+    fn glossy_directional_hemispherical_reflectance_is_bounded() {
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(10);
+        for &(alpha, f0) in &[(0.05f32, 0.9), (0.1, 0.9), (0.25, 0.5), (0.5, 0.04)] {
+            let m = Material::glossy(Vec3::new(1.0, 1.0, 1.0), alpha, f0);
+            // Average the DHR over incident directions.
+            let mut dhr_mean = 0.0f32;
+            const NI: usize = 64;
+            const NO: usize = 256;
+            for _ in 0..NI {
+                let dir_in = cosine_hemisphere(n, &mut rng) * -1.0;
+                let mut sum = 0.0f32;
+                for _ in 0..NO {
+                    let s = m.sample_bsdf(n, true, dir_in, Transport::Radiance, 555.0, &mut rng);
+                    if s.pdf_omega > 0.0 && s.dir_out.dot(n) > 0.0 {
+                        sum += s.weight; // f·cos/pdf is the DHR estimator
+                    }
+                }
+                dhr_mean += sum / NO as f32;
+            }
+            dhr_mean /= NI as f32;
+            assert!(
+                dhr_mean <= 1.0 + 0.02,
+                "α={alpha} f0={f0}: DHR {dhr_mean} exceeds 1"
+            );
+            assert!(
+                dhr_mean >= 0.25 * f0,
+                "α={alpha} f0={f0}: DHR {dhr_mean} implausibly small"
+            );
+        }
+    }
+
+    /// Glossy is NOT delta (§9.5): connections through glossy vertices
+    /// are valid — `eval_bsdf` returns a nonzero f and pdf for ordinary
+    /// direction pairs, and `specular_weight` is None (no specular pair;
+    /// the MIS machinery uses the continuous pdf instead).
+    #[test]
+    fn glossy_is_a_continuous_bsdf() {
+        let m = Material::glossy(Vec3::new(1.0, 1.0, 1.0), 0.1, 0.9);
+        assert!(!m.bsdf.is_delta());
+        assert!(!m.is_delta());
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let dir_in = Vec3::new(0.6, -0.8, 0.0);
+        // An ordinary (non-mirror) direction pair evaluates nonzero.
+        let dir_out = Vec3::new(0.0, 1.0, 0.0).normalize();
+        let (f, pdf) = m.eval_bsdf(n, dir_in, dir_out, 555.0);
+        assert!(f > 0.0, "glossy eval must be nonzero: {f}");
+        assert!(pdf > 0.0);
+        // No specular pair: hypothetical extensions use the continuous
+        // pdf, exactly like diffuse.
+        assert_eq!(
+            m.specular_weight(n, true, dir_in, dir_out, Transport::Radiance, 555.0),
+            None
+        );
+        // Even the exact mirror direction has no specular pair — the
+        // lobe is continuous, not a delta.
+        let mirror_dir = reflect_dir(dir_in, n);
+        assert_eq!(
+            m.specular_weight(n, true, dir_in, mirror_dir, Transport::Radiance, 555.0),
+            None
+        );
+        let (f, pdf) = m.eval_bsdf(n, dir_in, mirror_dir, 555.0);
+        assert!(f > 0.0 && pdf > 0.0);
     }
 }
