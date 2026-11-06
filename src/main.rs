@@ -124,11 +124,14 @@ fn build_scene_with(_laser_aim_y: f32) -> SceneData {
     // provides the room's ambient illumination; the lamp itself is not
     // in frame from the default camera (it sits above the top edge of
     // the view).
-    scene.add_light(LightData::from_quad(
-            Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,
-    ));
+    scene.add_light(LightData::from_quad( Vec3::new(0.0, room_height - 0.01, 0.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,));
+    scene.add_light(LightData::from_quad( Vec3::new(2.0, room_height - 0.01, 2.0), Vec3::new(0.0, -1.0, 0.0), 0.2, 0.2, emission,));
 
     scene.add_box( Vec3::new(room_size/2.0, 1.0, 1.0), Vec3::new(room_size, room_height, 0.02), white);
+    scene.add_shelf(Vec3::new(0.4, 0.0, 0.8), Vec3::new(0.8, 1.5, 0.2), white, brown);
+
+    scene.add_sphere(Vec3::new(0.0, 0.2, 0.0), 0.2, MaterialData::glass_bk7());
+    scene.add_sphere(Vec3::new(-1.4, 0.2, -1.2), 0.2, MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)));
 
     // The laser showcase: a red laser on the table, aimed backward at a
     // mirror tile on the back wall, which bounces the beam forward across
@@ -164,7 +167,7 @@ fn build_scene_with(_laser_aim_y: f32) -> SceneData {
         aim,
         0.2,                        // housing height
         0.01,                       // aperture radius
-        0.01,                       // beam half-angle (radians, ~0.57°)
+        0.001,                       // beam half-angle (radians, ~0.57°)
         650.0,                      // nm — the red laser line
         1.2e9,                      // spectral radiance at the line
     );
@@ -201,6 +204,7 @@ fn build_scene_with(_laser_aim_y: f32) -> SceneData {
     let dim = Vec3::new(1.0, 0.02, 0.7);
     scene.add_table(pos, dim, white, brown);
 
+
     // A second laser (green) on the table, aimed across the room at the
     // thin mirror boxes — its beam ping-pongs between them, and the
     // wide cone (0.05 rad) paints the table under *every* leg: the glow
@@ -216,10 +220,10 @@ fn build_scene_with(_laser_aim_y: f32) -> SceneData {
     // display stage where it belongs").
     scene.add_laser_line(
         Vec3::new(-1.6, 0.62, 1.9),
-        Vec3::new(-1.0, 0.0, -0.5),
+        Vec3::new(-1.0, 0.01, -0.5),
         0.2,
         0.01,
-        0.01,
+        0.005,
         532.0,                      // nm — the green laser line
         1.2e9,
     );

@@ -603,20 +603,18 @@ impl SceneData {
     /// Like `add_box`/`add_cylinder`: composed of boxes, so both
     /// backends see it without any changes.
     #[allow(dead_code)]
-    pub fn add_shelf(&mut self, center: Vec3, size: Vec3, mat: MaterialData) {
-        let panel_t = size.x * 0.05;
-        let board_t = size.y * 0.04;
-        for sx in [-1.0, 1.0] {
+    pub fn add_shelf(&mut self, center: Vec3, size: Vec3, mat: MaterialData, leg: MaterialData) {
+        let dim = Vec3::new(size.x / 2.0, size.y / 2.0, size.z / 2.0);
+        self.add_box(Vec3::new(center.x -  dim.x, center.y + dim.y, center.z - dim.z), Vec3::new(0.01, size.y, 0.01), leg);
+        self.add_box(Vec3::new(center.x +  dim.x, center.y + dim.y, center.z - dim.z), Vec3::new(0.01, size.y, 0.01), leg);
+        self.add_box(Vec3::new(center.x -  dim.x, center.y + dim.y, center.z + dim.z), Vec3::new(0.01, size.y, 0.01), leg);
+        self.add_box(Vec3::new(center.x +  dim.x, center.y + dim.y, center.z + dim.z), Vec3::new(0.01, size.y, 0.01), leg);
+        let step_size = size.y / 4.0;
+        for i in 1..5 {
+            let height = i as f32 * step_size + center.y; 
             self.add_box(
-                Vec3::new(center.x + sx * (size.x * 0.5 - panel_t * 0.5), center.y, center.z),
-                Vec3::new(panel_t, size.y, size.z),
-                mat,
-            );
-        }
-        for f in [-0.375, -0.125, 0.125, 0.375] {
-            self.add_box(
-                Vec3::new(center.x, center.y + size.y * f, center.z),
-                Vec3::new(size.x - 2.0 * panel_t, board_t, size.z),
+                Vec3::new(center.x, height, center.z),
+                Vec3::new(size.x, 0.02, size.z),
                 mat,
             );
         }

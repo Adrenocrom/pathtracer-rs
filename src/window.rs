@@ -647,6 +647,9 @@ impl App {
                     Err(e) => eprintln!("failed to save screenshot: {e}"),
                 }
             }
+            else {
+                window.request_redraw();
+            }
         }
 
         // Progressive accumulation while the camera is stationary.
