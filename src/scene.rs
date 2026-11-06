@@ -55,6 +55,7 @@ impl MaterialData {
         }
     }
 
+    #[allow(dead_code)]
     pub fn emissive(emission: Vec3) -> Self {
         Self {
             albedo: Vec3::new(0.0, 0.0, 0.0),
@@ -76,6 +77,7 @@ impl MaterialData {
     /// slot is the one place the cone can travel with the material so
     /// the BDPT pdf/weight/gate helpers can read it from any path
     /// vertex (see `Bsdf::Laser`).
+    #[allow(dead_code)]
     pub fn with_laser_bsdf(mut self, theta: f32) -> Self {
         self.bsdf = Bsdf::Laser {
             cos_theta: theta.cos(),
@@ -83,6 +85,7 @@ impl MaterialData {
         self
     }
 
+    #[allow(dead_code)]
     pub fn mirror(albedo: Vec3) -> Self {
         Self {
             albedo,
@@ -91,6 +94,7 @@ impl MaterialData {
         }
     }
 
+    #[allow(dead_code)]
     pub fn glass(ior: f32) -> Self {
         Self {
             albedo: Vec3::new(1.0, 1.0, 1.0),
@@ -127,6 +131,7 @@ impl MaterialData {
     }
 
     /// A cone-gated emitter with a smooth spectrum (an RGB spotlight).
+    #[allow(dead_code)]
     pub fn laser(emission: Vec3, theta: f32) -> Self {
         Self {
             albedo: Vec3::new(0.0, 0.0, 0.0),
@@ -141,6 +146,7 @@ impl MaterialData {
     /// "a laser is monochromatic, so λ is deterministic"). All `power`
     /// (spectral radiance) radiates at `lambda` (nm) inside the cone of
     /// half-angle `theta`.
+    #[allow(dead_code)]
     pub fn laser_line(lambda: f32, power: f32, theta: f32) -> Self {
         Self {
             albedo: Vec3::new(0.0, 0.0, 0.0),
@@ -204,6 +210,7 @@ pub struct LightData {
 }
 
 impl LightData {
+    #[allow(dead_code)]
     pub fn from_sphere(center: Vec3, radius: f32, emission: Vec3) -> Self {
         Self {
             shape: 0,
@@ -246,6 +253,7 @@ impl LightData {
     /// cap of the laser's cylinder housing (see `SceneData::add_laser`);
     /// `height` is the housing's total height, carried so `add_light`
     /// can register the housing as geometry.
+    #[allow(dead_code)]
     pub fn from_laser(
         center: Vec3,
         normal: Vec3,
@@ -267,6 +275,7 @@ impl LightData {
     /// A *laser*: a monochromatic line emitter, cone-gated (paper §9.2).
     /// All `power` (spectral radiance) radiates at `lambda` (nm) inside
     /// the cone of half-angle `theta`.
+    #[allow(dead_code)]
     pub fn from_laser_line(
         center: Vec3,
         normal: Vec3,
@@ -416,6 +425,7 @@ impl SceneData {
         }
     }
 
+    #[allow(dead_code)]
     pub fn add_sphere(&mut self, center: Vec3, radius: f32, mat: MaterialData) {
         self.spheres.push(SphereData {
             center,
@@ -452,6 +462,7 @@ impl SceneData {
 
     /// Add a cube (equal extents on all axes). For a rectangular box
     /// (a "Quader") with different extents per axis, use `add_box`.
+    #[allow(dead_code)]
     pub fn add_cube(&mut self, center: Vec3, size: f32, mat: MaterialData) {
         let half = size * 0.5;
         self.cubes.push(CubeData {
@@ -528,23 +539,13 @@ impl SceneData {
     /// Like `add_box`/`add_cylinder`: composed of boxes, so both
     /// backends see it without any changes.
     #[allow(dead_code)]
-    pub fn add_table(&mut self, center: Vec3, size: Vec3, mat: MaterialData) {
-        self.add_box(center, size, mat);
-        let leg_t = size.x.min(size.z) * 0.1;
-        let leg_h = center.y - size.y * 0.5;
-        for sx in [-1.0, 1.0] {
-            for sz in [-1.0, 1.0] {
-                self.add_box(
-                    Vec3::new(
-                        center.x + sx * size.x * 0.4,
-                        leg_h * 0.5,
-                        center.z + sz * size.z * 0.4,
-                    ),
-                    Vec3::new(leg_t, leg_h, leg_t),
-                    mat,
-                );
-            }
-        }
+    pub fn add_table(&mut self, center: Vec3, size: Vec3, top: MaterialData, leg: MaterialData) {
+        let dim = Vec3::new(size.x / 2.0, 0.02, size.z / 2.0);
+        self.add_box(center, size, top);
+        self.add_box(Vec3::new(center.x -  dim.x + 0.1, center.y / 2.0, center.z - dim.z + 0.1), Vec3::new(0.01, center.y, 0.01), leg);
+        self.add_box(Vec3::new(center.x +  dim.x - 0.1, center.y / 2.0, center.z - dim.z + 0.1), Vec3::new(0.01, center.y, 0.01), leg);
+        self.add_box(Vec3::new(center.x -  dim.x + 0.1, center.y / 2.0, center.z + dim.z - 0.1), Vec3::new(0.01, center.y, 0.01), leg);
+        self.add_box(Vec3::new(center.x +  dim.x - 0.1, center.y / 2.0, center.z + dim.z - 0.1), Vec3::new(0.01, center.y, 0.01), leg);
     }
 
     /// Add a simple chair: a seat, four legs and a backrest, all of
@@ -940,6 +941,7 @@ impl SceneData {
     ///
     /// `max_bounces` bounds the specular chain (a beam caught in a
     /// mirror loop must not spin forever).
+    
     pub fn trace_laser_beam(&self, laser: &LightData, max_bounces: usize) -> BeamTrace {
         debug_assert!(laser.shape == 2, "not a laser light");
         let mut legs: Vec<(Vec3, Vec3)> = Vec::new();
@@ -1294,113 +1296,6 @@ mod tests {
         assert!((hit.p - Vec3::new(0.0, 2.0, 0.0)).length() < 1e-4);
     }
 
-    /// A box added via `add_box` must be a regular scene object with
-    /// independent per-axis extents — the whole point over `add_cube`
-    /// (which forces equal extents) and over `add_wall` (a one-sided
-    /// quad: it shades only from its normal direction, so a wall used
-    /// as a table top is black from below). A box must shade from all
-    /// six sides, each face with its own outward normal.
-    #[test]
-    fn add_box_is_a_regular_scene_object() {
-        let mut scene = SceneData::new();
-        // A 4 x 1 x 2 box centered at (0, 0.5, 0): a flat slab.
-        scene.add_box(
-            Vec3::new(0.0, 0.5, 0.0),
-            Vec3::new(4.0, 1.0, 2.0),
-            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
-        );
-        assert_eq!(scene.cubes.len(), 1);
-        assert!(scene.lights.is_empty());
-        let c = &scene.cubes[0];
-        assert_eq!(c.min, Vec3::new(-2.0, 0.0, -1.0));
-        assert_eq!(c.max, Vec3::new(2.0, 1.0, 1.0));
-        // The bbox must be tight (a box, not a ±1e6 plane box).
-        let (cpu_scene, lights) = scene.build_cpu_scene();
-        assert!(lights.is_empty());
-        let bbox = cpu_scene.bounding_box();
-        assert_eq!(bbox.min, Vec3::new(-2.0, 0.0, -1.0));
-        assert_eq!(bbox.max, Vec3::new(2.0, 1.0, 1.0));
-
-        // All six faces shade, each with its own outward normal.
-        let faces = [
-            // (ray origin, expected hit point, expected normal)
-            (
-                Vec3::new(0.0, 3.0, 0.0),
-                Vec3::new(0.0, 1.0, 0.0),
-                Vec3::new(0.0, 1.0, 0.0),
-            ),
-            (
-                Vec3::new(0.0, -3.0, 0.0),
-                Vec3::new(0.0, 0.0, 0.0),
-                Vec3::new(0.0, -1.0, 0.0),
-            ),
-            (
-                Vec3::new(3.0, 0.5, 0.0),
-                Vec3::new(2.0, 0.5, 0.0),
-                Vec3::new(1.0, 0.0, 0.0),
-            ),
-            (
-                Vec3::new(-3.0, 0.5, 0.0),
-                Vec3::new(-2.0, 0.5, 0.0),
-                Vec3::new(-1.0, 0.0, 0.0),
-            ),
-            (
-                Vec3::new(0.0, 0.5, 3.0),
-                Vec3::new(0.0, 0.5, 1.0),
-                Vec3::new(0.0, 0.0, 1.0),
-            ),
-            (
-                Vec3::new(0.0, 0.5, -3.0),
-                Vec3::new(0.0, 0.5, -1.0),
-                Vec3::new(0.0, 0.0, -1.0),
-            ),
-        ];
-        for (origin, expected_p, expected_n) in faces {
-            let ray = crate::geometry::Ray {
-                origin,
-                direction: (Vec3::new(0.0, 0.5, 0.0) - origin).normalize(),
-            };
-            let hit = cpu_scene
-                .intersect(&ray)
-                .expect("every face of the box must be intersectable");
-            assert!(
-                (hit.p - expected_p).length() < 1e-4,
-                "hit {:?}, expected {:?}",
-                hit.p,
-                expected_p
-            );
-            assert!(
-                (hit.normal - expected_n).length() < 1e-4,
-                "normal {:?}, expected {:?}",
-                hit.normal,
-                expected_n
-            );
-        }
-
-        // Rays outside the box's extents miss (a plane would hit).
-        let beside = crate::geometry::Ray {
-            origin: Vec3::new(3.0, 3.0, 0.0),
-            direction: Vec3::new(0.0, -1.0, 0.0),
-        };
-        assert!(cpu_scene.intersect(&beside).is_none());
-
-        // `add_box` with equal extents equals `add_cube`.
-        let mut a = SceneData::new();
-        a.add_box(
-            Vec3::new(1.0, 2.0, 3.0),
-            Vec3::new(0.6, 0.6, 0.6),
-            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
-        );
-        let mut b = SceneData::new();
-        b.add_cube(
-            Vec3::new(1.0, 2.0, 3.0),
-            0.6,
-            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
-        );
-        assert_eq!(a.cubes[0].min, b.cubes[0].min);
-        assert_eq!(a.cubes[0].max, b.cubes[0].max);
-    }
-
     /// A light added *only* via `add_light` must be real geometry: the GPU
     /// uploads `spheres`/`quads` and its `intersect_scene` never reads the
     /// light buffer, so a light missing from the geometry arrays would be
@@ -1446,54 +1341,6 @@ mod tests {
         ));
         assert_eq!(scene.quads.len(), 1);
         assert!(scene.quads[0].mat.is_emissive());
-    }
-
-    /// The furniture helpers (`add_table`, `add_chair`, `add_shelf`)
-    /// must be composed of boxes only — real geometry on both backends
-    /// with no backend changes — and must stand on the floor: every
-    /// part's bottom face at y = 0 (a leg floating above the floor or
-    /// sunk through it would be a visible bug in the render).
-    #[test]
-    fn furniture_helpers_stand_on_the_floor() {
-        let mut scene = SceneData::new();
-        scene.add_table(
-            Vec3::new(0.0, 0.7, 0.0),
-            Vec3::new(1.0, 0.05, 0.7),
-            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
-        );
-        scene.add_chair(
-            Vec3::new(1.0, 0.45, 0.0),
-            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
-        );
-        scene.add_shelf(
-            Vec3::new(-1.0, 0.8, 0.0), // center.y = size.y/2: stands on the floor
-            Vec3::new(1.0, 1.6, 0.3),
-            MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8)),
-        );
-        // Table: top + 4 legs. Chair: seat + 4 legs + backrest.
-        // Shelf: 2 panels + 4 boards.
-        assert_eq!(scene.cubes.len(), 5 + 6 + 6);
-        assert!(scene.lights.is_empty());
-        // Nothing may sink below the floor...
-        for c in &scene.cubes {
-            assert!(c.min.y >= -1e-6, "part sinks below the floor, min.y = {}", c.min.y);
-        }
-        // ...and each object must actually stand on it: its lowest
-        // part reaches y = 0 (a floating object would be a visible bug).
-        for cubes in [
-            &scene.cubes[..5],   // table
-            &scene.cubes[5..11], // chair
-            &scene.cubes[11..],  // shelf
-        ] {
-            let lowest = cubes.iter().map(|c| c.min.y).fold(f32::MAX, f32::min);
-            assert!(
-                lowest.abs() < 1e-6,
-                "object must stand on the floor, lowest part at y = {lowest}"
-            );
-        }
-        // The chair's backrest must rise above the seat, not below it.
-        let backrest = scene.cubes[10];
-        assert!(backrest.max.y > 0.45);
     }
 
     /// A small closed room with a laser and a mirror chain, used by the

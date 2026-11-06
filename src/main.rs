@@ -199,11 +199,7 @@ fn build_scene_with(_laser_aim_y: f32) -> SceneData {
 
     let pos = Vec3::new(-1.7, 0.6, 1.7);
     let dim = Vec3::new(1.0, 0.02, 0.7);
-    scene.add_box(pos, dim, white);
-    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z - dim.z / 2.0 + 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x -  dim.x / 2.0 + 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
-    scene.add_box(Vec3::new(pos.x +  dim.x / 2.0 - 0.1, pos.y / 2.0, pos.z + dim.z / 2.0 - 0.1), Vec3::new(0.01, pos.y, 0.01), brown);
+    scene.add_table(pos, dim, white, brown);
 
     // A second laser (green) on the table, aimed across the room at the
     // thin mirror boxes — its beam ping-pongs between them, and the
