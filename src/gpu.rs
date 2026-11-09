@@ -155,19 +155,29 @@ struct GpuLight {
     _pad8: f32,
     _pad8b: f32,
     /// The specular bridge *ladder* (a laser only), packed one rung per
-    /// `vec4`: xyz = the rung's image-center, w = its radius. Rung j is
-    /// the aperture's mirror image unfolded across the first j mirrors
-    /// of the beam's chain (see `bdpt::Bridge` and
-    /// `SceneData::bridges_of_light`); the eye walk aims at these at
-    /// diffuse vertices, so the glow appears beside *every* leg of the
-    /// beam, not just the last. `n_bridges` = 0 marks "no ladder" (a
-    /// beam that never hits a mirror).
+    /// *pair* of vec4s: [xyz = the rung's image-center, w = its radius]
+    /// then [xyz = the rung's beam direction (the unfolded beam axis,
+    /// pointing away from the image toward the surface), w = the
+    /// emission cone's versine]. Rung j is the aperture's mirror image
+    /// unfolded across the first j mirrors of the beam's chain (see
+    /// `bdpt::Bridge` and `SceneData::bridges_of_light`); the eye walk
+    /// aims at these at diffuse vertices, so the glow appears beside
+    /// *every* leg of the beam, not just the last. The beam direction
+    /// and versine let the rung sample the *gate-mapped* cone — the
+    /// smaller of the image-disc cone and the emission cone — so at a
+    /// laser's physical divergence (θ ~ 10⁻⁴ rad) the spot's draws are
+    /// not wasted on gate-rejected aims (see `bdpt::Bridge`). A zero
+    /// beam_dir marks a rung without a beam direction (the degenerate
+    /// fallback: the disc cone alone, as before).
     ///
-    /// Packed as vec4 (not center+radius arrays) so the WGSL
-    /// `array<vec4<f32>, 8>` and this Rust array agree on the 16-byte
-    /// element stride — `array<vec3<f32>, 8>` would be 16-byte-strided
+    /// `n_bridges` = 0 marks "no ladder" (a beam that never hits a
+    /// mirror).
+    ///
+    /// Packed as vec4 pairs (not center+radius arrays) so the WGSL
+    /// `array<vec4<f32>, 16>` and this Rust array agree on the 16-byte
+    /// element stride — `array<vec3<f32>, 16>` would be 16-byte-strided
     /// in WGSL but 12-byte-strided here.
-    bridge_rungs: [[f32; 4]; MAX_BEAM_BOUNCES],
+    bridge_rungs: [[f32; 4]; 2 * MAX_BEAM_BOUNCES],
     n_bridges: u32,
     _pad9: [f32; 3],
 }
@@ -182,13 +192,19 @@ impl GpuLight {
     /// (`SceneData::bridges_of_light`), so a moving scene's rungs
     /// follow the mirrors. An empty ladder marks "no bridge".
     fn from_light_data(l: &LightData, ladder: &[crate::bdpt::Bridge]) -> Self {
-        let mut bridge_rungs = [[0.0f32; 4]; MAX_BEAM_BOUNCES];
+        let mut bridge_rungs = [[0.0f32; 4]; 2 * MAX_BEAM_BOUNCES];
         for (i, b) in ladder.iter().take(MAX_BEAM_BOUNCES).enumerate() {
-            bridge_rungs[i] = [
+            bridge_rungs[2 * i] = [
                 b.image_center.x,
                 b.image_center.y,
                 b.image_center.z,
                 b.radius,
+            ];
+            bridge_rungs[2 * i + 1] = [
+                b.beam_dir.x,
+                b.beam_dir.y,
+                b.beam_dir.z,
+                b.versine,
             ];
         }
         let (spectrum_kind, coeffs, lambda, power) = match l.spectrum {
@@ -233,7 +249,9 @@ const MAT_EMISSIVE: u32 = 1;
 const MAT_MIRROR: u32 = 2;
 const MAT_GLASS: u32 = 3;
 /// A laser aperture: emissive, but radiating only into a cone. The cone's
-/// cosine rides in the prim's `ior` slot (unused by emitters).
+/// *versine* (1 − cos θ, computed in f64 — see `Bsdf::Laser`) rides in
+/// the prim's `ior` slot (unused by emitters): at a laser's divergence
+/// the f32 cosine rounds to 1.0 and the cone would collapse.
 const MAT_LASER: u32 = 4;
 /// A GGX microfacet "rough mirror" (paper §9.5): a continuous lobe, so
 /// connections through it are valid. The roughness rides in `rough`,
@@ -253,7 +271,7 @@ const KIND_CYLINDER: u32 = 4;
 const _: () = {
     assert!(std::mem::size_of::<GpuPrim>() == 128);
     assert!(std::mem::size_of::<GpuBvhNode>() == 32);
-    assert!(std::mem::size_of::<GpuLight>() == 256);
+    assert!(std::mem::size_of::<GpuLight>() == 384);
     assert!(std::mem::size_of::<Uniforms>() == 96);
 };
 
@@ -442,11 +460,11 @@ fn mat_type_u32(m: &crate::scene::MaterialData) -> u32 {
 
 /// The ior of a glass material (1.0 for everything else, so the shader can
 /// read the field unconditionally). For a laser material the slot carries
-/// the emission cone's cosine instead (see `MAT_LASER`).
+/// the emission cone's *versine* instead (see `MAT_LASER`).
 fn mat_ior(m: &crate::scene::MaterialData) -> f32 {
     match m.bsdf {
         crate::geometry::Bsdf::Glass { ior, .. } => ior,
-        crate::geometry::Bsdf::Laser { cos_theta } => cos_theta,
+        crate::geometry::Bsdf::Laser { versine } => versine,
         _ => 1.0,
     }
 }

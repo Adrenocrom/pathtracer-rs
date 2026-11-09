@@ -82,7 +82,7 @@ pub enum Bsdf {
     /// (nonzero eval), so the BDPT blind spot softens on its own.
     Glossy { alpha: f32, f0: f32 },
     /// Tag for a *laser emitter*: an emissive surface that radiates only
-    /// into a narrow cone of half-angle `acos(cos_theta)` around its
+    /// into a narrow cone of half-angle `acos(1 − versine)` around its
     /// geometric normal (the beam). Not a scattering model at all — pure
     /// emitters never scatter — but the BSDF slot is the one place the
     /// emission cone can travel with the material, so the BDPT pdf/weight/
@@ -90,7 +90,17 @@ pub enum Bsdf {
     /// delta: the cone has a real (if tiny) solid angle, connections to
     /// the aperture stay valid, and one-sided shading applies (the
     /// aperture is dark from behind).
-    Laser { cos_theta: f32 },
+    ///
+    /// The cone is stored as its *versine* (1 − cos θ), computed in f64
+    /// by `cone_versine`: at a laser's divergence (θ ~ 10⁻⁴ rad) the f32
+    /// `theta.cos()` rounds to exactly 1.0, which would collapse the
+    /// cone's solid angle 2π(1 − cos θ) to zero and gate the beam away
+    /// entirely. Every consumer uses versine-native forms: the solid
+    /// angle is 2π·versine, the gate is |d − n|² ≤ 2·versine (unit
+    /// vectors — the component differences are Sterbenz-exact where
+    /// 1 − dot cancels catastrophically), and the cone sampler draws
+    /// the versine directly.
+    Laser { versine: f32 },
 }
 
 impl Bsdf {
@@ -120,6 +130,16 @@ impl Bsdf {
             _ => 1.0,
         }
     }
+}
+
+/// The versine (1 − cos θ) of a laser's emission-cone half-angle,
+/// computed in f64: at a laser's divergence (θ ~ 10⁻⁴ rad) the f32
+/// `theta.cos()` rounds to exactly 1.0, which would collapse the cone's
+/// solid angle 2π(1 − cos θ) to zero and gate the beam away entirely.
+/// The versine is O(θ²/2) — representable down to θ ~ 10⁻¹⁹ in f32.
+pub fn cone_versine(theta: f32) -> f32 {
+    let t = theta as f64;
+    (1.0 - t.cos()) as f32
 }
 
 /// Which quantity a subpath transports. The two agree for reflection but
@@ -218,14 +238,15 @@ impl Material {
 
     /// A cone-gated emitter with a *smooth* spectrum (an RGB spotlight):
     /// radiates `intent` only into the cone of half-angle `theta` around
-    /// the geometric normal. The cone is stored as its cosine so the
-    /// gate is a single dot product.
+    /// the geometric normal. The cone is stored as its versine (see
+    /// `Bsdf::Laser`) so the gate survives the tiny physical divergences.
+    #[allow(dead_code)]
     pub fn laser(emission: Vec3, theta: f32) -> Self {
         Self {
             albedo: VEC_ZERO,
             spectrum: SpectrumKind::smooth_from_rgb(emission),
             bsdf: Bsdf::Laser {
-                cos_theta: theta.cos(),
+                versine: cone_versine(theta),
             },
         }
     }
@@ -240,8 +261,23 @@ impl Material {
             albedo: VEC_ZERO,
             spectrum: SpectrumKind::Line { lambda, power },
             bsdf: Bsdf::Laser {
-                cos_theta: theta.cos(),
+                versine: cone_versine(theta),
             },
+        }
+    }
+
+    /// A laser-aperture material from the cone's versine directly — the
+    /// y_0 vertex material in bdpt.rs, whose cone comes from the
+    /// AreaLight's stored versine (no θ round-trip, which would lose
+    /// the tiny physical cones to the f32 rounding). The spectrum is
+    /// the same dummy white smooth SPD as `Material::laser`: the y_0
+    /// vertex's emission is read from the light's spectrum, never the
+    /// material's.
+    pub fn laser_cone(versine: f32) -> Self {
+        Self {
+            albedo: VEC_ZERO,
+            spectrum: SpectrumKind::smooth_from_rgb(Vec3::new(1.0, 1.0, 1.0)),
+            bsdf: Bsdf::Laser { versine },
         }
     }
 
@@ -254,15 +290,24 @@ impl Material {
     /// material's emission cone around `normal` (the beam). The cone is
     /// closed: a direction exactly on the boundary counts as inside.
     /// False for non-laser materials.
+    ///
+    /// Versine form: for unit vectors the gate is
+    /// |d − n|² = 2(1 − d·n) ≤ 2·versine — the component differences
+    /// are Sterbenz-exact where `1 − dot` cancels catastrophically at
+    /// the tiny divergences.
     pub fn in_beam(&self, normal: Vec3, p: Vec3, target: Vec3) -> bool {
         match self.bsdf {
-            Bsdf::Laser { cos_theta } => {
+            Bsdf::Laser { versine } => {
                 let d = target - p;
                 let len = d.length();
                 if len < 1e-8 {
                     return true;
                 }
-                normal.dot(d * (1.0 / len)) >= cos_theta
+                let u = d * (1.0 / len);
+                let dx = u.x - normal.x;
+                let dy = u.y - normal.y;
+                let dz = u.z - normal.z;
+                dx * dx + dy * dy + dz * dz <= 2.0 * versine
             }
             _ => false,
         }
@@ -1101,13 +1146,16 @@ pub enum LightShape {
     },
     /// A laser aperture: a disc of radius `radius` centered at `center`
     /// with outward normal `normal`, radiating only into the cone of
-    /// half-angle `theta` around `normal`. The disc is the top cap of
-    /// the laser's cylinder housing.
+    /// half-angle `acos(1 − versine)` around `normal`. The disc is the
+    /// top cap of the laser's cylinder housing. The cone is stored as
+    /// its versine (1 − cos θ, computed in f64 — see `Bsdf::Laser`): at
+    /// a laser's divergence the f32 cosine rounds to 1.0 and the cone
+    /// would collapse.
     Laser {
         center: Vec3,
         normal: Vec3,
         radius: f32,
-        theta: f32,
+        versine: f32,
     },
 }
 
@@ -1148,6 +1196,8 @@ impl AreaLight {
     /// with outward normal `normal`, radiating into the cone of
     /// half-angle `theta` around the normal. The disc is the emitting
     /// cap of the laser's cylinder housing (see `SceneData::add_laser`).
+    /// The cone is stored as its versine (see `Bsdf::Laser`).
+    #[allow(dead_code)]
     pub fn from_laser(
         center: Vec3,
         normal: Vec3,
@@ -1155,12 +1205,26 @@ impl AreaLight {
         theta: f32,
         spectrum: SpectrumKind,
     ) -> Self {
+        Self::from_laser_versine(center, normal, radius, cone_versine(theta), spectrum)
+    }
+
+    /// A laser aperture light in versine form (see `Bsdf::Laser` for why
+    /// the cone travels as its versine): the versine is computed once,
+    /// in f64, at the scene-construction site — never re-derived from a
+    /// cosine at a consumer.
+    pub fn from_laser_versine(
+        center: Vec3,
+        normal: Vec3,
+        radius: f32,
+        versine: f32,
+        spectrum: SpectrumKind,
+    ) -> Self {
         Self {
             shape: LightShape::Laser {
                 center,
                 normal: normal.normalize(),
                 radius,
-                theta,
+                versine,
             },
             spectrum,
         }
@@ -1228,11 +1292,16 @@ impl AreaLight {
     /// Sample the direction a light subpath leaves the sampled point in,
     /// around the normal `sample` returned: cosine-weighted for ordinary
     /// emitters (pdf cos/π), uniform in the cone for a laser aperture
-    /// (pdf 1/(2π(1 − cos θ))). Split from `sample` because a cone
+    /// (pdf 1/(2π·versine)). Split from `sample` because a cone
     /// emitter's departure direction is not its normal.
+    ///
+    /// Versine form: the draw is `1 − u·versine` (u uniform in [0,1]),
+    /// which is the versine of the drawn angle — exact at every
+    /// divergence, where the old `1 − u(1 − cos θ)` form lost the
+    /// entire cone to the f32 rounding of cos θ.
     pub fn sample_dir(&self, normal: Vec3, rng: &mut impl Rng) -> Vec3 {
         match &self.shape {
-            LightShape::Laser { theta, .. } => {
+            LightShape::Laser { versine, .. } => {
                 let a = if normal.x.abs() > 0.9 {
                     Vec3::new(0.0, 1.0, 0.0)
                 } else {
@@ -1240,12 +1309,14 @@ impl AreaLight {
                 };
                 let t = a.cross(normal).normalize();
                 let b = normal.cross(t);
-                let cos_theta = theta.cos();
-                // Uniform in the cone: cos φ uniform in [cos θ, 1].
-                let u = 1.0 - rng.gen::<f32>() * (1.0 - cos_theta);
+                // Uniform in the cone: the versine of the drawn angle is
+                // uniform in [0, versine] (the versine is the natural
+                // measure — cos φ uniform in [cos θ, 1] is exactly this).
+                let v = rng.gen::<f32>() * *versine;
+                let cos_phi = 1.0 - v;
+                let sin_phi = (2.0 * v - v * v).sqrt();
                 let phi = 2.0 * PI * rng.gen::<f32>();
-                let sin_theta = (1.0 - u * u).sqrt();
-                t * (sin_theta * phi.cos()) + b * (sin_theta * phi.sin()) + normal * u
+                t * (sin_phi * phi.cos()) + b * (sin_phi * phi.sin()) + normal * cos_phi
             }
             _ => cosine_hemisphere(normal, rng),
         }
@@ -1289,18 +1360,33 @@ impl AreaLight {
         matches!(self.shape, LightShape::Laser { .. })
     }
 
-    /// The laser cone's half-angle. Only meaningful for laser lights.
-    pub fn cone_theta(&self) -> f32 {
+    /// The laser cone's versine (1 − cos θ). Only meaningful for laser
+    /// lights. The versine — not the cosine — is the canonical form:
+    /// at a laser's divergence the f32 cosine rounds to 1.0 and the
+    /// cone would collapse (see `Bsdf::Laser`).
+    pub fn cone_versine(&self) -> f32 {
         match &self.shape {
-            LightShape::Laser { theta, .. } => *theta,
+            LightShape::Laser { versine, .. } => *versine,
             _ => 0.0,
         }
     }
 
-    /// The cosine of the laser cone's half-angle. Only meaningful for
-    /// laser lights.
-    pub fn cone_cos(&self) -> f32 {
-        self.cone_theta().cos()
+    /// The laser cone's half-angle (radians). Only meaningful for laser
+    /// lights; 0 for a degenerate (zero-solid-angle) cone. The inverse
+    /// of the versine — used by tests and diagnostics, never on a
+    /// transport path (the versine is the canonical form there).
+    #[allow(dead_code)]
+    pub fn cone_theta(&self) -> f32 {
+        match &self.shape {
+            LightShape::Laser { versine, .. } => {
+                if *versine <= 0.0 {
+                    0.0
+                } else {
+                    (2.0 * *versine as f64).sqrt() as f32
+                }
+            }
+            _ => 0.0,
+        }
     }
 
     /// True when the direction `p -> target` lies inside this laser's
@@ -1313,7 +1399,7 @@ impl AreaLight {
                 center,
                 normal,
                 radius,
-                theta,
+                versine,
             } => {
                 // p must lie on the aperture disc (the curved side of
                 // the housing is dark): the same plane/extent test as
@@ -1326,13 +1412,19 @@ impl AreaLight {
                     return false;
                 }
                 // ...and the direction p -> target must lie inside the
-                // cone (closed: exactly on the boundary counts).
+                // cone (closed: exactly on the boundary counts). The
+                // versine gate: |d − n|² = 2(1 − d·n) ≤ 2·versine for
+                // unit vectors — Sterbenz-exact where 1 − dot cancels.
                 let d = target - p;
                 let len = d.length();
                 if len < 1e-8 {
                     return true;
                 }
-                normal.dot(d * (1.0 / len)) >= theta.cos()
+                let u = d * (1.0 / len);
+                let dx = u.x - normal.x;
+                let dy = u.y - normal.y;
+                let dz = u.z - normal.z;
+                dx * dx + dy * dy + dz * dz <= 2.0 * versine
             }
             _ => true,
         }
@@ -1481,7 +1573,9 @@ mod tests {
 
     /// The laser aperture light: samples lie on the disc, the departure
     /// directions lie in the cone, and the cone gate accepts/rejects
-    /// directions correctly.
+    /// directions correctly. Also pins the versine representation at
+    /// the tiny physical divergences, where the old f32 cosine form
+    /// collapsed the cone entirely (cos(2e-4) rounds to 1.0).
     #[test]
     fn laser_light_samples_disc_and_cone() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(77);
@@ -1501,7 +1595,7 @@ mod tests {
             let d = light.sample_dir(n, &mut rng);
             // Every departure direction lies in the cone (dot with the
             // axis >= cos θ) and is unit length.
-            assert!(d.dot(n) >= light.cone_cos() - 1e-5);
+            assert!(d.dot(n) >= 1.0 - light.cone_versine() - 1e-5);
             assert!((d.length() - 1.0).abs() < 1e-5);
         }
         // The beam gate: a direction along the axis is inside, one far
@@ -1512,6 +1606,43 @@ mod tests {
         // A point off the aperture is not "in beam" (guards the direct
         // hit on the dark housing side).
         assert!(!light.in_beam(Vec3::new(0.0, 0.5, 0.0), p));
+
+        // The physical-divergence regime: a 532 nm beam with a 1 cm
+        // waist has θ = λ/(πw₀) ≈ 1.7e-5 rad. The versine must be
+        // representable (the f32 cosine rounds to 1.0 there), the cone
+        // sampler must still produce in-cone unit directions, and the
+        // gate must accept the axis and reject a 1e-3 rad off-axis
+        // direction (60x the half-angle).
+        let theta = 532.0e-9 / (PI * 0.01);
+        let tight = AreaLight::from_laser(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.01,
+            theta,
+            SpectrumKind::Line {
+                lambda: 532.0,
+                power: 1.0,
+            },
+        );
+        let versine = tight.cone_versine();
+        assert!(
+            versine > 0.0 && versine < 1e-8,
+            "the diffraction-limited versine must be tiny but nonzero: {versine}"
+        );
+        assert!((tight.cone_theta() - theta).abs() < theta * 1e-3);
+        for _ in 0..200 {
+            let (_, n) = tight.sample(&mut rng);
+            let d = tight.sample_dir(n, &mut rng);
+            assert!((d.length() - 1.0).abs() < 1e-5);
+            assert!(d.dot(n) >= 1.0 - versine - 1e-6);
+        }
+        assert!(tight.in_beam(p, p + Vec3::new(0.0, 1.0, 0.0)));
+        // 1e-3 rad off-axis: versine 5e-7 vs the cone's 1.4e-10 — far
+        // outside.
+        assert!(!tight.in_beam(
+            p,
+            p + Vec3::new(1e-3, 1.0, 0.0).normalize()
+        ));
     }
 
     #[test]

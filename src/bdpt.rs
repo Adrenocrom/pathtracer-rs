@@ -200,55 +200,129 @@ pub const BRIDGE_PROB: f32 = 0.25;
 /// by the image disc, which is what `sample_dir`/`pdf` describe
 /// (uniform over that cone).
 ///
+/// **The gate-mapped cone.** The aperture's emission is cone-gated
+/// (the beam), so not every direction that reaches the aperture
+/// carries light: only those whose *unfolded* arrival direction lies
+/// inside the emission cone. The unfolding is an isometry — it maps
+/// the beam axis to the reversed beam direction at the image, and the
+/// emission cone to the cone of half-angle θ around it — so the
+/// gate-accepted aim set from `p` is exactly the intersection of the
+/// image-disc cone (angular radius asin(r/D)) and the gate-mapped
+/// cone (angular radius θ around the reversed beam axis, as seen from
+/// `p`). At the wide test angles the disc cone is the smaller of the
+/// two and nothing changes; at a laser's physical divergence the
+/// gate-mapped cone is far smaller (θ ~ 10⁻⁴ rad vs r/D ~ 10⁻²), and
+/// sampling the full disc cone would waste ~all draws on gate-rejected
+/// aims — the spot would converge ~(Dθ/r)² times slower and fall
+/// below the accumulation layer's outlier-rejection threshold, never
+/// appearing. The rung therefore carries the beam direction and the
+/// cone's versine, and samples the *smaller* cone — zero waste at the
+/// spot, and the same distribution as before wherever the disc cone
+/// is the binding one.
+///
 /// This is a sampling technique, not a light source: no fake emitters,
 /// no mid-air beam — in clean air a laser beam is invisible from the
 /// side; only the light deposited on real surfaces is real.
 #[derive(Clone, Copy)]
 pub struct Bridge {
-    /// The aperture's mirror image through the beam's whole mirror
-    /// chain: a disc of `radius` centered at `image_center` (the
+    /// The aperture's mirror image through the beam's mirror-chain
+    /// prefix: a disc of `radius` centered at `image_center` (the
     /// aperture disc unfolded across every mirror plane in beam
     /// order).
     pub image_center: Vec3,
     /// The image disc's radius (the aperture radius).
     pub radius: f32,
+    /// The beam's travel direction at the image (the unfolded beam
+    /// axis, pointing *away* from the image toward the surface): a
+    /// ray from `p` aimed inside the gate-mapped cone crosses the
+    /// mirrors and arrives at the aperture inside the emission cone.
+    /// Zero marks a rung without a beam direction (the degenerate
+    /// fallback: sample the disc cone alone, as before).
+    pub beam_dir: Vec3,
+    /// The versine (1 − cos θ) of the emission cone's half-angle —
+    /// the gate-mapped cone's angular radius (see `Bsdf::Laser` for
+    /// why the cone travels as its versine).
+    pub versine: f32,
 }
 
 impl Bridge {
-    /// The solid-angle pdf of the bridge direction `dir` from `p`:
-    /// uniform over the cone subtended by the image disc —
-    /// pdf = 1 / (2π(1 − cos θ_c)) with θ_c = asin(radius / dist).
-    /// 0 when `p` lies within the image sphere (degenerate) or `dir`
-    /// points outside the cone.
-    pub fn pdf(&self, p: Vec3, dir: Vec3) -> f32 {
-        let d = self.image_center - p;
-        let len_sq = d.length_squared();
-        if len_sq <= self.radius * self.radius {
-            return 0.0;
-        }
-        // Inside the cone iff d·dir ≥ sqrt(len² − r²) — both sides
-        // scaled by len, i.e. cos(angle) ≥ cos(θ_c). No trig needed.
-        let cos_cone = (len_sq - self.radius * self.radius).sqrt();
-        if d.dot(dir) < cos_cone {
-            return 0.0;
-        }
-        let omega = 2.0 * PI * (1.0 - cos_cone / len_sq.sqrt());
-        1.0 / omega
-    }
-
-    /// Sample a direction uniformly over the cone subtended by the
-    /// image disc at `p`. None when `p` lies within the image sphere
-    /// (the cone is degenerate; the caller excludes such bridges from
-    /// the qualifying set, so this is a defensive fallback).
-    pub fn sample_dir(&self, p: Vec3, rng: &mut impl Rng) -> Option<Vec3> {
+    /// The cone this rung proposes from `p`: the *binding* constraint's
+    /// cone about its own axis. The aim set from `p` is the
+    /// intersection of the image-disc cone (half-angle asin(r/D)
+    /// around the aim axis) and the gate-mapped emission cone
+    /// (half-angle θ around −beam_dir — see the struct doc). Whichever
+    /// is *smaller* binds, and its cone — about its own axis — is the
+    /// proposal:
+    ///
+    /// * θ < asin(r/D) (a laser's physical divergence): the gate
+    ///   binds → the θ-cone around −beam_dir. At the spot the axes
+    ///   coincide (the image lies on the unfolded beam line through
+    ///   the surface point), so this is exact and zero-waste; beside
+    ///   the beam, the whole proposal lies inside the gate, and it
+    ///   hits the disc for every point in the beam's cross-section
+    ///   stripe (φ + θ ≤ asin(r/D)) — the full physical footprint.
+    /// * θ ≥ asin(r/D) (the wide test angles): the disc binds → the
+    ///   disc cone around the aim axis — *exactly the old behavior*,
+    ///   so the wide-θ synthetic scenes keep their convergence.
+    ///
+    /// None when `p` lies within the image sphere (degenerate).
+    ///
+    /// The disc cone's versine is computed in the cancellation-free
+    /// form `x/(1 + √(1−x))` with x = (r/D)²: the naive
+    /// `1 − √(1−x)` loses half its significant bits at the small
+    /// ratios, and the WGSL port (f32 only) must reproduce this
+    /// arithmetic bit-for-bit.
+    fn cone(&self, p: Vec3) -> Option<(Vec3, f32)> {
         let d = self.image_center - p;
         let len_sq = d.length_squared();
         if len_sq <= self.radius * self.radius {
             return None;
         }
         let len = len_sq.sqrt();
-        let axis = d * (1.0 / len);
-        let cos_cone = (len_sq - self.radius * self.radius).sqrt() / len;
+        let aim = d * (1.0 / len);
+        // The disc cone's versine: 1 − cos(asin(r/D)), stable form.
+        let x = self.radius * self.radius / len_sq;
+        let disc_versine = x / (1.0 + (1.0 - x).max(0.0).sqrt());
+        let has_beam = self.beam_dir.length_squared() > 0.5;
+        if self.versine < disc_versine && has_beam {
+            // The emission cone binds: aim along the reversed beam
+            // direction (unit — `reflect_dir` preserves length, and
+            // the normalize absorbs the f32 rounding).
+            Some((self.beam_dir * -1.0, self.versine))
+        } else {
+            // The disc binds (or no beam direction): the old disc cone.
+            Some((aim, disc_versine))
+        }
+    }
+
+    /// The solid-angle pdf of the bridge direction `dir` from `p`:
+    /// uniform over the cone `cone` describes — pdf = 1/(2π·versine).
+    /// 0 when `p` lies within the image sphere (degenerate) or `dir`
+    /// points outside the cone.
+    ///
+    /// The gate is the versine-native form |dir − axis|² ≤ 2·versine
+    /// (unit vectors): the component differences are Sterbenz-exact
+    /// where `1 − dot` cancels catastrophically at the tiny physical
+    /// divergences (versine ~ 10⁻¹⁰).
+    pub fn pdf(&self, p: Vec3, dir: Vec3) -> f32 {
+        let Some((axis, versine)) = self.cone(p) else {
+            return 0.0;
+        };
+        let dx = dir.x - axis.x;
+        let dy = dir.y - axis.y;
+        let dz = dir.z - axis.z;
+        if dx * dx + dy * dy + dz * dz > 2.0 * versine {
+            return 0.0;
+        }
+        1.0 / (2.0 * PI * versine)
+    }
+
+    /// Sample a direction uniformly over the cone `cone` describes.
+    /// None when `p` lies within the image sphere (the cone is
+    /// degenerate; the caller excludes such bridges from the
+    /// qualifying set, so this is a defensive fallback).
+    pub fn sample_dir(&self, p: Vec3, rng: &mut impl Rng) -> Option<Vec3> {
+        let (axis, versine) = self.cone(p)?;
         let a = if axis.x.abs() > 0.9 {
             Vec3::new(0.0, 1.0, 0.0)
         } else {
@@ -256,9 +330,14 @@ impl Bridge {
         };
         let t = a.cross(axis).normalize();
         let b = axis.cross(t);
-        // Uniform in the cone: cos φ uniform in [cos θ_c, 1].
-        let cos_phi = 1.0 - rng.gen::<f32>() * (1.0 - cos_cone);
-        let sin_phi = (1.0 - cos_phi * cos_phi).sqrt();
+        // Uniform in the cone: the versine of the drawn angle is
+        // uniform in [0, versine] (the versine is the natural
+        // measure — cos φ uniform in [cos θ, 1] is exactly this).
+        // The sine is computed from the versine directly
+        // (sin² = 2v − v²), never from the rounded 1 − v.
+        let v = rng.gen::<f32>() * versine;
+        let cos_phi = 1.0 - v;
+        let sin_phi = (2.0 * v - v * v).max(0.0).sqrt();
         let phi = 2.0 * PI * rng.gen::<f32>();
         Some(t * (sin_phi * phi.cos()) + b * (sin_phi * phi.sin()) + axis * cos_phi)
     }
@@ -547,7 +626,7 @@ impl<'a> PathView<'a> {
     /// has no incoming direction: the emitter scatters cosine-weighted
     /// around its stored (emission-side) normal with f = 1 — except a
     /// laser aperture, whose emission is uniform in its cone (pdf
-    /// 1/(2π(1 - cos θ)) inside the beam, 0 outside).
+    /// 1/(2π·versine) inside the beam, 0 outside).
     fn pdf_light(&self, m: usize) -> f64 {
         if m == self.k + 1 {
             return 1.0 / self.inv_light_pdf;
@@ -558,16 +637,25 @@ impl<'a> PathView<'a> {
         let pdf_omega = if m == self.k {
             let d_out = self.dir(m, m - 1);
             let v = self.vertex(m);
-            let cos = v.normal.dot(d_out);
             match v.mat.bsdf {
-                Bsdf::Laser { cos_theta } => {
-                    if cos >= cos_theta {
-                        1.0 / (2.0 * PI * (1.0 - cos_theta))
+                Bsdf::Laser { versine } => {
+                    // The versine gate |d − n|² ≤ 2·versine (unit
+                    // vectors): the component differences are
+                    // Sterbenz-exact where 1 − dot cancels
+                    // catastrophically at the tiny physical divergences
+                    // (and exactly absorbs the cone sampler's f32
+                    // cos-quantization — see `AreaLight::sample_dir`).
+                    let dx = d_out.x - v.normal.x;
+                    let dy = d_out.y - v.normal.y;
+                    let dz = d_out.z - v.normal.z;
+                    if dx * dx + dy * dy + dz * dz <= 2.0 * versine {
+                        1.0 / (2.0 * PI * versine)
                     } else {
                         0.0
                     }
                 }
                 _ => {
+                    let cos = v.normal.dot(d_out);
                     if cos <= 0.0 {
                         0.0
                     } else {
@@ -801,7 +889,7 @@ fn rr_prefix_products(path: &PathView, alpha_light0: f32) -> RrProducts {
     // whose factor is the sample weight of the event at y_j = x_{k-j}
     // toward y_{j+1} = x_{k-j-1}. The first extension has no BSDF at the
     // emitter (f = 1): cosine sampling gives the weight π, a laser
-    // aperture's uniform cone sampling gives cos0 · 2π(1 − cos θ) (0
+    // aperture's uniform cone sampling gives cos0 · 2π·versine (0
     // outside the beam). The light subpath carries importance.
     let mut alpha_l = alpha_light0;
     out.ql[0] = 1.0;
@@ -812,9 +900,13 @@ fn rr_prefix_products(path: &PathView, alpha_light0: f32) -> RrProducts {
             let d_out = path.dir(k, k - 1);
             let cos0 = v.normal.dot(d_out);
             match v.mat.bsdf {
-                Bsdf::Laser { cos_theta } => {
-                    if cos0 >= cos_theta {
-                        cos0 * 2.0 * PI * (1.0 - cos_theta)
+                Bsdf::Laser { versine } => {
+                    // The versine gate (see `pdf_light`).
+                    let dx = d_out.x - v.normal.x;
+                    let dy = d_out.y - v.normal.y;
+                    let dz = d_out.z - v.normal.z;
+                    if dx * dx + dy * dy + dz * dz <= 2.0 * versine {
+                        cos0 * 2.0 * PI * versine
                     } else {
                         0.0
                     }
@@ -1002,17 +1094,27 @@ pub fn bdpt_trace(
         // cosine-weighted, so the edge factor is cos0 * π (the G of the
         // edge cancels against the direction pdf, leaving the cosine
         // integral π). A laser aperture instead samples uniformly in its
-        // cone, so the edge factor is cos0 * 2π(1 - cos θ) — and the
+        // cone, so the edge factor is cos0 * 2π·versine — and the
         // direction must lie inside the beam, where the emitter's
         // radiance is nonzero.
         let is_laser = light.shape_is_laser();
         let cos0 = n0.dot(d0);
         let first_edge_factor = if !is_laser {
             PI
-        } else if cos0 >= light.cone_cos() {
-            cos0 * 2.0 * PI * (1.0 - light.cone_cos())
         } else {
-            0.0
+            // The versine gate (see `PathView::pdf_light`): the
+            // component-difference form is exact under the cone
+            // sampler's f32 quantization, where 1 − dot would lose the
+            // tiny cones entirely.
+            let versine = light.cone_versine();
+            let dx = d0.x - n0.x;
+            let dy = d0.y - n0.y;
+            let dz = d0.z - n0.z;
+            if dx * dx + dy * dy + dz * dz <= 2.0 * versine {
+                cos0 * 2.0 * PI * versine
+            } else {
+                0.0
+            }
         };
         // The spectral radiance at the drawn λ (the branch rule gates
         // it: only the active emitters radiate, and `active` already
@@ -1028,7 +1130,7 @@ pub fn bdpt_trace(
             // ordinary emitters the diffuse material reproduces the old
             // cosine-weighted pdf.
             mat: if is_laser {
-                Material::laser(Vec3::new(1.0, 1.0, 1.0), light.cone_theta())
+                Material::laser_cone(light.cone_versine())
             } else {
                 Material::emissive(Vec3::new(1.0, 1.0, 1.0))
             },
@@ -2083,6 +2185,105 @@ mod tests {
         assert!(
             mean_side.x < 1e-3,
             "dark housing side glows: {mean_side:?}"
+        );
+    }
+
+    /// The power-parametrized beam's analytic spot value: a laser of
+    /// power Φ and waist w₀ pointing straight down at a diffuse floor
+    /// deposits, at the beam-axis foot, the irradiance
+    /// E(0) = Φ·(1 + cosθ)/(2π·w₀²) — the closed form for a uniform-
+    /// radiance cone: the axis point accepts directions up to
+    /// min(asin(w₀/d), θ), and E(0) = L·π·sin²(min(α₀,θ)) with
+    /// L = Φ/(A_ap·2π(1−cosθ)) collapses via sin²θ = (1−cosθ)(1+cosθ)
+    /// to exactly that (the plan's Φ/(πw₀²) is the θ→0 limit). The
+    /// floor's reflected radiance is L_floor = E·ρ/π, and the rendered
+    /// sample at a floor point on the beam axis must match
+    /// `sensor_rgb(λ, L_floor, 1)` (a single line, so λ is
+    /// deterministic on the line branch).
+    ///
+    /// The θ-invariance is the whole point of the power
+    /// parametrization: beams with the same Φ but different θ render
+    /// the *same* axis radiance (the old radiance-parametrized form
+    /// dimmed the spot as θ shrank, which is why θ was left
+    /// artificially wide).
+    ///
+    /// Tolerance: the direct-light strategy that carries the spot
+    /// connects the light subpath's aperture sample to the eye vertex,
+    /// and the aperture's cone gate accepts only the aperture points
+    /// with |p'⊥| ≤ d·tanθ — a (d·θ/w₀)² fraction of the disc: 4% at
+    /// θ = 1e-3, 36% at θ = 3e-3. The estimator is unbiased (the
+    /// accepted samples carry the 1/pdf compensation), but the mean's
+    /// standard error is Bernoulli: ~1.9% at N = 65536 for the wide
+    /// beam, ~0.7% at N = 16384 for the mid one; the tolerances are
+    /// ~3σ. (The far-tighter regime — the demo's M² = 30 beams — is
+    /// carried by the bridge rungs, whose gate-mapped cone is pinned
+    /// by its own unit test; the connection strategy's pass rate
+    /// there is ~1e-5, beyond any feasible N.)
+    #[test]
+    fn power_parametrized_beam_renders_the_analytic_spot_value() {
+        const PI: f32 = std::f32::consts::PI;
+        let lambda = 650.0f32;
+        let power_w = 0.05f32;
+        let w0 = 0.01f32;
+        let rho = 0.8f32; // the floor's gray albedo: ρ(λ) = 0.8 at every λ
+        let render_spot = |theta: f32, n: usize| -> Vec3 {
+            // A laser pointing straight down at the floor from height
+            // 2. The beam disc on the floor has radius w₀ + d·θ, so
+            // the probe at the origin is inside for every θ below
+            // (both are in the tight regime θ < asin(w₀/d) = 5e-3,
+            // where the closed form above is exact).
+            let mut scene = crate::scene::SceneData::new();
+            scene.add_plane(
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                crate::scene::MaterialData::diffuse(Vec3::new(rho, rho, rho)),
+            );
+            scene.add_laser_beam(
+                Vec3::new(0.0, 2.0, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                0.4, // housing height
+                w0,
+                theta,
+                lambda,
+                power_w,
+            );
+            let (cpu_scene, lights) = scene.build_cpu_scene();
+            let mut rng = StdRng::seed_from_u64(41);
+            // The probe: looking straight down at the floor point on
+            // the beam axis. The direct-light strategy (the light
+            // subpath's first vertex connects to the eye vertex)
+            // carries the spot.
+            let r = ray(Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, -1.0, 0.0));
+            let mut mean = VEC_ZERO;
+            for _ in 0..n {
+                mean = mean + bdpt_trace(&r, &*cpu_scene, 4, &lights, NO_BRIDGES, &mut rng);
+            }
+            mean * (1.0 / n as f32)
+        };
+
+        // Two divergences, both in the tight regime: the axis radiance
+        // must match the closed form for each, and the two must agree
+        // (θ-invariance — the (1+cosθ)/2 factor differs by 0.1%
+        // between them, far inside the noise).
+        let wide = render_spot(1e-3, 65536);
+        let mid = render_spot(3e-3, 16384);
+        let e_wide = power_w * (1.0 + (1e-3f32).cos()) / (2.0 * PI * w0 * w0);
+        let e_mid = power_w * (1.0 + (3e-3f32).cos()) / (2.0 * PI * w0 * w0);
+        let expected_wide = sensor_rgb(lambda, e_wide * rho / PI, 1.0);
+        let expected_mid = sensor_rgb(lambda, e_mid * rho / PI, 1.0);
+        assert!(
+            (wide.x - expected_wide.x).abs() <= expected_wide.x * 0.06,
+            "wide beam {wide:?} != analytic {expected_wide:?}"
+        );
+        assert!(
+            (mid.x - expected_mid.x).abs() <= expected_mid.x * 0.03,
+            "mid beam {mid:?} != analytic {expected_mid:?}"
+        );
+        // θ-invariance: the two agree within the combined noise
+        // (~2% SE each).
+        assert!(
+            (wide.x - mid.x).abs() <= expected_wide.x * 0.07,
+            "spot radiance is not theta-invariant: wide {wide:?} mid {mid:?}"
         );
     }
 

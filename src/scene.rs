@@ -76,11 +76,12 @@ impl MaterialData {
     /// Attach the laser emission cone to an emissive material: the BSDF
     /// slot is the one place the cone can travel with the material so
     /// the BDPT pdf/weight/gate helpers can read it from any path
-    /// vertex (see `Bsdf::Laser`).
+    /// vertex (see `Bsdf::Laser`). The cone is stored as its versine
+    /// (see `Bsdf::Laser`).
     #[allow(dead_code)]
     pub fn with_laser_bsdf(mut self, theta: f32) -> Self {
         self.bsdf = Bsdf::Laser {
-            cos_theta: theta.cos(),
+            versine: crate::geometry::cone_versine(theta),
         };
         self
     }
@@ -131,13 +132,14 @@ impl MaterialData {
     }
 
     /// A cone-gated emitter with a smooth spectrum (an RGB spotlight).
+    /// The cone is stored as its versine (see `Bsdf::Laser`).
     #[allow(dead_code)]
     pub fn laser(emission: Vec3, theta: f32) -> Self {
         Self {
             albedo: Vec3::new(0.0, 0.0, 0.0),
             spectrum: SpectrumKind::smooth_from_rgb(emission),
             bsdf: Bsdf::Laser {
-                cos_theta: theta.cos(),
+                versine: crate::geometry::cone_versine(theta),
             },
         }
     }
@@ -152,7 +154,7 @@ impl MaterialData {
             albedo: Vec3::new(0.0, 0.0, 0.0),
             spectrum: SpectrumKind::Line { lambda, power },
             bsdf: Bsdf::Laser {
-                cos_theta: theta.cos(),
+                versine: crate::geometry::cone_versine(theta),
             },
         }
     }
@@ -295,6 +297,51 @@ impl LightData {
         )
     }
 
+    /// A *laser beam*, power-parametrized (the physically correct model —
+    /// paper §9.2's "the laser is a collimated beam"): specify the beam
+    /// power Φ (W) and the divergence half-angle θ, and the line's
+    /// spectral radiance is derived as
+    /// `P = Φ / (A_ap · Ω(θ))` with `A_ap = π·radius²` the aperture
+    /// area and `Ω(θ) = 2π(1 − cos θ)` the cone's solid angle. The spot
+    /// irradiance `E = Φ/(π·w₀²)` is then *invariant to θ* — θ controls
+    /// only the divergence, as it physically does. (The old
+    /// radiance-parametrized form coupled them: at fixed Le the power
+    /// Φ ∝ Ω, so θ was secretly a brightness knob — which is why it was
+    /// left artificially wide.)
+    ///
+    /// `theta` is the beam's *physical* divergence: a diffraction-
+    /// limited beam has θ = M²·λ/(π·w₀) with w₀ = `radius` (M² = 1 is
+    /// the ideal Gaussian; real pointers sit at M² ≈ 1–3, and the demo
+    /// uses a larger M² so the spot grows visibly across the room).
+    /// The versine is computed in f64 (see `cone_versine`): at these
+    /// divergences the f32 cosine rounds to 1.0 and the cone would
+    /// collapse.
+    pub fn from_laser_beam(
+        center: Vec3,
+        normal: Vec3,
+        radius: f32,
+        theta: f32,
+        height: f32,
+        lambda: f32,
+        power_w: f32,
+    ) -> Self {
+        let versine = crate::geometry::cone_versine(theta);
+        let omega = 2.0 * std::f32::consts::PI * versine;
+        let aperture_area = std::f32::consts::PI * radius * radius;
+        let power = power_w / (aperture_area * omega);
+        Self::from_laser_spec_versine(
+            center,
+            normal,
+            radius,
+            versine,
+            height,
+            SpectrumKind::Line {
+                lambda,
+                power,
+            },
+        )
+    }
+
     /// The shared laser-aperture constructor: the spectrum rides in the
     /// `spectrum` field; the cone half-angle and housing height ride in
     /// the unused quad slots (`half_w`/`half_h`).
@@ -306,6 +353,28 @@ impl LightData {
         height: f32,
         spectrum: SpectrumKind,
     ) -> Self {
+        Self::from_laser_spec_versine(
+            center,
+            normal,
+            radius,
+            crate::geometry::cone_versine(theta),
+            height,
+            spectrum,
+        )
+    }
+
+    /// The shared laser-aperture constructor in versine form (see
+    /// `Bsdf::Laser` for why the cone travels as its versine): the
+    /// spectrum rides in the `spectrum` field; the cone versine and
+    /// housing height ride in the unused quad slots (`half_w`/`half_h`).
+    fn from_laser_spec_versine(
+        center: Vec3,
+        normal: Vec3,
+        radius: f32,
+        versine: f32,
+        height: f32,
+        spectrum: SpectrumKind,
+    ) -> Self {
         Self {
             shape: 2,
             center,
@@ -313,8 +382,8 @@ impl LightData {
             normal: normal.normalize(),
             tangent: Vec3::new(0.0, 0.0, 0.0),
             bitangent: Vec3::new(0.0, 0.0, 0.0),
-            half_w: theta,   // the cone half-angle rides in the unused slot
-            half_h: height, // the housing height rides in the unused slot
+            half_w: versine, // the cone versine rides in the unused slot
+            half_h: height,  // the housing height rides in the unused slot
             spectrum,
         }
     }
@@ -754,6 +823,11 @@ impl SceneData {
     /// so the laser may be added before, after or interleaved with the
     /// mirrors, and a scene that moves between frames simply re-derives
     /// every rung from the new geometry.
+    ///
+    /// Radiance-parametrized (the smooth-spectrum form the synthetic
+    /// test scenes use); the demo and any physical scene use
+    /// `add_laser_beam`, the power-parametrized form.
+    #[allow(dead_code)]
     pub fn add_laser(
         &mut self,
         center: Vec3,
@@ -773,6 +847,11 @@ impl SceneData {
     /// physically correct replacement for the RGB channel-stuffing hack.
     /// All `power` (spectral radiance) radiates at `lambda` (nm) inside
     /// the cone of half-angle `theta` around the beam axis.
+    ///
+    /// Radiance-parametrized (the analytic tests use it to pin exact
+    /// rendered values); the demo and any physical scene use
+    /// `add_laser_beam`, the power-parametrized form.
+    #[allow(dead_code)]
     pub fn add_laser_line(
         &mut self,
         center: Vec3,
@@ -787,6 +866,29 @@ impl SceneData {
         let aperture = center + axis * (height * 0.5);
         let light = LightData::from_laser_line(
             aperture, axis, radius, theta, height, lambda, power,
+        );
+        self.add_light(light);
+    }
+
+    /// Add a *laser beam*, power-parametrized (the physically correct
+    /// laser model — see `LightData::from_laser_beam`): a cylinder
+    /// housing whose top cap is the aperture, emitting a beam of
+    /// `power_w` watts along `axis` into a cone of half-angle `theta`.
+    /// The spot irradiance is Φ/(π·w₀²), invariant to θ.
+    pub fn add_laser_beam(
+        &mut self,
+        center: Vec3,
+        axis: Vec3,
+        height: f32,
+        radius: f32,
+        theta: f32,
+        lambda: f32,
+        power_w: f32,
+    ) {
+        let axis = axis.normalize();
+        let aperture = center + axis * (height * 0.5);
+        let light = LightData::from_laser_beam(
+            aperture, axis, radius, theta, height, lambda, power_w,
         );
         self.add_light(light);
     }
@@ -855,6 +957,18 @@ impl SceneData {
 
     /// `bridges_of_light` against an already-built BVH (the per-laser
     /// variant rebuilds it; this one shares it across all lasers).
+    ///
+    /// Each rung carries the beam direction and the emission cone's
+    /// versine alongside the image disc: the unfolding is an isometry,
+    /// so it maps the beam axis to the reflected travel direction at
+    /// the image, and the emission cone to the cone of half-angle θ
+    /// around it — the *gate-mapped* cone the rung samples (see
+    /// `bdpt::Bridge`). Without it, at a laser's physical divergence
+    /// the rung would sample the full image-disc cone while the
+    /// aperture's cone gate accepts only a (Dθ/r)² fraction of the
+    /// aims — the spot would converge ~(Dθ/r)² times slower and fall
+    /// below the accumulation layer's outlier-rejection threshold,
+    /// never appearing.
     fn bridges_of_light_in(
         &self,
         laser: &LightData,
@@ -866,6 +980,9 @@ impl SceneData {
         let mut dir = laser.normal;
         // The aperture's image, unfolded across the mirrors hit so far.
         let mut image = laser.center;
+        // The emission cone's versine (the versine — not the cosine —
+        // is the canonical form; see `Bsdf::Laser`).
+        let versine = laser.half_w;
         let mut ladder = Vec::new();
         for _ in 0..max_bounces {
             let ray = Ray {
@@ -907,11 +1024,21 @@ impl SceneData {
                     // the lobe is narrow.
                     let d = image - hit.p;
                     image = image - normal * (2.0 * d.dot(normal));
+                    dir = reflect_dir(dir, normal);
+                    // The gate-mapped cone: the unfolded beam axis at
+                    // the image is the *reflected* travel direction —
+                    // a ray from the surface aimed inside the cone
+                    // around it crosses the mirrors and arrives at the
+                    // aperture inside the emission cone. (The image
+                    // sits behind the mirror, so the axis points from
+                    // the image toward the surface — the direction the
+                    // eye walk aims along.)
                     ladder.push(crate::bdpt::Bridge {
                         image_center: image,
                         radius: laser.radius,
+                        beam_dir: dir,
+                        versine,
                     });
-                    dir = reflect_dir(dir, normal);
                     origin = hit.p + normal * EPS_NEAR;
                 }
                 Bsdf::Glass { .. } => break, // see the doc comment
@@ -1103,7 +1230,7 @@ impl SceneData {
                 mat: Material::emissive_spec(l.spectrum),
             })
         } else if l.shape == 2 {
-            AreaLight::from_laser(l.center, l.normal, l.radius, l.half_w, l.spectrum)
+            AreaLight::from_laser_versine(l.center, l.normal, l.radius, l.half_w, l.spectrum)
         } else {
             AreaLight::from_quad(&Quad {
                 center: l.center,
@@ -1127,6 +1254,7 @@ impl Default for SceneData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     #[test]
     fn light_area_matches_geometry_definitions() {
@@ -1653,5 +1781,188 @@ mod tests {
             d1.dot(Vec3::new(0.0, -1.0, 0.0)) > 0.0,
             "rung 1 must point out of the ceiling beside leg 3"
         );
+    }
+
+    /// The power parametrization (the collimated-beam rethink): the
+    /// line's spectral radiance must be P = Φ/(A_ap·Ω(θ)), so the spot
+    /// irradiance E = Φ/(π·w₀²) is *invariant to θ* — θ controls only
+    /// the divergence, as it physically does. (The old
+    /// radiance-parametrized form coupled them: Φ ∝ Ω at fixed Le, so
+    /// θ was secretly a brightness knob.)
+    #[test]
+    fn laser_beam_power_parametrization_is_theta_invariant() {
+        const PI: f32 = std::f32::consts::PI;
+        let radius = 0.01f32;
+        let power_w = 0.05f32;
+        // The spot irradiance E = Φ/(π·w₀²) — the same for every θ.
+        let expected_e = power_w / (PI * radius * radius);
+        for theta in [1e-5f32, 1e-4, 1e-3, 1e-2, 0.1] {
+            let light = LightData::from_laser_beam(
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                radius,
+                theta,
+                0.2,
+                650.0,
+                power_w,
+            );
+            let SpectrumKind::Line { power, .. } = light.spectrum else {
+                panic!("a beam laser must be a line emitter");
+            };
+            // P = Φ/(A_ap·Ω): the derived radiance.
+            let omega = 2.0 * PI * crate::geometry::cone_versine(theta);
+            let aperture_area = PI * radius * radius;
+            let expected_p = power_w / (aperture_area * omega);
+            assert!(
+                (power - expected_p).abs() <= expected_p * 1e-3,
+                "theta {theta}: radiance {power} != {expected_p}"
+            );
+            // The spot irradiance: E = P·A_ap·Ω/ (π·w₀²) = Φ/(π·w₀²)
+            // — invariant to θ by construction.
+            let e = power * aperture_area * omega / (PI * radius * radius);
+            assert!(
+                (e - expected_e).abs() <= expected_e * 1e-3,
+                "theta {theta}: spot irradiance {e} != {expected_e}"
+            );
+        }
+    }
+
+    /// The footprint law: the beam's cross-section radius at distance d
+    /// is w(d) = w₀ + d·tanθ ≈ w₀ + d·θ. The versine representation
+    /// must reproduce it at the physical divergences (the f32 cosine
+    /// form collapsed there — at the diffraction limit cos(θ) is
+    /// *exactly* 1.0 in f32, a zero-solid-angle cone: the pdf
+    /// 1/(2π(1−cosθ)) would divide by zero and the gate would reject
+    /// the beam's own axis).
+    #[test]
+    fn laser_beam_versine_survives_the_physical_divergences() {
+        const PI: f32 = std::f32::consts::PI;
+        let w0 = 0.01f32;
+        // The diffraction-limited beam (M² = 1): θ = λ/(πw₀) ≈ 1.7e-4
+        // rad for 532 nm. The f32 cosine collapses to exactly 1.0 here
+        // (θ²/2 = 1.4e-10 is far below the 3e-8 rounding threshold).
+        let theta_dl = 532.0e-9 / (PI * w0);
+        assert!(
+            theta_dl.cos() == 1.0,
+            "the f32 cosine must collapse at the diffraction limit"
+        );
+        let versine_dl = crate::geometry::cone_versine(theta_dl);
+        assert!(
+            versine_dl > 0.0 && (versine_dl - 0.5 * theta_dl * theta_dl).abs()
+                <= 0.5 * theta_dl * theta_dl * 1e-3,
+            "the versine must survive where the cosine collapsed: {versine_dl}"
+        );
+
+        // The demo's M² = 30 beam: θ ≈ 5.1e-4 rad. The cosine keeps
+        // ~1 significant digit here (1 − 1.19e-7 vs the true
+        // 1 − 1.29e-7 — an 8% error in the solid angle); the versine
+        // is exact.
+        let theta = 30.0 * 532.0e-9 / (PI * w0);
+        let light = LightData::from_laser_beam(
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            w0,
+            theta,
+            0.2,
+            532.0,
+            0.005,
+        );
+        let versine = light.half_w;
+        assert!(
+            (versine - 0.5 * theta * theta).abs() <= 0.5 * theta * theta * 1e-3,
+            "versine {versine} != theta^2/2 = {}",
+            0.5 * theta * theta
+        );
+        // The footprint at 5 m: w = w₀ + d·θ ≈ 1 cm + 2.5 mm — the
+        // spot grows visibly across the room, exactly what M² = 30
+        // is for (a diffraction-limited beam would stay a constant
+        // 1 cm disc).
+        let d = 5.0f32;
+        let footprint = w0 + d * theta;
+        assert!(
+            (footprint - 0.0125).abs() < 1e-3,
+            "footprint {footprint}"
+        );
+    }
+
+    /// The rung's gate-mapped cone: at a laser's physical divergence
+    /// the emission cone (θ ~ 5e-4 rad) is far tighter than the image
+    /// disc's cone (r/D ~ 1e-2), so the rung must propose the
+    /// gate-mapped cone — its samples must lie inside the emission
+    /// cone's gate-mapped image (the reversed beam direction), or the
+    /// aperture's cone gate would reject ~all of them and the spot
+    /// would never converge. At the wide test angles the disc cone is
+    /// the binding one and the samples must aim at the image disc (the
+    /// old behavior).
+    #[test]
+    fn bridge_rung_samples_the_gate_mapped_cone_at_physical_divergence() {
+        use crate::bdpt::Bridge;
+        // A rung 5 m away, aperture radius 1 cm: the disc cone's
+        // half-angle is asin(0.01/5) ≈ 2e-3 rad.
+        let image_center = Vec3::new(0.0, 5.0, 0.0);
+        let radius = 0.01f32;
+        // The physical divergence of the demo's green laser.
+        let theta = 30.0 * 532.0e-9 / (std::f32::consts::PI * 0.01);
+        let versine = crate::geometry::cone_versine(theta);
+        let beam_dir = Vec3::new(0.0, -1.0, 0.0); // the beam travels -y
+        let rung = Bridge {
+            image_center,
+            radius,
+            beam_dir,
+            versine,
+        };
+        let p = Vec3::new(0.0, 0.0, 0.0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        for _ in 0..500 {
+            let d = rung.sample_dir(p, &mut rng).expect("non-degenerate");
+            // Every sample must lie inside the gate-mapped cone: within
+            // θ of the reversed beam direction (+y — the direction a
+            // ray from p must travel to arrive at the aperture inside
+            // the emission cone).
+            let dx = d.x - 0.0;
+            let dy = d.y - 1.0;
+            let dz = d.z - 0.0;
+            assert!(
+                dx * dx + dy * dy + dz * dz <= 2.0 * versine * 1.001,
+                "sample {d:?} outside the gate-mapped cone (versine {versine})"
+            );
+            // ...and the pdf must be the gate-mapped cone's: uniform
+            // over 2π·versine.
+            let pdf = rung.pdf(p, d);
+            assert!(
+                (pdf - 1.0 / (2.0 * std::f32::consts::PI * versine)).abs()
+                    < 1e-3 / (2.0 * std::f32::consts::PI * versine),
+                "pdf {pdf} is not the gate-mapped cone's"
+            );
+        }
+        // A direction at the disc-cone's edge but outside the emission
+        // cone (2e-3 rad off-axis, 4x the divergence) must have pdf 0:
+        // the rung no longer proposes it.
+        let off = Vec3::new(2e-3, 1.0, 0.0).normalize();
+        assert_eq!(rung.pdf(p, off), 0.0);
+
+        // The wide-angle control: θ = 0.1 rad > the disc cone's 2e-3,
+        // so the disc binds and the samples aim at the image disc (the
+        // old behavior — the wide-θ synthetic scenes keep their
+        // convergence).
+        let wide = Bridge {
+            image_center,
+            radius,
+            beam_dir,
+            versine: crate::geometry::cone_versine(0.1),
+        };
+        for _ in 0..500 {
+            let d = wide.sample_dir(p, &mut rng).expect("non-degenerate");
+            // Inside the disc cone: within asin(r/D) of the aim axis.
+            let aim = (image_center - p).normalize();
+            let dx = d.x - aim.x;
+            let dy = d.y - aim.y;
+            let dz = d.z - aim.z;
+            let disc_versine = 0.01f32 * 0.01 / 25.0;
+            assert!(
+                dx * dx + dy * dy + dz * dz <= 2.0 * disc_versine * 1.001,
+                "wide sample {d:?} outside the disc cone"
+            );
+        }
     }
 }

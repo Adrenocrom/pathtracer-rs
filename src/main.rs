@@ -30,6 +30,11 @@ const SAMPLES_PREVIEW: usize = 1;
 /// survive in proportion to their contribution.
 const MAX_DEPTH_PREVIEW: usize = 8;
 
+/// The lasers' aperture radius — the beam waist w₀ (m). The physical
+/// divergence is θ = M²·λ/(π·w₀) and the spot irradiance is
+/// Φ/(π·w₀²), both derived from this one constant.
+const LASER_WAIST: f32 = 0.01;
+
 /// Build the scene with multiple objects for interesting lighting.
 ///
 /// `laser_aim_y` is the red laser's aim height on the front-wall mirror
@@ -153,23 +158,38 @@ fn build_scene_with(_laser_aim_y: f32) -> SceneData {
     //
     // Spectral (paper §9.2): the laser is a *monochromatic line* —
     // 650 nm, the physically correct replacement for the old RGB trick
-    // of putting 4×10⁸ in the red channel. The line's power is chosen
-    // so the rendered spot's luminance matches the old RGB hack (the
-    // 1/p(λ) sensor factor ≈ ×3 replaces the channel stuffing); the
-    // out-of-gamut negative channels clamp at display, where they
-    // belong.
+    // of putting 4×10⁸ in the red channel. The out-of-gamut negative
+    // channels clamp at display, where they belong.
+    //
+    // The beam model (the collimated-beam rethink): the laser is
+    // power-parametrized — Φ = 50 mW, a bright presentation pointer —
+    // with the *physical* divergence θ = M²·λ/(π·w₀) (M² = 30, a
+    // deliberately imperfect beam so the spot grows visibly across
+    // the room; a diffraction-limited M² = 1 would stay a constant
+    // 1 cm disc, which is the physically correct but visually
+    // uninformative limit). The spot irradiance E = Φ/(π·w₀²) ≈
+    // 160 W/m² is θ-invariant — θ controls only the divergence, as
+    // it physically does. The old radiance-parametrized form coupled
+    // them (Φ ∝ Ω at fixed Le, so θ was secretly a brightness knob —
+    // which is why it was left artificially wide, reading as a
+    // spotlight).
     let laser_pos = Vec3::new(-1.3, 0.62, 1.8);
     let back_mirror_center = Vec3::new(0.0, 1.0, -(room_size - 0.01));
     //let aim_point = Vec3::new(0.0, laser_aim_y, -(room_size - 0.01));
     let aim = Vec3::new(1.0, 0.0, -room_size).normalize();
-    scene.add_laser_line(
+    // The red laser: 650 nm, 50 mW, M² = 30.
+    let red_lambda = 650.0;
+    let red_power_w = 0.05;
+    let red_m2 = 30.0;
+    let red_theta = red_m2 * red_lambda * 1e-9 / (std::f32::consts::PI * LASER_WAIST);
+    scene.add_laser_beam(
         laser_pos,
         aim,
         0.2,                        // housing height
-        0.01,                       // aperture radius
-        0.001,                       // beam half-angle (radians, ~0.57°)
-        650.0,                      // nm — the red laser line
-        1.2e9,                      // spectral radiance at the line
+        LASER_WAIST,                // aperture radius = the beam waist
+        red_theta,                  // physical divergence (rad)
+        red_lambda,                 // nm — the red laser line
+        red_power_w,                // W — the beam power
     );
     scene.add_quad(
         back_mirror_center,
@@ -218,14 +238,23 @@ fn build_scene_with(_laser_aim_y: f32) -> SceneData {
     // rendered sample carries negative R/B channels; the display stage
     // gamut-maps them (§9.2: "the out-of-gamut problem moves to the
     // display stage where it belongs").
-    scene.add_laser_line(
+    //
+    // The beam model: 5 mW (a standard green pointer — green is
+    // ~6× more luminous than 650 nm red per watt, so 5 mW of green
+    // renders a spot of comparable luminance to 50 mW of red), M² = 30
+    // — the same divergence law as the red laser.
+    let green_lambda = 532.0;
+    let green_power_w = 0.005;
+    let green_m2 = 30.0;
+    let green_theta = green_m2 * green_lambda * 1e-9 / (std::f32::consts::PI * LASER_WAIST);
+    scene.add_laser_beam(
         Vec3::new(-1.6, 0.62, 1.9),
         Vec3::new(-1.0, 0.01, -0.5),
         0.2,
-        0.01,
-        0.005,
-        532.0,                      // nm — the green laser line
-        1.2e9,
+        LASER_WAIST,
+        green_theta,
+        green_lambda,               // nm — the green laser line
+        green_power_w,              // W — the beam power
     );
 
     scene

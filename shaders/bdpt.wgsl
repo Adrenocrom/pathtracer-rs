@@ -61,7 +61,10 @@ struct Uniforms {
 // tangent, its radius in radius and its half-height in half_h.
 // mat_type is 0 diffuse / 1 emissive / 2 mirror / 3 glass / 4 laser /
 // 5 glossy; ior carries the glass interior index (1.0 otherwise), or
-// the laser emission cone's cosine for mat_type 4. The spectral fields
+// the laser emission cone's *versine* (1 - cos theta, computed in f64
+// on the CPU — at a laser's divergence the f32 cosine rounds to 1.0
+// and the cone would collapse; see bdpt.rs::Bsdf::Laser) for
+// mat_type 4. The spectral fields
 // (paper §9.2): sellmeier carries the glass dispersion coefficients
 // (all zeros = achromatic, the constant ior); rough/f0 carry the GGX
 // lobe for mat_type 5 (§9.5).
@@ -135,17 +138,24 @@ struct GpuLight {
     _pad8: f32,
     _pad8b: f32,
     // The specular bridge *ladder* (a laser only), packed one rung per
-    // vec4: xyz = the rung's image-center, w = its radius. Rung j is
-    // the aperture's mirror image unfolded across the first j mirrors
-    // of the beam's chain (see bdpt.rs::Bridge and
-    // SceneData::bridges_of_light); the eye walk aims at these at
-    // diffuse vertices, so the glow appears beside *every* leg of the
-    // beam, not just the last. n_bridges = 0 marks "no ladder".
-    bridge_rungs: array<vec4<f32>, 8>,
+    // *pair* of vec4s: [xyz = the rung's image-center, w = its radius]
+    // then [xyz = the rung's beam direction (the unfolded beam axis,
+    // pointing away from the image toward the surface), w = the
+    // emission cone's versine]. Rung j is the aperture's mirror image
+    // unfolded across the first j mirrors of the beam's chain (see
+    // bdpt.rs::Bridge); the eye walk aims at these at diffuse vertices,
+    // so the glow appears beside *every* leg of the beam, not just the
+    // last. The beam direction and versine let the rung sample the
+    // *gate-mapped* cone — the smaller of the image-disc cone and the
+    // emission cone — so at a laser's physical divergence the spot's
+    // draws are not wasted on gate-rejected aims. A zero beam_dir
+    // marks a rung without a beam direction (the disc cone alone).
+    // n_bridges = 0 marks "no ladder".
+    bridge_rungs: array<vec4<f32>, 16>,
     n_bridges: u32,
     // Three scalar pads, not a vec3: WGSL aligns vec3 to 16 bytes, which
-    // would push the struct to 272 bytes while the Rust side's [f32; 3]
-    // stays at 256. Scalars are 4-byte aligned in both languages.
+    // would push the struct past the Rust side's [f32; 3]. Scalars are
+    // 4-byte aligned in both languages.
     _pad9: f32,
     _pad10: f32,
     _pad11: f32,
@@ -226,8 +236,10 @@ const MAT_DIFFUSE: u32 = 0u;
 const MAT_EMISSIVE: u32 = 1u;
 const MAT_MIRROR: u32 = 2u;
 const MAT_GLASS: u32 = 3u;
-// A laser aperture: emissive, radiating only into the cone whose cosine
-// rides in the prim's `ior` slot.
+// A laser aperture: emissive, radiating only into the cone whose
+// *versine* (1 - cos theta, computed in f64 on the CPU) rides in the
+// prim's `ior` slot — at a laser's divergence the f32 cosine rounds to
+// 1.0 and the cone would collapse (see bdpt.rs::Bsdf::Laser).
 const MAT_LASER: u32 = 4u;
 // A GGX microfacet "rough mirror" (paper §9.5): a continuous lobe, so
 // connections through it are valid. The roughness rides in `rough`, the
@@ -1108,37 +1120,73 @@ fn ggx_eval_pdf(alpha: f32, f0: f32, rho: f32, normal: vec3<f32>,
 const BRIDGE_PROB: f32 = 0.25;
 
 // The solid-angle pdf of the bridge direction `dir` from `p`: uniform
-// over the cone subtended by the image disc. 0 when `p` lies within
-// the image sphere (degenerate) or `dir` points outside the cone.
-fn bridge_pdf(center: vec3<f32>, radius: f32, p: vec3<f32>, dir: vec3<f32>) -> f32 {
+// over the *binding* cone — the smaller of the image-disc cone
+// (half-angle asin(r/D) around the aim axis) and the gate-mapped
+// emission cone (half-angle theta around -beam_dir; see
+// bdpt.rs::Bridge::cone) — about its own axis. pdf 1/(2*pi*versine).
+// 0 when `p` lies within the image sphere (degenerate) or `dir`
+// points outside the cone. The gate is the versine-native form
+// |dir - axis|^2 <= 2*versine (unit vectors): the component
+// differences are Sterbenz-exact where 1 - dot cancels
+// catastrophically at the tiny physical divergences.
+//
+// The disc cone's versine is computed in the cancellation-free form
+// x/(1 + sqrt(1-x)) with x = (r/D)^2 — the naive 1 - sqrt(1-x) loses
+// half its significant bits at the small ratios, and this must match
+// the CPU arithmetic bit-for-bit (the 1:1 port).
+fn bridge_pdf(center: vec3<f32>, radius: f32, beam_dir: vec3<f32>, versine: f32,
+              p: vec3<f32>, dir: vec3<f32>) -> f32 {
     let d = center - p;
     let len_sq = dot(d, d);
     if (len_sq <= radius * radius) { return 0.0; }
-    // Inside the cone iff d·dir ≥ sqrt(len² − r²) — both sides scaled
-    // by len, i.e. cos(angle) ≥ cos(θ_c). No trig needed.
-    let cos_cone = sqrt(len_sq - radius * radius);
-    if (dot(d, dir) < cos_cone) { return 0.0; }
-    let omega = 2.0 * PI * (1.0 - cos_cone / sqrt(len_sq));
-    return 1.0 / omega;
+    let len = sqrt(len_sq);
+    let aim = d * (1.0 / len);
+    let x = radius * radius / len_sq;
+    let disc_versine = x / (1.0 + sqrt(max(0.0, 1.0 - x)));
+    let has_beam = dot(beam_dir, beam_dir) > 0.5;
+    var axis = aim;
+    var v = disc_versine;
+    if (versine < disc_versine && has_beam) {
+        axis = beam_dir * -1.0;
+        v = versine;
+    }
+    let dx = dir.x - axis.x;
+    let dy = dir.y - axis.y;
+    let dz = dir.z - axis.z;
+    if (dx * dx + dy * dy + dz * dz > 2.0 * v) { return 0.0; }
+    return 1.0 / (2.0 * PI * v);
 }
 
-// Sample a direction uniformly over the cone subtended by the image
-// disc at `p`. Returns vec3(0) when `p` lies within the image sphere
-// (degenerate; the caller falls back to the cosine draw).
-fn bridge_sample_dir(center: vec3<f32>, radius: f32, p: vec3<f32>,
-                     state: ptr<function, u32>) -> vec3<f32> {
+// Sample a direction uniformly over the cone `bridge_cone` describes.
+// Returns vec3(0) when `p` lies within the image sphere (degenerate;
+// the caller falls back to the cosine draw).
+fn bridge_sample_dir(center: vec3<f32>, radius: f32, beam_dir: vec3<f32>, versine: f32,
+                     p: vec3<f32>, state: ptr<function, u32>) -> vec3<f32> {
     let d = center - p;
     let len_sq = dot(d, d);
     if (len_sq <= radius * radius) { return vec3<f32>(0.0); }
     let len = sqrt(len_sq);
-    let axis = d * (1.0 / len);
-    let cos_cone = sqrt(len_sq - radius * radius) / len;
+    let aim = d * (1.0 / len);
+    let x = radius * radius / len_sq;
+    let disc_versine = x / (1.0 + sqrt(max(0.0, 1.0 - x)));
+    let has_beam = dot(beam_dir, beam_dir) > 0.5;
+    var axis = aim;
+    var v = disc_versine;
+    if (versine < disc_versine && has_beam) {
+        axis = beam_dir * -1.0;
+        v = versine;
+    }
     let a = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(axis.x) > 0.9);
     let t = normalize3(cross(a, axis));
     let b = cross(axis, t);
-    // Uniform in the cone: cos φ uniform in [cos θ_c, 1].
-    let cos_phi = 1.0 - pcg(state) * (1.0 - cos_cone);
-    let sin_phi = sqrt(max(0.0, 1.0 - cos_phi * cos_phi));
+    // Uniform in the cone: the versine of the drawn angle is uniform
+    // in [0, versine] (the versine is the natural measure — cos phi
+    // uniform in [cos theta, 1] is exactly this). The sine is
+    // computed from the versine directly (sin^2 = 2v - v^2), never
+    // from the rounded 1 - v.
+    let vv = pcg(state) * v;
+    let cos_phi = 1.0 - vv;
+    let sin_phi = sqrt(max(0.0, 2.0 * vv - vv * vv));
     let phi = 2.0 * PI * pcg(state);
     return t * (sin_phi * cos(phi)) + b * (sin_phi * sin(phi)) + axis * cos_phi;
 }
@@ -1152,8 +1200,8 @@ fn qualifying_bridge_count(p: vec3<f32>, normal: vec3<f32>) -> u32 {
     for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
         let l = lights[li];
         for (var bi = 0u; bi < l.n_bridges; bi = bi + 1u) {
-            let d = l.bridge_rungs[bi].xyz - p;
-            let r = l.bridge_rungs[bi].w;
+            let d = l.bridge_rungs[2u * bi].xyz - p;
+            let r = l.bridge_rungs[2u * bi].w;
             if (dot(d, normal) > 0.0 && dot(d, d) > r * r) {
                 count = count + 1u;
             }
@@ -1175,10 +1223,12 @@ fn mixture_pdf(p: vec3<f32>, normal: vec3<f32>, dir_in: vec3<f32>, dir_out: vec3
     for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
         let l = lights[li];
         for (var bi = 0u; bi < l.n_bridges; bi = bi + 1u) {
-            let d = l.bridge_rungs[bi].xyz - p;
-            let r = l.bridge_rungs[bi].w;
+            let d = l.bridge_rungs[2u * bi].xyz - p;
+            let r = l.bridge_rungs[2u * bi].w;
             if (dot(d, normal) > 0.0 && dot(d, d) > r * r) {
-                bridge_density += bridge_pdf(l.bridge_rungs[bi].xyz, r, p, dir_out);
+                let beam_dir = l.bridge_rungs[2u * bi + 1u].xyz;
+                let versine = l.bridge_rungs[2u * bi + 1u].w;
+                bridge_density += bridge_pdf(l.bridge_rungs[2u * bi].xyz, r, beam_dir, versine, p, dir_out);
             }
         }
     }
@@ -1206,8 +1256,8 @@ fn sample_diffuse_mixture(albedo: vec3<f32>, p: vec3<f32>, normal: vec3<f32>,
         for (var li = 0u; li < uniforms.n_lights; li = li + 1u) {
             let l = lights[li];
             for (var bi = 0u; bi < l.n_bridges; bi = bi + 1u) {
-                let d = l.bridge_rungs[bi].xyz - p;
-                let r = l.bridge_rungs[bi].w;
+                let d = l.bridge_rungs[2u * bi].xyz - p;
+                let r = l.bridge_rungs[2u * bi].w;
                 if (dot(d, normal) > 0.0 && dot(d, d) > r * r) {
                     if (seen == pick) { chosen_light = i32(li); chosen_bridge = i32(bi); }
                     seen = seen + 1u;
@@ -1216,8 +1266,10 @@ fn sample_diffuse_mixture(albedo: vec3<f32>, p: vec3<f32>, normal: vec3<f32>,
         }
         if (chosen_light >= 0) {
             let l = lights[u32(chosen_light)];
-            let rung = l.bridge_rungs[u32(chosen_bridge)];
-            let d = bridge_sample_dir(rung.xyz, rung.w, p, state);
+            let rung = l.bridge_rungs[2u * u32(chosen_bridge)];
+            let beam_dir = l.bridge_rungs[2u * u32(chosen_bridge) + 1u].xyz;
+            let versine = l.bridge_rungs[2u * u32(chosen_bridge) + 1u].w;
+            let d = bridge_sample_dir(rung.xyz, rung.w, beam_dir, versine, p, state);
             // A degenerate cone (unreachable for a qualifying rung)
             // falls back to the cosine draw already made.
             if (dot(d, d) > 0.0) { dir_out = d; }
@@ -1463,10 +1515,19 @@ fn pv_pdf_light(eye: ptr<function, array<PathVertex, 8>>,
         let v = pv_vertex(eye, light_path, view, m);
         let cos = dot(v.normal, d_out);
         if (v.mat_type == MAT_LASER) {
-            // Uniform in the cone: pdf 1/(2π(1 - cos θ)) inside, 0 out.
-            let cos_theta = v.ior;
-            if (cos >= cos_theta) {
-                pdf_omega = 1.0 / (2.0 * PI * (1.0 - cos_theta));
+            // Uniform in the cone: pdf 1/(2*pi*versine) inside, 0 out.
+            // The versine rides in the prim's `ior` slot (see
+            // MAT_LASER); the gate is |d - n|^2 <= 2*versine (unit
+            // vectors) — the component differences are Sterbenz-exact
+            // where 1 - dot cancels catastrophically at the tiny
+            // physical divergences (and exactly absorbs the cone
+            // sampler's f32 cos-quantization).
+            let versine = v.ior;
+            let dx = d_out.x - v.normal.x;
+            let dy = d_out.y - v.normal.y;
+            let dz = d_out.z - v.normal.z;
+            if (dx * dx + dy * dy + dz * dz <= 2.0 * versine) {
+                pdf_omega = 1.0 / (2.0 * PI * versine);
             }
         } else {
             if (cos > 0.0) { pdf_omega = cos / PI; }
@@ -1650,7 +1711,7 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
     // whose factor is the sample weight of the event at y_j = x_{k-j}
     // toward y_{j+1} = x_{k-j-1}. The first extension has no BSDF at the
     // emitter (f = 1): cosine sampling gives the weight PI, a laser
-    // aperture's uniform cone sampling gives cos0 * 2*PI*(1 - cos theta)
+    // aperture's uniform cone sampling gives cos0 * 2*PI*versine
     // (0 outside the beam). The light subpath carries importance.
     var alpha_l = alpha_light0;
     (*ql)[0u] = 1.0;
@@ -1662,9 +1723,13 @@ fn rr_prefix_products(eye: ptr<function, array<PathVertex, 8>>,
             let d_out = pv_dir(eye, light_path, view, k, k - 1u);
             let cos0 = dot(v.normal, d_out);
             if (v.mat_type == MAT_LASER) {
-                let cos_theta = v.ior;
-                if (cos0 >= cos_theta) {
-                    factor = cos0 * 2.0 * PI * (1.0 - cos_theta);
+                // The versine gate (see pv_pdf_light).
+                let versine = v.ior;
+                let dx = d_out.x - v.normal.x;
+                let dy = d_out.y - v.normal.y;
+                let dz = d_out.z - v.normal.z;
+                if (dx * dx + dy * dy + dz * dz <= 2.0 * versine) {
+                    factor = cos0 * 2.0 * PI * versine;
                 } else {
                     factor = 0.0;
                 }
@@ -1713,18 +1778,21 @@ fn sample_light(l: GpuLight, state: ptr<function, u32>) -> vec3<f32> {
 }
 
 // The direction the light subpath leaves the sampled point in: uniform
-// in the laser's cone (pdf 1/(2π(1 - cos θ))), cosine-weighted around
+// in the laser's cone (pdf 1/(2*pi*versine)), cosine-weighted around
 // the normal otherwise. The CPU's AreaLight::sample returns this as the
 // second tuple element; WGSL returns it separately because the cone
-// sampling needs its own random numbers.
+// sampling needs its own random numbers. The cone's versine rides in
+// `half_w` (computed in f64 on the CPU — at a laser's divergence the
+// f32 cosine rounds to 1.0 and the cone would collapse; see
+// bdpt.rs::Bsdf::Laser).
 fn sample_light_dir(l: GpuLight, p: vec3<f32>, state: ptr<function, u32>) -> vec3<f32> {
     if (l.shape == 2u) {
         let f = frame(l.normal);
-        let cos_theta = cos(l.half_w);
-        let u = 1.0 - pcg(state) * (1.0 - cos_theta);
+        let v = pcg(state) * l.half_w;
+        let cos_phi = 1.0 - v;
+        let sin_phi = sqrt(max(0.0, 2.0 * v - v * v));
         let phi = 2.0 * PI * pcg(state);
-        let sin_theta = sqrt(max(0.0, 1.0 - u * u));
-        return f[0] * (sin_theta * cos(phi)) + f[1] * (sin_theta * sin(phi)) + l.normal * u;
+        return f[0] * (sin_phi * cos(phi)) + f[1] * (sin_phi * sin(phi)) + l.normal * cos_phi;
     }
     return cosine_hemisphere(light_normal(l, p), state);
 }
@@ -1888,14 +1956,21 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         // (RR_START >= 2). The emitter has no BSDF (f = 1) and scatters
         // cosine-weighted, so the edge factor is cos0 * PI. A laser
         // aperture samples uniformly in its cone, so the edge factor is
-        // cos0 * 2*PI*(1 - cos theta) — and the direction must lie
-        // inside the beam, where the emitter's radiance is nonzero.
+        // cos0 * 2*PI*versine — and the direction must lie inside the
+        // beam, where the emitter's radiance is nonzero.
         let cos0 = dot(n0, d0);
         var edge_factor = PI;
         if (is_laser) {
-            let cos_theta = cos(light.half_w);
-            if (cos0 >= cos_theta) {
-                edge_factor = cos0 * 2.0 * PI * (1.0 - cos_theta);
+            // The cone's versine rides in `half_w` (see
+            // `sample_light_dir`). The gate is the versine-native form
+            // (see pv_pdf_light): exact under the cone sampler's f32
+            // quantization, where 1 - dot would lose the tiny cones.
+            let versine = light.half_w;
+            let dx = d0.x - n0.x;
+            let dy = d0.y - n0.y;
+            let dz = d0.z - n0.z;
+            if (dx * dx + dy * dy + dz * dz <= 2.0 * versine) {
+                edge_factor = cos0 * 2.0 * PI * versine;
             } else {
                 edge_factor = 0.0;
             }
@@ -1908,7 +1983,7 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
         // The y_0 vertex material carries the emission cone so the MIS
         // pdf machinery (pv_pdf_light at m = k) can see it.
         let y0_mat = select(MAT_EMISSIVE, MAT_LASER, is_laser);
-        let y0_ior = select(1.0, cos(light.half_w), is_laser);
+        let y0_ior = select(1.0, light.half_w, is_laser);
         light_path[0] = PathVertex(p0, n0, true, vec3<f32>(0.0),
                                    y0_mat, y0_ior, array<f32, 6>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
                                    0.0, 0.0, ltp, true);
@@ -1981,8 +2056,16 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                     }
                     var in_beam = true;
                     if (last.mat_type == MAT_LASER) {
-                        let cos_theta = last.ior;
-                        in_beam = dot(last.normal, d_in * -1.0) >= cos_theta;
+                        // The versine gate: |d - n|^2 = 2(1 - d.n) <=
+                        // 2*versine for unit vectors — Sterbenz-exact
+                        // where 1 - dot cancels catastrophically at the
+                        // tiny physical divergences.
+                        let versine = last.ior;
+                        let u = d_in * -1.0;
+                        let dx = u.x - last.normal.x;
+                        let dy = u.y - last.normal.y;
+                        let dz = u.z - last.normal.z;
+                        in_beam = dx * dx + dy * dy + dz * dz <= 2.0 * versine;
                     }
                     // The branch rule: only an emitter active at the
                     // drawn λ radiates. Nested ifs, not `&&` (see
@@ -2050,8 +2133,17 @@ fn bdpt_trace(ray_origin: vec3<f32>, ray_dir: vec3<f32>, state: ptr<function, u3
                 // zeroes every connection to the aperture.
                 let y0 = light_path[0u];
                 if (y0.mat_type == MAT_LASER) {
-                    let cos_theta = y0.ior;
-                    if (dot(y0.normal, d_conn * -1.0) < cos_theta) {
+                    // The versine gate (see the direct-hit site above):
+                    // the emission direction is y_0 -> x_{i+1}, i.e.
+                    // -d_conn (d_conn points from the eye vertex to the
+                    // light vertex); testing d_conn itself inverts the
+                    // gate and zeroes every connection to the aperture.
+                    let versine = y0.ior;
+                    let u = d_conn * -1.0;
+                    let dx = u.x - y0.normal.x;
+                    let dy = u.y - y0.normal.y;
+                    let dz = u.z - y0.normal.z;
+                    if (dx * dx + dy * dy + dz * dz > 2.0 * versine) {
                         f_light = 0.0;
                     }
                 }

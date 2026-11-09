@@ -598,7 +598,7 @@ sections).
 
 - [x] Review: code + paper + plan read end to end; baseline green
 - [x] Hygiene: stale light-count test fixed; `is_specular_pair` λ fixed
-- [ ] Phase 6: power-parametrized beam emitter + physical divergence +
+- [x] Phase 6: power-parametrized beam emitter + physical divergence +
       demo constants + tests
 - [ ] Phase 7.1–7.4: flat rung buffer, per-vertex n_qual cache, CPU
       allocation fix, mis_weight pdf caching (then measure)
@@ -610,3 +610,71 @@ sections).
       dead-code silence
 - [ ] README + paper Appendix A/B updated for the single backend and
       the new laser model
+
+### Phase 6 session log
+
+Implemented end to end (CPU + WGSL 1:1 port + tests + demo):
+
+1. **Power parametrization.** `LightData::from_laser_beam` /
+   `SceneData::add_laser_beam`: specify Φ (W) and θ; the line's
+   spectral radiance is derived as P = Φ/(A_ap·Ω(θ)) with
+   Ω = 2π·versine. The spot irradiance E = Φ/(π·w₀²) is θ-invariant
+   (pinned by `laser_beam_power_parametrization_is_theta_invariant`
+   and the analytic spot test). The radiance-parametrized
+   constructors stay for the analytic tests.
+2. **The versine representation.** The plan's "machinery is
+   θ-agnostic" claim missed a hard numerical wall: at the physical
+   divergences the f32 `theta.cos()` rounds to exactly 1.0 (at the
+   diffraction limit, M² = 1) or keeps ~1 significant digit (M² = 30,
+   an 8% solid-angle error) — the cone's solid angle 2π(1−cosθ)
+   collapses and the beam gates to black. The cone now travels as its
+   *versine* (1 − cosθ, computed in f64 by `cone_versine`) through
+   `Bsdf::Laser`, `LightShape::Laser`, `LightData::half_w` and the
+   prim's `ior` slot; every consumer uses versine-native forms: the
+   solid angle is 2π·versine, the gate is |d − n|² ≤ 2·versine (unit
+   vectors — Sterbenz-exact where 1 − dot cancels catastrophically,
+   and it exactly absorbs the cone sampler's f32 cos-quantization),
+   and the cone sampler draws the versine directly (sin² = 2v − v²,
+   never from the rounded 1 − v).
+3. **The gate-mapped bridge cone.** The plan's second miss: the rung
+   sampled the full image-disc cone (angular radius w₀/D), but the
+   aperture's cone gate accepts only a (Dθ/w₀)² fraction of those
+   aims — at the demo's divergence that is ~1e-4, so the spot would
+   converge ~10⁴× slower and fall below the accumulation layer's
+   outlier-rejection threshold (p ≥ 0.1), never appearing. The
+   unfolding is an isometry, so it maps the emission cone exactly onto
+   a cone of half-angle θ around the reversed beam direction at the
+   image; each rung now carries `beam_dir` + `versine` and samples the
+   *binding* cone — the smaller of the disc cone and the gate-mapped
+   cone, about its own axis (the disc cone's versine in the
+   cancellation-free form x/(1+√(1−x)), x = (r/D)²). At the wide test
+   angles the disc binds and the behavior is exactly the old one; at
+   the physical divergences the gate binds and the spot's draws are
+   zero-waste. `GpuLight` grew to 384 bytes (one rung = two vec4s).
+4. **Demo constants.** Red: 650 nm, 50 mW, M² = 30 (θ ≈ 6.2e-4 rad);
+   green: 532 nm, 5 mW, M² = 30 (θ ≈ 5.1e-4 rad) — green is ~6× more
+   luminous per watt (ȳ(532) ≈ 0.86 vs ȳ(650) ≈ 0.107), so the spots
+   read equally bright; both deposit E ≈ 160/16 W/m², above the floor
+   under the ceiling panel (~10 W/m²). The plan's 5 mW red would have
+   rendered ~6× dimmer than the lit floor — visible, but weak.
+5. **Tests.** New: the power parametrization's θ-invariance; the
+   versine surviving the diffraction limit (where the f32 cosine is
+   exactly 1.0); the gate-mapped rung cone (samples inside the
+   emission cone's image, pdf uniform over 2π·versine, the wide-angle
+   control keeping the disc cone); the analytic spot value — the
+   rendered axis radiance matches the closed form
+   E(0) = Φ(1+cosθ)/(2πw₀²)·ρ/π (the plan's Φ/(πw₀²) is the θ→0
+   limit; the exact form follows from E(0) = L·π·sin²(min(α₀,θ)) with
+   sin²θ = (1−cosθ)(1+cosθ)), with Bernoulli-SE tolerances from the
+   connection strategy's (dθ/w₀)² pass rate. The existing
+   cone-gate/ladder/MIS tests keep their wide-θ scenes (the machinery
+   is θ-agnostic; the binding-cone switch keeps their convergence).
+6. **Bugs found and fixed during implementation:** the first draft of
+   the rung's `pdf` used the disc versine r²/D² (2× the true
+   1−cos(asin(r/D))) and sampled the smaller cone about the *disc*
+   axis — the wide-angle regime regressed and the narrow regime
+   rendered a half-width stripe; the binding cone must be sampled
+   about its own axis. The emitter-cone gates in bdpt.rs first used
+   `1 − cos ≤ versine` — at the tiny cones the cancellation leaves
+   ~1 digit, killing ~7% of the light walk's reconstructed cone
+   samples; the |d−n|² form is exact under the f32 quantization.
