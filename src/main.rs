@@ -565,10 +565,10 @@ mod tests {
     #[test]
     fn scene_builds_and_is_sampleable() {
         let scene = build_scene();
-        // The demo scene has three emitters: the ceiling panel and the
-        // two laser apertures. (No decal: the beams' spots are
+        // The demo scene has four emitters: the two ceiling panels and
+        // the two laser apertures. (No decal: the beams' spots are
         // transported light, not fake emitters.)
-        assert_eq!(scene.lights.len(), 3);
+        assert_eq!(scene.lights.len(), 4);
         for light in &scene.lights {
             assert!(light.area() > 0.0);
             assert!(light.spectrum.is_emissive());
@@ -593,7 +593,7 @@ mod tests {
             direction: Vec3::new(0.0, 0.0, 1.0),
         };
         assert!(cpu_scene.intersect(&ray).is_some());
-        assert_eq!(lights.len(), 3);
+        assert_eq!(lights.len(), 4);
     }
 
     #[test]

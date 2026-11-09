@@ -389,3 +389,224 @@ needs either a smaller-aperture showcase or the speckle texture.
 - **Phases 3–5** (polarization, participating media, wave optics) remain
   designed in this plan for follow-up sessions, in the paper's cost
   order.
+
+---
+
+# Session 2 — the laser model, performance, single backend
+
+Status: **reviewed and designed** — see the checklist at the end.
+
+A full code review (all of `src/`, both shaders, the paper, this plan)
+preceded the three phases below. Two baseline bugs were found and fixed
+immediately (see Hygiene); the suite is green (83 passed, 2 GPU tests
+ignored).
+
+## Phase 6 — The laser as a collimated beam (model rethink)
+
+**Diagnosis — why the current laser reads as a spotlight.** The laser is
+modeled as a tiny disc emitter radiating uniformly into a cone, with the
+emission direction *independent* of the emission position — which is
+literally the definition of a spotlight. Two independent tells:
+
+1. **The cone is 50–300× too wide.** The demo uses θ = 0.001 rad (red) and
+   0.005 rad (green); the physical divergence of a beam with waist
+   w₀ = 1 cm is θ_d = λ/(πw₀) ≈ 2×10⁻⁵ rad. At a 5 m throw the cone
+   spread (d·tanθ ≈ 5 mm) is comparable to the aperture radius (1 cm), so
+   the spot's *penumbra* (width 2dθ ≈ 1 cm) is as wide as the beam
+   itself: the spot is mostly soft edge. That soft blob is exactly what
+   reads as "spotlight"; a laser spot is a sharp, *constant-size* beam
+   cross-section.
+2. **The radiance magic number hides the power.** `Le = 1.2e9` with
+   A = πr² ≈ 3.1×10⁻⁴ m² and Ω = πθ² ≈ 3.1×10⁻⁶ sr corresponds to a beam
+   power Φ = Le·A·Ω ≈ **1.2 W** — a Class-4 burning laser, not a pointer.
+   Worse, because Φ ∝ Ω at fixed Le, θ is secretly a *brightness* knob:
+   shrinking the cone dims the spot. That coupling is why θ was left
+   artificially wide in the first place.
+
+**The better model: a power-parametrized collimated beam.** A laser is
+the *collimated* limit — position and direction perfectly correlated,
+spot = the translated beam cross-section, divergence set by
+diffraction. Concretely:
+
+1. **Power parametrization.** `add_laser_line(center, axis, height,
+   radius, power_w, lambda)`: specify the beam power Φ (W) and derive
+   the line's spectral radiance `P = Φ/(A_ap·Ω(θ))`. The spot irradiance
+   becomes E = Φ/(πw₀²) — *invariant to θ* (θ now controls only the
+   divergence, as it physically does). A 5 mW pointer deposits
+   E ≈ 16 W/m² — brighter than the floor under the ceiling panel
+   (E ≈ 10 W/m²): physically correct and visually correct.
+2. **Physical divergence.** θ = M²·λ/(π·w₀) with w₀ = the aperture
+   radius; M² = 1 is diffraction-limited. The demo may use M² ≈ 10–30 so
+   the spot grows *visibly* across the room — still 10–30× tighter than
+   today. The spot becomes a sharp disc that stays constant along the
+   mirror chain; the penumbra disappears because position and direction
+   are now (nearly) perfectly correlated — which *is* the physical
+   definition of collimation.
+3. **Why the cone survives — and the direction-delta does not.** The
+   "obvious" alternative — a direction-delta emitter (radiance
+   ∝ δ(ω − axis), the exact GO limit) — is *worse* on all three counts:
+   (a) the aperture becomes a delta connection endpoint, killing the
+   s=1 direct-light strategy that carries the first-leg glow (the
+   floor beside the beam connects straight to y₀ only because the cone
+   is continuous); (b) the emitter departure pdf becomes a delta,
+   requiring the symbolic-pdf convention in the MIS machinery (new
+   edge cases); (c) numerically it needs a tolerance cone anyway — and
+   the physically correct tolerance cone *is* the diffraction cone. The
+   cone emitter with physical θ **is** the GO collimated beam with the
+   wave-optics divergence as its tolerance: zero machinery changes,
+   unbiased, connectable.
+4. **The upgrade path to §9.1.** This model is the wave-optics
+   channel's geometric skeleton: flat disc → Gaussian cross-section
+   profile (needs the position-pdf plumbing in `pdf_light(m=k+1)` —
+   moderate, deferred) → complex field |u|² with speckle (Phase 5's
+   coherent channel). The ladder already preserves path length =
+   phase, so each rung's image disc becomes the beam's virtual waist.
+
+**Files.** `scene.rs` (`LightData::from_laser_line` gains `power_w`,
+derives P; keep the radiance-based constructor for the analytic tests),
+`main.rs` (demo constants: Φ = 5 mW, physical θ), `gpu.rs`/`bdpt.wgsl`
+(nothing — the machinery is θ-agnostic).
+
+**Tests.** Power invariance (fixed Φ, θ varying over decades: the spot
+irradiance is unchanged); the footprint law (spot radius = w₀ + d·tanθ);
+the rendered spot matches Φ/(πw₀²)·ρ/π analytically; the existing
+cone-gate and ladder tests keep their wide-θ synthetic scenes (they
+test the machinery, which is θ-agnostic).
+
+## Phase 7 — Performance
+
+**The hot spot: bridge qualification inside the MIS inner loop.**
+Every pdf/weight query at a diffuse eye vertex calls `mixture_pdf`,
+which loops over *all lights × all their rungs* — on the GPU loading
+the full 256-byte `GpuLight` per light, **twice** (count + density); on
+the CPU allocating a `Vec` per call. These queries run O(k²) times per
+path (per connection strategy × per edge in the ratio walk and the RR
+sweep): several hundred `mixture_pdf` calls per path, each doing ~8–10
+storage loads. The bridge loop is plausibly 5–10× the rest of the
+shader combined — the single biggest win available.
+
+1. **Flat rung buffer.** Move the rungs out of `GpuLight` into a
+   dedicated `array<vec4<f32>>` storage buffer (xyz = image center,
+   w = radius), uploaded once per scene. The qualification loop reads
+   16 bytes per rung instead of 256 bytes per light; `GpuLight`
+   shrinks by 128 bytes (the rung array and its pads go — which also
+   retires the vec3-alignment trap that array caused).
+2. **Per-vertex cached qualifying count.** `n_qual` depends only on
+   (p, normal) — and the oriented normal at a path position is
+   *query-independent*: every MIS/RR query uses the realized edge
+   directions (`pv_event_pdf`'s `d_in` is always a realized path edge),
+   and both walks stop at back-face diffuse hits, so the orientation
+   never flips between queries. Compute `n_qual` once at vertex
+   creation (one pass over the flat rung array), store it in
+   `PathVertex`, early-out at 0 — the overwhelmingly common case.
+   Semantics unchanged: the current code recomputes the identical
+   value hundreds of times per path.
+3. **CPU: kill the hot-path allocations.** `qualifying_bridges`
+   returns `Vec<usize>` — a heap allocation in the innermost MIS
+   query, dozens per path; `bdpt_trace` also collects `active` into a
+   `Vec` per trace. After Phase 8 the CPU path is the test oracle, so
+   this is test-suite speed, not production speed — but the same
+   per-vertex cache applies 1:1.
+4. **`mis_weight` per-edge caching.** `mis_valid(s2)` and
+   `mis_step(s2)` both compute `pv_pdf_eye(s2+1)`; cache the per-m pdfs
+   in small local arrays within one `mis_weight` call (~2× off that
+   walk). Same for the CPU.
+5. **Shared-prefix RR caching** (optional — measure after 1–4): qe[l]
+   for l ≤ n_eye and ql[j] for j ≤ light_len are strategy-independent
+   (the subpath prefixes are shared across strategies; only the
+   crossover extensions differ). Precompute the prefix sweeps once
+   per path. A delicate refactor of the MIS machinery — guard with the
+   sum-to-one and differential tests.
+6. **Ladder derivation: one BVH build.** `GpuRenderer::build_scene_buffers`
+   calls per-laser `bridges_of_light`, and each call rebuilds the whole
+   trait-object scene + BVH (`bridges_of_light` → `build_cpu_scene`) —
+   N lasers → N full scene builds per upload, per frame under the M
+   animation. Add a per-laser variant that shares one build (the flat
+   `bridges()` already does exactly this).
+7. **`update_scene` buffer reuse.** The M animation re-creates the
+   prim/BVH/light buffers per frame; reuse allocations when capacity
+   suffices (`write_buffer` only).
+8. **Optional: SAH split** in both BVH builders (the room mixes
+   5 m walls with cm-scale mirror tiles — median-split-on-widest-axis
+   is weak there). Measure after 1–7.
+
+## Phase 8 — Remove the CPU renderer
+
+**Scope: remove the CPU *renderer*, keep the CPU *BDPT core*.** The CPU
+implementation remains (a) the test oracle — the whole evidence suite
+(§8) runs `bdpt_trace` on CPU scenes — and (b) the ladder-derivation
+engine (`bridges_of_light` traces beams through the trait-object BVH).
+Removing either would gut the paper's validation story; the renderer
+frontend is what goes.
+
+Remove:
+- `renderer::CpuRenderer` and the `Renderer` trait (only `GpuRenderer`
+  remains; the frontends use it concretely).
+- `Cam::render` (the rayon pixel loop) and the CPU FHD fallback in
+  `render_fhd` — the export is GPU-only; no adapter → clean error.
+- The `rayon` dependency (nothing else uses it).
+- The terminal frontend's CPU fallback branch (it becomes GPU-only; it
+  already prefers the GPU).
+
+Keep:
+- `bdpt.rs`, `bvh.rs`, `geometry.rs`, `SceneData::build_cpu_scene` —
+  the oracle + the ladder engine.
+- `accumulate` + its unit tests as the *tested reference* of the
+  winsorization policy the WGSL accumulation block implements (the
+  parity discipline: the shader's policy stays pinned by a CPU-side
+  test even though no CPU renderer consumes it).
+- The `gpu_matches_cpu` oracle: its CPU reference becomes a small
+  `#[cfg(test)]` render helper (a plain loop over pixels calling
+  `bdpt_trace`; 32×32 needs no parallelism).
+- The `renderer.rs` export constants (FHD_*, MAX_ACCUMULATED_FRAMES,
+  SAMPLES_FHD) move to `gpu.rs` or a small config module.
+
+README updates land with the phase (the "Two Frontends" / CPU-fallback
+sections).
+
+## Hygiene (found in review; first two fixed immediately)
+
+- **[FIXED]** `scene_builds_and_is_sampleable` expected 3 lights; the
+  demo has 4 (a second ceiling panel was added without updating the
+  test).
+- **[FIXED]** `Material::is_specular_pair` hardcoded λ = 550 nm while
+  the WGSL port passes the path's hero λ — a 1:1-port violation that
+  corrupts the MIS weights of dispersive-glass paths on the CPU: the
+  550-nm refraction direction is not the realized λ's, the
+  specular-pair test fails, and the realized strategy's pdf collapses
+  to 0. Now takes `lambda` like every other BSDF query.
+- **The `M` sweep animation is a no-op**: `build_scene_with(_laser_aim_y)`
+  ignores its parameter (the `aim_point` line is commented out), so the
+  window frontend rebuilds and re-uploads the whole scene every frame
+  *while changing nothing* — a documented README feature that animates
+  nothing at full cost. Restore the aim (note: this moves the default
+  spot — the fixed aim and the aim_point aim are different beams) or
+  remove the feature. Either way Phase 7.6/7.7 make the per-frame
+  re-upload cheap.
+- **Doc drift**: `SAMPLES_FHD = 1280` vs README "1024 samples per pixel"
+  vs paper "128 spp" — three different numbers for one constant; and
+  `GpuRenderer::render_frame`'s doc says "two samples per pixel" but
+  dispatches 4.
+- **Debris**: `progress.patch` in the repo root (a leftover diff from a
+  previous session); `screenshot.png` is a generated artifact (gitignore).
+- **Dead-code warnings (9)**: mostly test-only items (`Material::*`
+  constructors, `trace_laser_beam`, `background_coeffs`,
+  `BeamTrace`/`BeamSpot`) — mark `#[cfg(test)]` where honest; delete
+  `firefly_clamp_bound` (superseded by the spectral bound).
+
+## Session 2 checklist
+
+- [x] Review: code + paper + plan read end to end; baseline green
+- [x] Hygiene: stale light-count test fixed; `is_specular_pair` λ fixed
+- [ ] Phase 6: power-parametrized beam emitter + physical divergence +
+      demo constants + tests
+- [ ] Phase 7.1–7.4: flat rung buffer, per-vertex n_qual cache, CPU
+      allocation fix, mis_weight pdf caching (then measure)
+- [ ] Phase 7.5–7.8 (optional, post-measurement): shared-prefix RR,
+      SAH, buffer reuse
+- [ ] Phase 8: CPU renderer removal (keep the BDPT core, `accumulate`
+      tests, oracle helper)
+- [ ] Hygiene: M-animation decision, doc sync, debris removal,
+      dead-code silence
+- [ ] README + paper Appendix A/B updated for the single backend and
+      the new laser model

@@ -573,14 +573,19 @@ impl Material {
     /// True when (dir_in, dir_out) is the specular pair of this delta BSDF
     /// (the deterministic direction it scatters into). Used by the MIS
     /// machinery to give delta-sampled edges their symbolic pdf of 1.
+    /// `lambda` is the path's hero wavelength — dispersive glass picks
+    /// its refraction direction per-λ, so the pair test must use the
+    /// same λ the walk used (the WGSL port passes `view.lambda`; a
+    /// hardcoded 550 here would diverge from it on dispersive glass).
     pub fn is_specular_pair(
         &self,
         normal: Vec3,
         front_face: bool,
         dir_in: Vec3,
         dir_out: Vec3,
+        lambda: f32,
     ) -> bool {
-        self.specular_weight(normal, front_face, dir_in, dir_out, Transport::Radiance, 550.0)
+        self.specular_weight(normal, front_face, dir_in, dir_out, Transport::Radiance, lambda)
             .is_some()
     }
 

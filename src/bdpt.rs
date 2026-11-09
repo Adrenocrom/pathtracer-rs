@@ -471,7 +471,7 @@ impl<'a> PathView<'a> {
         if v.mat.bsdf.is_delta() {
             if v
                 .mat
-                .is_specular_pair(normal, front_face, d_in, d_out)
+                .is_specular_pair(normal, front_face, d_in, d_out, self.lambda)
             {
                 1.0
             } else {
