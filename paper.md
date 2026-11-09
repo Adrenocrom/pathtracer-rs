@@ -38,7 +38,8 @@ SceneData (flat, GPU-friendly scene description, src/scene.rs)
    │                 → reference oracle, fully unit-tested
    │
    └── GPU backend:  kind-tagged prim array + flat pre-order BVH (src/gpu.rs)
-                     WGSL compute, one thread/pixel (shaders/bdpt.wgsl)
+                     WGSL compute, one thread/pixel (shaders/bdpt/, concatenated
+                     by BDPT_WGSL in src/gpu.rs)
                      PCG32 RNG, persistent rgba32float accumulation buffer
                      (the .w channel carries the outlier-rejection statistic)
 
@@ -66,7 +67,7 @@ Key architectural decisions:
 
 A full path is $x_1 \dots x_k$ — camera at $x_0$, emitter at $y_0 = x_k$. The eye subpath samples $x_1, x_2, \dots$; the light subpath samples $y_0, y_1, \dots$. Every partition of the path into an eye prefix and light suffix is a *strategy*: strategy $s$ uses $s$ eye vertices and connects $x_s$ to $x_{s+1} = y_{k-s-1}$; strategy $k$ is the eye subpath hitting the emitter directly. The estimator sums, over all strategies that can sample the path, the contribution weighted by the MIS weight $w_s$.
 
-The implementation (`bdpt_trace` in `src/bdpt.rs`, ported 1:1 to `shaders/bdpt.wgsl`):
+The implementation (`bdpt_trace` in `src/bdpt.rs`, ported 1:1 to the WGSL fragments in `shaders/bdpt/`):
 
 1. **Eye walk.** Trace the camera ray; at each hit, orient the normal toward the arrival side; stop at emitters; sample the BSDF (diffuse vertices use the cosine–bridge mixture of §4.4); roll Russian roulette on the post-scatter throughput.
 2. **Light walk.** Pick a light uniformly, sample a surface point (pdf $1/(n \cdot A)$), sample a departure direction (cosine-weighted, or uniform-in-cone for a laser aperture), then walk as above transporting *importance*.
@@ -336,7 +337,7 @@ The model-change analysis shows the architecture's forward compatibility: spectr
 | Component | File |
 |---|---|
 | BDPT + MIS + roulette + bridges (CPU) | `src/bdpt.rs` |
-| BDPT + MIS + accumulation (GPU, 1:1 port) | `shaders/bdpt.wgsl` |
+| BDPT + MIS + accumulation (GPU, 1:1 port) | `shaders/bdpt/` |
 | Scene description, beam trace, ladder derivation | `src/scene.rs` |
 | BSDFs, Fresnel/Snell, prims, area lights | `src/geometry.rs` |
 | BVH (CPU tree) | `src/bvh.rs` |

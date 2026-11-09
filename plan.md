@@ -155,7 +155,7 @@ cube; physically correct laser colors)"*.
 - **`src/bdpt.rs`** — scalar-throughput refactor; λ sampling at path start;
   sensor conversion + spectral clamp at the end; `PathView` carries λ.
 - **`src/main.rs`** — demo: Line lasers (650/532 nm), BK7 glass cube.
-- **`src/gpu.rs` + `shaders/bdpt.wgsl`** — the 1:1 port: `GpuPrim` grows to
+- **`src/gpu.rs` + `shaders/bdpt/`** — the 1:1 port: `GpuPrim` grows to
   144 B (Sellmeier[6] + roughness + pad), `GpuLight` reuses free pads for
   the spectrum kind/λ/power, `PathVertex` fields go scalar, the CMF table +
   `G⁻¹` + the albedo ramps are hardcoded consts, λ sampling + conversion +
@@ -464,7 +464,7 @@ diffraction. Concretely:
 
 **Files.** `scene.rs` (`LightData::from_laser_line` gains `power_w`,
 derives P; keep the radiance-based constructor for the analytic tests),
-`main.rs` (demo constants: Φ = 5 mW, physical θ), `gpu.rs`/`bdpt.wgsl`
+`main.rs` (demo constants: Φ = 5 mW, physical θ), `gpu.rs`/`bdpt/`
 (nothing — the machinery is θ-agnostic).
 
 **Tests.** Power invariance (fixed Φ, θ varying over decades: the spot

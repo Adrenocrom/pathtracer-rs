@@ -16,6 +16,32 @@ use crate::output::PixelBuffer;
 use crate::scene::{LightData, SceneData};
 use bytemuck::{Pod, Zeroable};
 
+/// The BDPT compute shader, concatenated from the fragments in
+/// `shaders/bdpt/` in dependency order (WGSL has no `#include`):
+/// common (structs, consts, bindings, RNG) → intersect (flat-BVH
+/// traversal) → spectral (CMF, Sellmeier, the hero-λ draw) → sampling
+/// (cosine hemisphere, G term, shadow rays) → bsdf (sampling/eval, GGX)
+/// → bridges (the laser ladder mixture) → pathview (the unified path
+/// positions) → mis (Veach's walk, roulette prefix products) → lights
+/// (surface sampling) → firefly (the clamp, the accumulation consts) →
+/// trace (`bdpt_trace`) → main (the entry point). This is the single
+/// source the pipeline and the naga validation test consume; the
+/// pre-split `shaders/bdpt.wgsl` is no longer referenced.
+const BDPT_WGSL: &str = concat!(
+    include_str!("../shaders/bdpt/common.wgsl"),
+    include_str!("../shaders/bdpt/intersect.wgsl"),
+    include_str!("../shaders/bdpt/spectral.wgsl"),
+    include_str!("../shaders/bdpt/sampling.wgsl"),
+    include_str!("../shaders/bdpt/bsdf.wgsl"),
+    include_str!("../shaders/bdpt/bridges.wgsl"),
+    include_str!("../shaders/bdpt/pathview.wgsl"),
+    include_str!("../shaders/bdpt/mis.wgsl"),
+    include_str!("../shaders/bdpt/lights.wgsl"),
+    include_str!("../shaders/bdpt/firefly.wgsl"),
+    include_str!("../shaders/bdpt/trace.wgsl"),
+    include_str!("../shaders/bdpt/main.wgsl"),
+);
+
 /// Camera + frame state, uploaded once per frame.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -44,10 +70,13 @@ struct Uniforms {
     /// `FIREFLY_LIGHT_MULT`; kept as a uniform so the WGSL clamp and
     /// the CPU clamp share one source of truth for the multiplier.
     firefly_clamp: f32,
-    _pad2: u32,
+    /// DEBUG (temporary): 1 = the shader dumps bridge-path diagnostics
+    /// into the accumulation buffer's .w channel instead of the moment
+    /// statistic (the winsorization is bypassed while debugging).
+    debug: u32,
 }
 
-/// One scene primitive in GPU form (matches `Prim` in shaders/bdpt.wgsl).
+/// One scene primitive in GPU form (matches `Prim` in shaders/bdpt/common.wgsl).
 ///
 /// All five families (sphere/quad/cube/plane/cylinder) share this layout,
 /// kind-tagged, so a single array — and a single BVH leaf range — can hold
@@ -90,7 +119,7 @@ struct GpuPrim {
     f0: f32,
 }
 
-/// One flat BVH node in GPU form (matches `BvhNode` in shaders/bdpt.wgsl).
+/// One flat BVH node in GPU form (matches `BvhNode` in shaders/bdpt/common.wgsl).
 ///
 /// * Leaf (`count > 0`): `right_first` indexes the first prim of a
 ///   contiguous run of `count` prims — the prim array is uploaded in
@@ -109,7 +138,7 @@ struct GpuBvhNode {
 }
 
 /// One sampleable emitter surface in GPU form (matches `GpuLight` in
-/// shaders/bdpt.wgsl). `shape` is 0 = sphere, 1 = quad, 2 = laser
+/// shaders/bdpt/common.wgsl). `shape` is 0 = sphere, 1 = quad, 2 = laser
 /// aperture (disc + cone). For a laser, `half_w` carries the cone
 /// half-angle `theta` (the slot is unused by the disc) — the same
 /// piggyback the CPU-side `LightData` uses.
@@ -258,7 +287,7 @@ const MAT_LASER: u32 = 4;
 /// the normal-incidence reflectance in `f0`.
 const MAT_GLOSSY: u32 = 5;
 
-// Prim kind tags, shared with shaders/bdpt.wgsl.
+// Prim kind tags, shared with shaders/bdpt/intersect.wgsl.
 const KIND_SPHERE: u32 = 0;
 const KIND_QUAD: u32 = 1;
 const KIND_CUBE: u32 = 2;
@@ -525,6 +554,9 @@ pub struct GpuRenderer {
     samples: u32,
     /// True when the accumulation buffer must be overwritten this frame.
     reset: bool,
+    /// DEBUG (temporary): 1 = the shader dumps bridge-path diagnostics
+    /// into the accumulation buffer's .w channel.
+    debug: u32,
     adapter_info: String,
 }
 
@@ -609,7 +641,10 @@ impl GpuRenderer {
         height: u32,
         adapter_info: String,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::include_wgsl!("../shaders/bdpt.wgsl"));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bdpt"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(BDPT_WGSL)),
+        });
 
         // --- Scene buffers (flat POD arrays) ---
         let (prim_buf, bvh_buf, light_buf, n_prims, n_lights, firefly_clamp) =
@@ -712,6 +747,7 @@ impl GpuRenderer {
             firefly_clamp,
             samples: 0,
             reset: true,
+            debug: 0,
             adapter_info,
         }
     }
@@ -986,6 +1022,15 @@ impl GpuRenderer {
         self.samples = 0;
     }
 
+    /// DEBUG (temporary): enable/disable the shader's bridge-diagnostics
+    /// dump (the .w channel carries the diagnostic instead of the moment
+    /// statistic).
+    pub fn set_debug(&mut self, debug: bool) {
+        self.debug = debug as u32;
+        self.reset = true;
+        self.samples = 0;
+    }
+
     /// Render one frame (two samples per pixel) and accumulate it on the
     /// GPU. Does not block on the GPU; call `read_pixels` when pixels are
     /// needed.
@@ -1023,7 +1068,7 @@ impl GpuRenderer {
             spp: spp.max(1),
             n_prims: self.n_prims,
             firefly_clamp: self.firefly_clamp,
-            _pad2: 0,
+            debug: self.debug,
         };
         self.queue
             .write_buffer(&self.res.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
@@ -1053,6 +1098,23 @@ impl GpuRenderer {
     /// Copy the accumulation buffer to the CPU and return it as a PixelBuffer.
     /// Blocks until the GPU has finished the pending frame.
     pub fn read_pixels(&mut self) -> PixelBuffer {
+        let floats = self.read_raw();
+        let pixels: Vec<Vec3> = floats
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| Vec3::new(c[0], c[1], c[2]))
+            .collect();
+        PixelBuffer {
+            width: self.width as usize,
+            height: self.height as usize,
+            pixels,
+        }
+    }
+
+    /// DEBUG (temporary): the raw accumulation buffer (rgba32float), the
+    /// .w channel included (the bridge diagnostic in debug mode).
+    pub fn read_raw(&mut self) -> Vec<f32> {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1078,18 +1140,7 @@ impl GpuRenderer {
         let floats: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         self.readback_buf.unmap();
-
-        let pixels: Vec<Vec3> = floats
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| Vec3::new(c[0], c[1], c[2]))
-            .collect();
-        PixelBuffer {
-            width: self.width as usize,
-            height: self.height as usize,
-            pixels,
-        }
+        floats
     }
 }
 
@@ -1180,7 +1231,7 @@ mod tests {
     /// wgpu uses. This runs on every machine, GPU or not.
     #[test]
     fn wgsl_shader_validates() {
-        let source = include_str!("../shaders/bdpt.wgsl");
+        let source = BDPT_WGSL;
         let module = naga::front::wgsl::Frontend::new()
             .parse(source)
             .expect("WGSL parse failed");
@@ -1354,7 +1405,7 @@ mod tests {
     ///
     /// History: the NVIDIA 615.78.08 shader compiler crashed the whole
     /// test process with SIGILL here (see the comment on
-    /// `lambda_eq` in shaders/bdpt.wgsl); the shader-side workaround
+    /// `lambda_eq` in shaders/bdpt/spectral.wgsl); the shader-side workaround
     /// fixed it, and this test is the regression guard.
     #[test]
     #[ignore]

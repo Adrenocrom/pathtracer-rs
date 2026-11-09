@@ -778,7 +778,7 @@ mod tests {
     #[test]
     fn background_coeffs_match_the_wgsl_constants() {
         let c = background_coeffs();
-        // The exact values hardcoded in shaders/bdpt.wgsl's background
+        // The exact values hardcoded in shaders/bdpt/trace.wgsl's background
         // path. If this test fails after a CMF-table or matrix change,
         // update the shader's `coeffs` constant to match.
         assert!((c.x - 5.4379e-5).abs() < 5e-8, "x: {c:?}");

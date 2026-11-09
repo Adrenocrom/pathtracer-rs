@@ -82,7 +82,7 @@ pub const BACKGROUND: Vec3 = Vec3 {
 // remove it: the per-sample clamp below (bounds the magnitude) and the
 // temporal outlier rejection in the accumulation layer (stops it from
 // sticking; see `accumulate` in renderer.rs and the accumulation block
-// in shaders/bdpt.wgsl).
+// in shaders/bdpt/main.wgsl).
 
 /// Per-sample clamp: the bound is a multiple of the brightest
 /// emitter's luminance — a deliberately *loose*, physically motivated
@@ -116,14 +116,14 @@ pub const FIREFLY_LIGHT_MULT: f32 = 8.0;
 /// Temporal outlier rejection: a batch whose mean luminance exceeds
 /// the running mean by more than this many standard deviations is
 /// scaled down to that bound before it enters the accumulation
-/// statistics. Must match `WINSOR_K` in shaders/bdpt.wgsl.
+/// statistics. Must match `WINSOR_K` in shaders/bdpt/firefly.wgsl.
 pub const WINSOR_K: f32 = 3.0;
 
 /// The second-moment memory, in samples. The rejection statistic
 /// E[lum²] is an exponential moving average over roughly this many
 /// samples rather than a full running average, so one outlier can
 /// only keep σ (and with it the rejection bound) loose for a bounded
-/// time. Must match `MOMENT_WINDOW` in shaders/bdpt.wgsl.
+/// time. Must match `MOMENT_WINDOW` in shaders/bdpt/firefly.wgsl.
 pub const MOMENT_WINDOW: usize = 16;
 
 /// The per-sample luminance clamp bound for a scene whose brightest
@@ -138,7 +138,7 @@ pub fn firefly_clamp_bound(max_light_luminance: f32) -> f32 {
 }
 
 /// Clamp one sample's luminance to `bound`, preserving its chroma.
-/// Shared shape with `clamp_sample` in shaders/bdpt.wgsl.
+/// Shared shape with `clamp_sample` in shaders/bdpt/firefly.wgsl.
 pub fn clamp_sample(c: Vec3, bound: f32) -> Vec3 {
     let lum = c.luminance();
     if lum > bound && lum > 0.0 {
@@ -964,7 +964,7 @@ fn spectral_clamp_bound(lights: &[AreaLight], wave: &WaveSample) -> f32 {
 /// multiple of the brightest emitter's luminance at the sampled λ)
 /// that removes only implausible samples. The tight, mean-aware
 /// firefly removal happens in the accumulation layer (`accumulate` in
-/// renderer.rs / the accumulation block in shaders/bdpt.wgsl), where
+/// renderer.rs / the accumulation block in shaders/bdpt/main.wgsl), where
 /// temporal persistence separates a caustic from a firefly.
 pub fn bdpt_trace(
     ray: &Ray,

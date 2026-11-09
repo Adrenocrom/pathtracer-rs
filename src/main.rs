@@ -625,6 +625,800 @@ mod tests {
         assert_eq!(lights.len(), 4);
     }
 
+    /// DIAGNOSTIC (temporary): where do the demo beams land, and does the
+    /// estimator produce light there? Traces both beams, prints the
+    /// ladders, and probes the spot with the CPU estimator.
+    /// Ignored by default: a temporary diagnostic for the ongoing
+    /// GPU-bridge investigation (slow: it renders a full view on the
+    /// CPU). Run with `cargo test -- --ignored diagnostic_demo_beams_and_spots`.
+    #[test]
+    #[ignore]
+    fn diagnostic_demo_beams_and_spots() {
+        let scene = build_scene();
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        let bridges = scene.bridges();
+        let mut out = String::new();
+        out.push_str("=== demo beam diagnostics ===\n");
+        out.push_str(&format!("n_bridges total: {}\n", bridges.len()));
+        for light in &scene.lights {
+            if light.shape != 2 {
+                continue;
+            }
+            let lambda = match light.spectrum {
+                crate::spectrum::SpectrumKind::Line { lambda, .. } => lambda,
+                _ => 0.0,
+            };
+            let trace = scene.trace_laser_beam(light, 8);
+            out.push_str(&format!(
+                "laser λ={lambda} at {:?} dir {:?}: {} legs, spot={:?}\n",
+                light.center,
+                light.normal,
+                trace.legs.len(),
+                trace.spot.as_ref().map(|s| s.p)
+            ));
+            for (i, (a, b)) in trace.legs.iter().enumerate() {
+                out.push_str(&format!("  leg {i}: {a:?} -> {b:?}\n"));
+            }
+            let ladder = scene.bridges_of_light(light, 8);
+            out.push_str(&format!("  ladder: {} rungs\n", ladder.len()));
+            for (i, r) in ladder.iter().enumerate() {
+                out.push_str(&format!(
+                    "  rung {i}: image {:?} r={} beam_dir {:?} versine {:.3e}\n",
+                    r.image_center, r.radius, r.beam_dir, r.versine
+                ));
+            }
+        }
+
+        // Follow the green beam across the glossy tile the way the ladder
+        // does (trace_laser_beam stops at the glossy surface because it
+        // is non-delta): aim at rung 0's image, then continue along the
+        // reversed rung-1 beam direction.
+        let green = scene
+            .lights
+            .iter()
+            .find(|l| match l.spectrum {
+                crate::spectrum::SpectrumKind::Line { lambda, .. } => lambda == 532.0,
+                _ => false,
+            })
+            .expect("the green laser");
+        let green_ladder = scene.bridges_of_light(green, 8);
+        if green_ladder.len() >= 2 {
+            // Leg 1: aperture -> glossy tile. Aim from the aperture along
+            // the beam axis.
+            let mut origin = green.center + green.normal * 0.001;
+            let mut dir = green.normal;
+            let mut legs = Vec::new();
+            for _ in 0..8 {
+                let ray = crate::geometry::Ray { origin, direction: dir };
+                let Some(hit) = cpu_scene.intersect(&ray) else { break };
+                legs.push((origin, hit.p));
+                let front_face = hit.normal.dot(dir) < 0.0;
+                let normal = if front_face { hit.normal } else { hit.normal * -1.0 };
+                match hit.mat.bsdf {
+                    crate::geometry::Bsdf::Mirror | crate::geometry::Bsdf::Glossy { .. } => {
+                        dir = crate::geometry::reflect_dir(dir, normal);
+                        origin = hit.p + normal * 0.001;
+                    }
+                    _ => {
+                        out.push_str(&format!(
+                            "λ=532 full chain lands at {:?} (mat {:?}) after {} legs\n",
+                            hit.p,
+                            hit.mat.bsdf,
+                            legs.len()
+                        ));
+                        for (i, (a, b)) in legs.iter().enumerate() {
+                            out.push_str(&format!("  λ=532 leg {i}: {a:?} -> {b:?}\n"));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Render the default camera view and scan for the spots: the
+        // brightest red-dominant and green-dominant pixels.
+        let cam = default_cam();
+        let (forward, right, up) = {
+            let forward = (cam.lookat - cam.origin).normalize();
+            let world_up = Vec3::new(0.0, 1.0, 0.0);
+            let right = world_up.cross(forward).normalize();
+            let up = forward.cross(right).normalize();
+            (forward, right, up)
+        };
+        let aspect = 16.0 / 9.0;
+        let theta = cam.fov_deg.to_radians();
+        let h = (theta * 0.5).tan();
+        let w = aspect * h;
+        let mut rng = rand::thread_rng();
+        let n = 64;
+        let mut best_red = (0.0f32, 0usize, 0usize);
+        let mut best_green = (0.0f32, 0usize, 0usize);
+        let mut red_sum = 0.0f32;
+        let mut green_sum = 0.0f32;
+        for y in 0..48 {
+            for x in 0..85 {
+                let px = (x as f32 / 85.0 * 2.0 - 1.0) * w;
+                let py = -(y as f32 / 48.0 * 2.0 - 1.0) * h;
+                let dir = (right * px + up * py + forward).normalize();
+                let ray = crate::geometry::Ray { origin: cam.origin, direction: dir };
+                let mut mean = VEC_ZERO;
+                for _ in 0..n {
+                    mean = mean
+                        + crate::bdpt::bdpt_trace(&ray, &*cpu_scene, 8, &lights, &bridges, &mut rng);
+                }
+                mean = mean * (1.0 / n as f32);
+                // Red-dominant: R much greater than G and B.
+                if mean.x > mean.y * 3.0 && mean.x > mean.z * 3.0 && mean.x > best_red.0 {
+                    best_red = (mean.x, x, y);
+                }
+                if mean.y > mean.x * 3.0 && mean.y > mean.z * 3.0 && mean.y > best_green.0 {
+                    best_green = (mean.y, x, y);
+                }
+                red_sum += mean.x.max(0.0);
+                green_sum += mean.y.max(0.0);
+            }
+        }
+        out.push_str(&format!(
+            "default view scan (85x48, {n} spp): best red pixel {best_red:?}, best green pixel {best_green:?}\n"
+        ));
+        out.push_str(&format!(
+            "default view: total red {red_sum:.2}, total green {green_sum:.2}\n"
+        ));
+        std::fs::write("target/demo_beam_diag.txt", &out).ok();
+    }
+
+    /// DIAGNOSTIC (temporary): analyze the rendered screenshots for the
+    /// laser spots — saturated red / green blobs.
+    /// Ignored by default: a temporary diagnostic (it depends on
+    /// screenshot files in the repo root). Run with
+    /// `cargo test -- --ignored diagnostic_scan_screenshots`.
+    #[test]
+    #[ignore]
+    fn diagnostic_scan_screenshots() {
+        let mut report = String::new();
+        for name in [
+            "screenshot.png",
+            "screenshot2.png",
+            "screenshot_15000.png",
+            "example.png",
+        ] {
+            let Ok(img) = image::open(name) else {
+                report.push_str(&format!("{name}: could not open\n"));
+                continue;
+            };
+            let rgb = img.to_rgb8();
+            let (w, h) = (rgb.width(), rgb.height());
+            let mut red_pixels = 0usize;
+            let mut green_pixels = 0usize;
+            let mut best_red = (0u8, 0u32, 0u32);
+            let mut best_green = (0u8, 0u32, 0u32);
+            // The brightest pixels overall, to see what dominates.
+            let mut brightest: Vec<(u32, u32, u32)> = Vec::new(); // (lum, x, y)
+            for y in 0..h {
+                for x in 0..w {
+                    let p = rgb.get_pixel(x, y);
+                    let (r, g, b) = (p[0] as u32, p[1] as u32, p[2] as u32);
+                    // Saturated red: R dominant, G/B low.
+                    if r > 150 && g * 3 < r && b * 3 < r {
+                        red_pixels += 1;
+                        if r as u8 > best_red.0 {
+                            best_red = (r as u8, x, y);
+                        }
+                    }
+                    // Saturated green: G dominant, R/B low.
+                    if g > 150 && r * 3 < g && b * 3 < g {
+                        green_pixels += 1;
+                        if g as u8 > best_green.0 {
+                            best_green = (g as u8, x, y);
+                        }
+                    }
+                    let lum = (r * 2 + g * 3 + b) / 6;
+                    if brightest.len() < 8 || lum > brightest[0].0 {
+                        brightest.push((lum, x, y));
+                        brightest.sort();
+                        if brightest.len() > 8 {
+                            brightest.remove(0);
+                        }
+                    }
+                }
+            }
+            report.push_str(&format!(
+                "{name} ({w}x{h}): red-ish {red_pixels} (best {best_red:?}), \
+                 green-ish {green_pixels} (best {best_green:?})\n"
+            ));
+            // Sample the brightest pixels' actual colors.
+            for (lum, x, y) in &brightest {
+                let p = rgb.get_pixel(*x, *y);
+                report.push_str(&format!(
+                    "  bright ({x},{y}) lum {lum}: ({}, {}, {})\n",
+                    p[0], p[1], p[2]
+                ));
+            }
+        }
+        std::fs::write("target/screenshot_scan.txt", &report).ok();
+    }
+
+    /// DIAGNOSTIC (temporary): render the current demo scene on the GPU at
+    /// the default camera and scan for the laser spots. The CPU renders
+    /// them strongly (see demo_beam_diag); if the GPU doesn't, the bug is
+    /// in the WGSL port.
+    /// Ignored by default: it creates a GPU instance, and several GPU
+    /// tests running in parallel crashed the suite with SIGSEGV during
+    /// the debug session. Run with
+    /// `cargo test -- --ignored diagnostic_gpu_demo_spots`.
+    #[test]
+    #[ignore]
+    fn diagnostic_gpu_demo_spots() {
+        let scene = build_scene();
+        const W: usize = 480;
+        const H: usize = 270;
+        let Ok(mut gpu) = crate::gpu::GpuRenderer::new(&scene, W as u32, H as u32) else {
+            std::fs::write("target/gpu_demo_diag.txt", "no GPU adapter\n").ok();
+            return;
+        };
+        let cam = default_cam();
+        // Accumulate 64 frames x 4 spp = 256 spp.
+        for _ in 0..64 {
+            gpu.render_frame(&cam, 8);
+        }
+        let buf = gpu.read_pixels();
+        let mut report = String::new();
+        report.push_str(&format!(
+            "GPU demo render {W}x{H}, {} spp: scanning for spots\n",
+            gpu.samples_accumulated()
+        ));
+        // Project the true spot points through the camera (the same
+        // convention as Cam::render).
+        let (right, up) = {
+            let forward = (cam.lookat - cam.origin).normalize();
+            let world_up = Vec3::new(0.0, 1.0, 0.0);
+            let right = world_up.cross(forward).normalize();
+            let up = forward.cross(right).normalize();
+            (right, up)
+        };
+        let aspect = W as f32 / H as f32;
+        let theta = cam.fov_deg.to_radians();
+        let hh = (theta * 0.5).tan();
+        let ww = aspect * hh;
+        let project = |p: Vec3| -> (usize, usize) {
+            let d = p - cam.origin;
+            let len = d.length();
+            let dir = d * (1.0 / len);
+            let u = (dir.dot(right) / ww + 1.0) * 0.5;
+            let v = (1.0 - dir.dot(up) / hh) * 0.5;
+            ((u * W as f32) as usize, (v * H as f32) as usize)
+        };
+        let red_spot = Vec3::new(1.8076, 0.62, 0.99);
+        let green_spot = Vec3::new(-2.5, 0.633, 1.252);
+        for (label, p) in [("red spot", red_spot), ("green spot", green_spot)] {
+            let (cx, cy) = project(p);
+            report.push_str(&format!(
+                "--- {label} world {p:?} -> pixel ({cx},{cy}) ---\n"
+            ));
+            for dy in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    let x = (cx as i32 + dx).clamp(0, W as i32 - 1) as usize;
+                    let y = (cy as i32 + dy).clamp(0, H as i32 - 1) as usize;
+                    let g = buf.get_pixel(x, y);
+                    report.push_str(&format!(
+                        "  ({x:3},{y:3}) gpu ({:8.3},{:8.3},{:8.3})\n",
+                        g.x, g.y, g.z
+                    ));
+                }
+            }
+        }
+        // The overall image mean, to confirm the render isn't black.
+        let mean = buf
+            .pixels
+            .iter()
+            .fold(VEC_ZERO, |a, p| a + *p)
+            * (1.0 / buf.pixels.len() as f32);
+        report.push_str(&format!("image mean: {mean:?}\n"));
+        std::fs::write("target/gpu_demo_diag.txt", &report).ok();
+    }
+
+    /// DIAGNOSTIC (temporary): CPU-vs-GPU comparison on the actual demo
+    /// scene (the oracle test uses a different scene with a wide-θ,
+    /// mirror-less laser, so it never exercises the bridge path). Render
+    /// the same view on both backends and dump the most-divergent pixels.
+    /// Ignored by default: it creates a GPU instance, and several GPU
+    /// tests running in parallel crashed the suite with SIGSEGV during
+    /// the debug session. Run with
+    /// `cargo test -- --ignored diagnostic_cpu_vs_gpu_demo`.
+    #[test]
+    #[ignore]
+    fn diagnostic_cpu_vs_gpu_demo() {
+        let scene = build_scene();
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        let bridges = scene.bridges();
+        let cam = default_cam();
+
+        const W: usize = 120;
+        const H: usize = 68;
+        const SPP: usize = 48;
+
+        // CPU render.
+        let (forward, right, up) = {
+            let forward = (cam.lookat - cam.origin).normalize();
+            let world_up = Vec3::new(0.0, 1.0, 0.0);
+            let right = world_up.cross(forward).normalize();
+            let up = forward.cross(right).normalize();
+            (forward, right, up)
+        };
+        let aspect = W as f32 / H as f32;
+        let theta = cam.fov_deg.to_radians();
+        let hh = (theta * 0.5).tan();
+        let ww = aspect * hh;
+        let mut cpu_pixels = vec![VEC_ZERO; W * H];
+        {
+            use rayon::prelude::*;
+            cpu_pixels
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(i, px)| {
+                    let x = i % W;
+                    let y = i / W;
+                    let mut rng = rand::thread_rng();
+                    let mut mean = VEC_ZERO;
+                    for _ in 0..SPP {
+                        let u = (x as f32 + rng.gen::<f32>()) / W as f32;
+                        let v = (y as f32 + rng.gen::<f32>()) / H as f32;
+                        let px_ = (u * 2.0 - 1.0) * ww;
+                        let py = -(v * 2.0 - 1.0) * hh;
+                        let dir = (right * px_ + up * py + forward).normalize();
+                        let ray = crate::geometry::Ray { origin: cam.origin, direction: dir };
+                        mean = mean
+                            + crate::bdpt::bdpt_trace(
+                                &ray, &*cpu_scene, 8, &lights, &bridges, &mut rng,
+                            );
+                    }
+                    *px = mean * (1.0 / SPP as f32);
+                });
+        }
+
+        // GPU render: same resolution, same spp.
+        let Ok(mut gpu) = crate::gpu::GpuRenderer::new(&scene, W as u32, H as u32) else {
+            std::fs::write("target/cpu_gpu_demo_diag.txt", "no GPU adapter\n").ok();
+            return;
+        };
+        gpu.render_frame_spp(&cam, 8, SPP as u32);
+        let gpu_buf = gpu.read_pixels();
+
+        // Compare: the top divergences and the spot pixels.
+        let mut report = String::new();
+        report.push_str(&format!(
+            "CPU vs GPU demo render {W}x{H} @ {SPP} spp\n"
+        ));
+        let mut divs: Vec<(f32, usize)> = cpu_pixels
+            .iter()
+            .zip(&gpu_buf.pixels)
+            .map(|(c, g)| ((c.x - g.x).abs() + (c.y - g.y).abs() + (c.z - g.z).abs(), 0))
+            .zip(0..)
+            .map(|((d, _), i)| (d, i))
+            .collect();
+        divs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        for (d, i) in divs.iter().take(12) {
+            let x = i % W;
+            let y = i / W;
+            let c = cpu_pixels[*i];
+            let g = gpu_buf.pixels[*i];
+            // What surface does this pixel look at (CPU)?
+            let u = (x as f32 + 0.5) / W as f32;
+            let v = (y as f32 + 0.5) / H as f32;
+            let px_ = (u * 2.0 - 1.0) * ww;
+            let py = -(v * 2.0 - 1.0) * hh;
+            let dir = (right * px_ + up * py + forward).normalize();
+            let hit = cpu_scene.intersect(&crate::geometry::Ray { origin: cam.origin, direction: dir });
+            let surf = hit
+                .map(|h| format!("{:?} mat {:?}", h.p, h.mat.bsdf))
+                .unwrap_or_else(|| "escape".into());
+            report.push_str(&format!(
+                "({x:3},{y:3}) div {d:8.3}  cpu ({:7.3},{:7.3},{:7.3})  gpu ({:7.3},{:7.3},{:7.3})  -> {surf}\n",
+                c.x, c.y, c.z, g.x, g.y, g.z
+            ));
+        }
+        // Project the true spot points through the camera to pixel
+        // coordinates (the same convention as Cam::render: u left->right,
+        // v top->bottom, py negated), then probe neighborhoods.
+        let project = |p: Vec3| -> (usize, usize) {
+            let d = p - cam.origin;
+            let len = d.length();
+            let dir = d * (1.0 / len);
+            let px = dir.dot(right);
+            let py = dir.dot(up);
+            let u = (px / ww + 1.0) * 0.5;
+            let v = (1.0 - py / hh) * 0.5;
+            ((u * W as f32) as usize, (v * H as f32) as usize)
+        };
+        let red_spot = Vec3::new(1.8076, 0.62, 0.99);
+        let green_spot = Vec3::new(-2.5, 0.633, 1.252);
+        for (label, p) in [("red spot", red_spot), ("green spot", green_spot)] {
+            let (cx, cy) = project(p);
+            report.push_str(&format!(
+                "--- {label} at world {p:?} -> pixel ({cx},{cy}) ---\n"
+            ));
+            for dy in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    let x = (cx as i32 + dx).clamp(0, W as i32 - 1) as usize;
+                    let y = (cy as i32 + dy).clamp(0, H as i32 - 1) as usize;
+                    let c = cpu_pixels[y * W + x];
+                    let g = gpu_buf.pixels[y * W + x];
+                    report.push_str(&format!(
+                        "  ({x:3},{y:3}) cpu ({:8.3},{:8.3},{:8.3})  gpu ({:8.3},{:8.3},{:8.3})\n",
+                        c.x, c.y, c.z, g.x, g.y, g.z
+                    ));
+                }
+            }
+        }
+        // What does the GPU's best-red pixel (238, 226) at 480x270
+        // correspond to here (120x68)? Scale: (59.5, 56.5).
+        for (label, x, y) in [("gpu best-red scaled", 59usize, 56usize)] {
+            let c = cpu_pixels[y * W + x];
+            let g = gpu_buf.pixels[y * W + x];
+            let u = (x as f32 + 0.5) / W as f32;
+            let v = (y as f32 + 0.5) / H as f32;
+            let px_ = (u * 2.0 - 1.0) * ww;
+            let py = -(v * 2.0 - 1.0) * hh;
+            let dir = (right * px_ + up * py + forward).normalize();
+            let hit = cpu_scene.intersect(&crate::geometry::Ray { origin: cam.origin, direction: dir });
+            let surf = hit
+                .map(|h| format!("{:?} mat {:?}", h.p, h.mat.bsdf))
+                .unwrap_or_else(|| "escape".into());
+            report.push_str(&format!(
+                "{label} ({x},{y}): cpu {c:?}  gpu {g:?}  -> {surf}\n"
+            ));
+        }
+        // Channel means over the whole image.
+        let cm = cpu_pixels.iter().fold(VEC_ZERO, |a, p| a + *p) * (1.0 / (W * H) as f32);
+        let gm = gpu_buf.pixels.iter().fold(VEC_ZERO, |a, p| a + *p) * (1.0 / (W * H) as f32);
+        report.push_str(&format!("image mean: cpu {cm:?}  gpu {gm:?}\n"));
+        std::fs::write("target/cpu_gpu_demo_diag.txt", &report).ok();
+    }
+
+    /// DIAGNOSTIC (temporary): the decisive probe. The CPU renders the red
+    /// spot at R≈24 when a ray is aimed straight at it (see demo_beam_diag).
+    /// Render the same probe on the GPU in ONE dispatch with 4096 spp —
+    /// a pure batch mean, no accumulation blending, no winsorization
+    /// (the first frame's batch is stored raw). If the GPU ever credits
+    /// the spot, the mean must approach ~24; if it never does, the bug
+    /// is in the WGSL trace, not the accumulation layer.
+    /// Ignored by default: it creates a GPU instance, and several GPU
+    /// tests running in parallel crashed the suite with SIGSEGV during
+    /// the debug session. Run with
+    /// `cargo test -- --ignored diagnostic_gpu_spot_probe`.
+    #[test]
+    #[ignore]
+    fn diagnostic_gpu_spot_probe() {
+        let scene = build_scene();
+        let mut report = String::new();
+        // The red spot on the partition wall, its normal (toward the
+        // camera side), and the probe eye 0.5 m out.
+        let spot = Vec3::new(1.8076, 0.62, 0.99);
+        let normal = Vec3::new(0.0, 0.0, -1.0);
+        let eye = spot + normal * 0.5;
+        let cam = Cam::new(eye, spot, 60.0);
+
+        // CPU reference: the center ray.
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        let bridges = scene.bridges();
+        let dir = (spot - eye).normalize();
+        let ray = crate::geometry::Ray { origin: eye, direction: dir };
+        let mut rng = rand::thread_rng();
+        let n = 4000;
+        let mut mean = VEC_ZERO;
+        let mut hits = 0;
+        for _ in 0..n {
+            let c = crate::bdpt::bdpt_trace(&ray, &*cpu_scene, 8, &lights, &bridges, &mut rng);
+            mean = mean + c;
+            if c.x > 10.0 {
+                hits += 1;
+            }
+        }
+        mean = mean * (1.0 / n as f32);
+        report.push_str(&format!(
+            "CPU probe at the red spot: mean {mean:?} ({hits}/{n} samples with R>10)\n"
+        ));
+
+        // GPU: per-frame batch values at the center pixel, 64 frames of
+        // 4 spp (the preview path). The seed varies per frame (it mixes
+        // uniforms.samples), so this is the true per-frame distribution:
+        // ~23% of frames should carry a bridge hit (batch R ≈ 60), the
+        // rest ambient (~0.5). Also track the running accumulated mean.
+        let Ok(mut gpu) = crate::gpu::GpuRenderer::new(&scene, 32, 32) else {
+            report.push_str("no GPU adapter\n");
+            std::fs::write("target/gpu_spot_probe.txt", &report).ok();
+            return;
+        };
+        const FRAMES: usize = 64;
+        let mut batches: Vec<f32> = Vec::new();
+        let mut running: Vec<f32> = Vec::new();
+        for f in 0..FRAMES {
+            gpu.render_frame(&cam, 8);
+            let buf = gpu.read_pixels();
+            batches.push(buf.get_pixel(16, 16).x);
+            running.push(buf.get_pixel(16, 16).x);
+            if f % 16 == 15 {
+                report.push_str(&format!(
+                    "  frames {f}: last-16 batches {:?}\n",
+                    &batches[batches.len() - 16..]
+                ));
+            }
+        }
+        let big = batches.iter().filter(|&&s| s > 5.0).count();
+        let mean: f32 = batches.iter().sum::<f32>() / FRAMES as f32;
+        report.push_str(&format!(
+            "GPU per-frame batches at the spot: mean {mean:.3}, frames with R>5: {big}/{FRAMES}\n"
+        ));
+        report.push_str(&format!("  all batches: {batches:?}\n"));
+        report.push_str(&format!("  running mean (every 8th): {:?}\n", {
+            let mut v = Vec::new();
+            for i in (0..FRAMES).step_by(8) {
+                v.push(running[i]);
+            }
+            v
+        }));
+
+        // The same probe for the green spot on the left wall.
+        let gspot = Vec3::new(-2.5, 0.633, 1.252);
+        let gnormal = Vec3::new(1.0, 0.0, 0.0);
+        let geye = gspot + gnormal * 0.5;
+        let gdir = (gspot - geye).normalize();
+        let gray = crate::geometry::Ray { origin: geye, direction: gdir };
+        let mut rng = rand::thread_rng();
+        let mut gmean = VEC_ZERO;
+        let mut ghits = 0;
+        for _ in 0..n {
+            let c = crate::bdpt::bdpt_trace(&gray, &*cpu_scene, 8, &lights, &bridges, &mut rng);
+            gmean = gmean + c;
+            if c.y > 10.0 {
+                ghits += 1;
+            }
+        }
+        gmean = gmean * (1.0 / n as f32);
+        report.push_str(&format!(
+            "CPU probe at the green spot: mean {gmean:?} ({ghits}/{n} samples with G>10)\n"
+        ));
+        let gcam = Cam::new(geye, gspot, 60.0);
+        let Ok(mut ggpu) = crate::gpu::GpuRenderer::new(&scene, 32, 32) else {
+            std::fs::write("target/gpu_spot_probe.txt", &report).ok();
+            return;
+        };
+        ggpu.render_frame_spp(&gcam, 8, 64);
+        let gbuf = ggpu.read_pixels();
+        report.push_str(&format!(
+            "GPU green probe (center pixel, one 64-spp dispatch): {:?}\n",
+            gbuf.get_pixel(16, 16)
+        ));
+        std::fs::write("target/gpu_spot_probe.txt", &report).ok();
+    }
+
+    /// DIAGNOSTIC (temporary): minimal repro. A small room with ONE laser
+    /// using the demo's exact model (spectral 650 nm line, power-
+    /// parametrized 50 mW, physical divergence θ = 6.2e-4) aimed at a
+    /// 45° mirror that bounces the beam onto the ceiling. Probe the spot
+    /// on CPU and GPU. This exercises: the line branch rule, the power
+    /// parametrization, the versine cone, the gate-mapped bridge cone,
+    /// the mirror chain, and the direct-hit crediting — with none of the
+    /// demo scene's other confounds.
+    /// Ignored by default: it creates a GPU instance, and several GPU
+    /// tests running in parallel crashed the suite with SIGSEGV during
+    /// the debug session. Run with
+    /// `cargo test -- --ignored diagnostic_gpu_minimal_bridge_repro`.
+    #[test]
+    #[ignore]
+    fn diagnostic_gpu_minimal_bridge_repro() {
+        let mut scene = SceneData::new();
+        let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
+        // A 2 x 2 x 2 room.
+        scene.add_wall(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(0.0, 1.0, -1.0), Vec3::new(0.0, 0.0, 1.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, -1.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0), 2.0, 2.0, white);
+        scene.add_wall(Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), 2.0, 2.0, white);
+        // The laser: the demo's exact model. 70 cm up, aimed straight
+        // down at the mirror.
+        let lambda = 650.0f32;
+        let power_w = 0.05f32;
+        let m2 = 30.0f32;
+        let theta = m2 * lambda * 1e-9 / (std::f32::consts::PI * 0.01);
+        scene.add_laser_beam(
+            Vec3::new(0.4, 1.7, 0.0),
+            Vec3::new(0.0, -1.0, 0.0),
+            0.2,
+            0.01,
+            theta,
+            lambda,
+            power_w,
+        );
+        // One 45° floor mirror: the downward beam reflects horizontal
+        // (+z)... then hits the front wall. Simpler: aim the mirror to
+        // send the beam to the CEILING — 45° tilted so the downward
+        // beam reflects horizontally, then a second wall mirror sends
+        // it up? Keep it minimal: ONE mirror, the beam lands on a wall.
+        // A 45° mirror at the floor reflects the down-beam to +z; the
+        // beam lands on the front wall (z=1) at height ~0.002.
+        scene.add_quad(
+            Vec3::new(0.4, 0.002, 0.0),
+            Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2),
+            0.6,
+            0.6,
+            MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
+        );
+
+        // Where does the beam land? Trace it.
+        let laser = scene
+            .lights
+            .iter()
+            .find(|l| l.shape == 2)
+            .expect("the laser");
+        let trace = scene.trace_laser_beam(laser, 4);
+        let mut report = String::new();
+        report.push_str(&format!(
+            "minimal repro: {} legs, spot {:?}\n",
+            trace.legs.len(),
+            trace.spot.as_ref().map(|s| s.p)
+        ));
+        let ladder = scene.bridges_of_light(laser, 4);
+        report.push_str(&format!("ladder: {} rungs\n", ladder.len()));
+        for (i, r) in ladder.iter().enumerate() {
+            report.push_str(&format!(
+            "  rung {i}: image {:?} r={} beam_dir {:?} versine {:.3e}\n",
+            r.image_center, r.radius, r.beam_dir, r.versine
+        ));
+        }
+        let spot = trace.spot.expect("the beam must land").p;
+
+        // CPU probe: look at the spot from 0.5 m out along the wall
+        // normal (the front wall's normal is -z).
+        let (cpu_scene, lights) = scene.build_cpu_scene();
+        let bridges = scene.bridges();
+        let normal = Vec3::new(0.0, 0.0, -1.0);
+        let eye = spot + normal * 0.5;
+        let dir = (spot - eye).normalize();
+        let ray = crate::geometry::Ray { origin: eye, direction: dir };
+        let mut rng = rand::thread_rng();
+        let n = 4000;
+        let mut mean = VEC_ZERO;
+        let mut hits = 0;
+        for _ in 0..n {
+            let c = crate::bdpt::bdpt_trace(&ray, &*cpu_scene, 8, &lights, &bridges, &mut rng);
+            mean = mean + c;
+            if c.x > 10.0 {
+                hits += 1;
+            }
+        }
+        mean = mean * (1.0 / n as f32);
+        report.push_str(&format!(
+            "CPU probe at the spot: mean {mean:?} ({hits}/{n} samples with R>10)\n"
+        ));
+
+        // GPU probe: the same camera geometry.
+        let Ok(mut gpu) = crate::gpu::GpuRenderer::new(&scene, 32, 32) else {
+            report.push_str("no GPU adapter\n");
+            std::fs::write("target/gpu_minimal_repro.txt", &report).ok();
+            return;
+        };
+        let cam = Cam::new(eye, spot, 60.0);
+        for _ in 0..64 {
+            gpu.render_frame(&cam, 8);
+        }
+        let buf = gpu.read_pixels();
+        report.push_str(&format!(
+            "GPU probe (center pixel, {} frames x 4 spp): {:?}\n",
+            64,
+            buf.get_pixel(16, 16)
+        ));
+        std::fs::write("target/gpu_minimal_repro.txt", &report).ok();
+    }
+
+    /// DIAGNOSTIC (temporary): bisect the WGSL bridge failure. Three
+    /// variants of the minimal repro, each isolating one piece:
+    ///   A. no mirror — the direct hit on the floor (cone gate, line
+    ///      branch, power parametrization; no bridge).
+    ///   B. mirror + WIDE θ (0.05 rad) — the bridge path with the disc
+    ///      cone binding (the old behavior).
+    ///   C. mirror + PHYSICAL θ (6.2e-4) — the bridge path with the
+    ///      gate-mapped cone binding (the demo's regime).
+    /// Each variant is probed on CPU and GPU.
+    /// Ignored by default: it creates GPU instances, and several GPU
+    /// tests running in parallel crashed the suite with SIGSEGV during
+    /// the debug session. Run with
+    /// `cargo test -- --ignored diagnostic_gpu_bridge_bisect`.
+    #[test]
+    #[ignore]
+    fn diagnostic_gpu_bridge_bisect() {
+        let mut report = String::new();
+        let build = |with_mirror: bool, theta: f32| -> SceneData {
+            let mut scene = SceneData::new();
+            let white = MaterialData::diffuse(Vec3::new(0.8, 0.8, 0.8));
+            scene.add_wall(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(0.0, 2.0, 0.0), Vec3::new(0.0, -1.0, 0.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(0.0, 1.0, -1.0), Vec3::new(0.0, 0.0, 1.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, -1.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(-1.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0), 2.0, 2.0, white);
+            scene.add_wall(Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), 2.0, 2.0, white);
+            scene.add_laser_beam(
+                Vec3::new(0.4, 1.7, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                0.2,
+                0.01,
+                theta,
+                650.0,
+                0.05,
+            );
+            if with_mirror {
+                scene.add_quad(
+                    Vec3::new(0.4, 0.002, 0.0),
+                    Vec3::new(0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2),
+                    0.6,
+                    0.6,
+                    MaterialData::mirror(Vec3::new(0.9, 0.9, 0.9)),
+                );
+            }
+            scene
+        };
+
+        for (label, with_mirror, theta) in [
+            ("A no-mirror", false, 6.2e-4),
+            ("B mirror wide-theta", true, 0.05),
+            ("C mirror physical-theta", true, 6.2e-4),
+        ] {
+            let scene = build(with_mirror, theta);
+            let laser = scene.lights.iter().find(|l| l.shape == 2).unwrap();
+            let trace = scene.trace_laser_beam(laser, 4);
+            let spot = trace.spot.expect("the beam must land").p;
+            // The probe eye: 0.5 m out along the surface normal. For the
+            // no-mirror variant the spot is on the floor (normal +y);
+            // for the mirror variants it is on the front wall (normal
+            // -z).
+            let normal = if with_mirror {
+                Vec3::new(0.0, 0.0, -1.0)
+            } else {
+                Vec3::new(0.0, 1.0, 0.0)
+            };
+            let eye = spot + normal * 0.5;
+
+            // CPU probe.
+            let (cpu_scene, lights) = scene.build_cpu_scene();
+            let bridges = scene.bridges();
+            let dir = (spot - eye).normalize();
+            let ray = crate::geometry::Ray { origin: eye, direction: dir };
+            let mut rng = rand::thread_rng();
+            let n = 4000;
+            let mut mean = VEC_ZERO;
+            let mut hits = 0;
+            for _ in 0..n {
+                let c = crate::bdpt::bdpt_trace(&ray, &*cpu_scene, 8, &lights, &bridges, &mut rng);
+                mean = mean + c;
+                if c.x > 10.0 {
+                    hits += 1;
+                }
+            }
+            mean = mean * (1.0 / n as f32);
+
+            // GPU probe.
+            let gpu_mean = match crate::gpu::GpuRenderer::new(&scene, 32, 32) {
+                Ok(mut gpu) => {
+                    let cam = Cam::new(eye, spot, 60.0);
+                    for _ in 0..64 {
+                        gpu.render_frame(&cam, 8);
+                    }
+                    let buf = gpu.read_pixels();
+                    buf.get_pixel(16, 16)
+                }
+                Err(_) => {
+                    report.push_str("no GPU adapter\n");
+                    VEC_ZERO
+                }
+            };
+            report.push_str(&format!(
+                "{label}: spot {spot:?}  cpu {mean:?} ({hits}/{n} R>10)  gpu {gpu_mean:?}\n"
+            ));
+        }
+        std::fs::write("target/gpu_bridge_bisect.txt", &report).ok();
+    }
+
     #[test]
     fn preview_render_produces_finite_pixels() {
         let scene = build_scene();
